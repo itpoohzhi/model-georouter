@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20pip%20runtime-brightgreen.svg)]()
-[![Tests](https://img.shields.io/badge/tests-306%20passed-success.svg)]()
+[![Tests](https://img.shields.io/badge/tests-337%20passed-success.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
 **model-georouter** is a lightweight, zero-dependency local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library**.
@@ -122,12 +122,12 @@ Edit `~/.config/model-georouter/config.json` to define your egress proxy backend
 ```json
 {
   "server": {
-    "host": "127.0.0.1",
+    "listen": "127.0.0.1",
     "port": 10830,
     "max_connections": 256,
     "ingress_wait_timeout": 5.0,
-    "request_head_timeout": 15.0,
-    "body_timeout": 60.0
+    "body_timeout": 60.0,
+    "log_dir": "~/.config/model-georouter/logs"
   },
   "slots": {
     "direct_slots": 16,
@@ -139,33 +139,26 @@ Edit `~/.config/model-georouter/config.json` to define your egress proxy backend
     },
     "route-de": {
       "type": "http_connect",
-      "urls": ["http://127.0.0.1:10820"],
-      "connect_timeout": 12.0
+      "proxies": ["http://127.0.0.1:10820"]
     },
     "route-uz": {
       "type": "http_connect",
-      "urls": ["http://username:password@85.192.60.125:44445"],
-      "connect_timeout": 12.0
+      "proxies": ["http://username:password@85.192.60.125:44445"]
     }
   },
   "routing": {
     "default_pool": "direct",
     "geo_fallback_pool": "route-de",
     "rules": [
-      { "prefix": "muse-", "pool": "route-de" },
-      { "prefix": "meta/", "pool": "route-de" },
-      { "prefix": "gpt-", "pool": "route-de" },
-      { "prefix": "claude-", "pool": "route-uz" },
-      { "prefix": "deepseek-", "pool": "direct" },
-      { "prefix": "qwen-", "pool": "direct" }
+      { "match_prefix": ["muse-", "meta/", "gpt-"], "pool": "route-de" },
+      { "match_prefix": ["claude-"], "pool": "route-uz" },
+      { "match_prefix": ["deepseek-", "qwen-"], "pool": "direct" }
     ]
-  },
-  "logging": {
-    "log_dir": "~/.config/model-georouter/logs",
-    "log_level": "INFO"
   }
 }
 ```
+
+Both flat (`server.direct_slots`, top-level `rules`) and nested (`slots`, `routing`) layouts are accepted. Legacy aliases keep working: `host` → `listen`, `urls` → `proxies`, `prefix` → `match_prefix`. `max_connections` is re-applied on hot-reload without a restart.
 
 ### 4. Running the Service
 
@@ -285,7 +278,7 @@ curl -X POST http://127.0.0.1:10830/v1/chat/completions \
 
 ## Testing & Verification
 
-The test suite covers 306 automated test cases testing protocol conformance, concurrency, and failure recovery:
+The test suite covers 337 automated test cases testing protocol conformance, concurrency, and failure recovery:
 
 ```bash
 pytest -v
@@ -293,7 +286,7 @@ pytest -v
 
 ```text
 ============================= test session starts ==============================
-collected 306 items
+collected 337 items
 
 tests/test_adapters.py ................................................. [ 16%]
 tests/test_config.py ...........................................         [ 30%]
@@ -302,7 +295,7 @@ tests/test_model_router.py ............................................. [ 57%]
 tests/test_proxy_pool.py ..........................                      [ 83%]
 tests/test_relay_and_errors.py ......................................... [ 100%]
 
-============================= 306 passed in 11.17s =============================
+============================= 337 passed in 11.17s =============================
 ```
 
 ---

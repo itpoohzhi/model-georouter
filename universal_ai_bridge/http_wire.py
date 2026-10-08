@@ -84,13 +84,17 @@ def connection_tokens(headers: Headers) -> set[str]:
     return {t.strip().lower() for v in header_values(headers, "connection") for t in v.split(",") if t.strip()}
 
 
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")  # RFC 9110 §5.6.2
+_TARGET_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f]")
+
+
 def _parse_header_lines(lines: list[str], error: type[Exception]) -> Headers:
     headers: Headers = []
     for line in lines:
         if not line:
             break
         name, sep, value = line.partition(":")
-        if not sep or not name or name != name.strip():
+        if not sep or not _TOKEN_RE.fullmatch(name) or "\r" in value or "\n" in value:
             raise error("malformed header line")
         headers.append((name, value.strip()))
     return headers
@@ -121,7 +125,11 @@ class ResponseHead:
 def parse_request_head(block: bytes) -> RequestHead:
     lines = block.decode("latin-1").split("\r\n")
     parts = lines[0].split(" ")
-    if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith("HTTP/1."):
+    if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
+        raise BadRequestError("malformed request line")
+    if not _TOKEN_RE.fullmatch(parts[0]) or not parts[1] or _TARGET_FORBIDDEN_RE.search(parts[1]):
+        raise BadRequestError("malformed request line")
+    if "\r" in parts[2] or "\n" in parts[2]:
         raise BadRequestError("malformed request line")
     headers = _parse_header_lines(lines[1:], BadRequestError)
     lengths = header_values(headers, "content-length")

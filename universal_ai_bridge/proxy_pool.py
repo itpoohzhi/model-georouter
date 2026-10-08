@@ -108,11 +108,49 @@ def _send_all(sock: socket.socket, data: bytes, deadline: float) -> None:
     sock.sendall(data)
 
 
+def _resolve(host: str, port: int, deadline: float) -> list[tuple]:
+    """`getaddrinfo` в пределах бюджета: сам вызов таймаута не принимает, поэтому ждём его в потоке до `deadline`."""
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        pass
+    else:
+        return socket.getaddrinfo(host.strip("[]"), port, type=socket.SOCK_STREAM)  # литерал: DNS не нужен
+    outcome: list[list[tuple] | OSError] = []
+
+    def work() -> None:
+        try:
+            outcome.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except OSError as exc:
+            outcome.append(exc)
+
+    resolver = threading.Thread(target=work, daemon=True)
+    resolver.start()
+    resolver.join(max(deadline - time.monotonic(), 0))
+    if not outcome:
+        raise TimeoutError("DNS resolution exceeded egress deadline")
+    if isinstance(outcome[0], OSError):
+        raise outcome[0]
+    return outcome[0]
+
+
 def _dial(host: str, port: int, deadline: float) -> socket.socket:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise TimeoutError("egress deadline exceeded")
-    sock = socket.create_connection((host, port), timeout=remaining)
+    last: OSError | None = None
+    for family, kind, proto, _, address in _resolve(host, port, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("egress deadline exceeded")
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(remaining)
+            sock.connect(address)
+        except OSError as exc:
+            sock.close()
+            last = exc
+            continue
+        break
+    else:
+        raise last or OSError(f"no addresses resolved for {host}")
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except OSError:
@@ -157,14 +195,14 @@ def open_http_connect(endpoint: ProxyEndpoint, host: str, port: int, deadline: f
         raise
 
 
-def _socks_address(host: str, port: int, remote_dns: bool) -> bytes:
+def _socks_address(host: str, port: int, remote_dns: bool, deadline: float) -> bytes:
     """ATYP + адрес + порт; при `remote_dns` доменное имя всегда уходит прокси (ATYP 0x03)."""
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         ip = None
     if ip is None and not remote_dns:
-        sockaddr = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4]
+        sockaddr = _resolve(host, port, deadline)[0][4]
         ip = ipaddress.ip_address(sockaddr[0])
     if ip is not None:
         atyp = 0x01 if ip.version == 4 else 0x04
@@ -198,7 +236,7 @@ def open_socks5(
                 raise EgressConnectError(f"proxy {endpoint.label} rejected SOCKS5 credentials")
         elif method != 0x00:
             raise EgressConnectError(f"proxy {endpoint.label} chose unsupported SOCKS5 method {method:#x}")
-        request = bytes([0x05, 0x01, 0x00]) + _socks_address(host, port, remote_dns)
+        request = bytes([0x05, 0x01, 0x00]) + _socks_address(host, port, remote_dns, deadline)
         _send_all(sock, request, deadline)
         version, reply, _, atyp = _recv_exact(sock, 4, deadline)
         if version != 0x05:

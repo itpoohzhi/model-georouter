@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from . import SERVICE_NAME, __version__
+from . import SERVICE_NAME, SERVICE_NAME_ALIASES, __version__
 from .adapters import AdapterRegistry, AdapterRoute, AdminAdapter
 from .config import BridgeConfig, ConfigManager, PoolConfig, UpstreamConfig
 from .error_handler import ErrorHandler, json_response_bytes
@@ -53,6 +53,10 @@ LOGGER = get_logger("universal_ai_bridge.server")
 DIAGNOSTIC_BODY_LIMIT = 16384
 DRAIN_MAX_SECONDS = 2.0
 DRAIN_MAX_BYTES = 64 * 1024 * 1024
+OVERLOADED_503 = (
+    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Type: text/plain\r\n"
+    b"Connection: close\r\nContent-Length: 20\r\n\r\nService Unavailable\n"
+)
 SKIPPED_REQUEST_HEADERS = frozenset({"host", "accept-encoding", "content-length", "expect"})
 
 
@@ -183,7 +187,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
             snapshot.server.geo_cache_file or None, snapshot.server.geo_cache_ttl_seconds
         )
         self.slots = SplitSlots(snapshot.server.direct_slots, snapshot.server.proxy_slots)
-        self.ingress = threading.BoundedSemaphore(snapshot.server.max_connections)
+        self.ingress = SlotPool(snapshot.server.max_connections)
         self.metrics = Metrics()
         self.error_handler = ErrorHandler()
         self.admin = AdminAdapter()
@@ -215,6 +219,37 @@ class BridgeServer(socketserver.ThreadingTCPServer):
     def handle_error(self, request, client_address) -> None:  # noqa: ARG002
         LOGGER.exception("unhandled error in connection handler")
 
+    def _check_reload(self) -> None:
+        """Hot-reload: ёмкость входного лимита следует за `max_connections` актуального снимка."""
+        self.ingress.resize(self.config_manager.get().server.max_connections)
+
+    def process_request(self, request, client_address) -> None:
+        """Лимит соединений проверяется до создания потока: при переполнении — inline 503 и закрытие в accept-цикле."""
+        self._check_reload()
+        if not self.ingress.try_acquire():
+            self.metrics.incr("status_503")
+            self.metrics.incr("rejected_503")
+            try:
+                request.setblocking(False)
+                request.send(OVERLOADED_503)
+                request.shutdown(socket.SHUT_WR)
+                request.recv(65536)  # вычитать уже пришедшее без ожидания: закрытие с непрочитанным даёт RST и стирает 503
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.ingress.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.ingress.release()
+
     def start_background(self) -> threading.Thread:
         thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
         thread.start()
@@ -232,6 +267,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         return {
             "status": "ok",
             "service": SERVICE_NAME,
+            "service_aliases": list(SERVICE_NAME_ALIASES),
             "version": __version__,
             "listen": f"{host}:{port}",
             "slots": self.slots.stats(),
@@ -295,17 +331,11 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         sock: socket.socket = self.request
         configure_socket(sock)
-        admitted = False
         try:
-            admitted = self.server.ingress.acquire(timeout=self.server.config_manager.get().server.ingress_wait_timeout)
-            if not admitted:
-                raise SlotsExhaustedError("ingress")
             self._serve(sock)
         except BaseException as exc:  # noqa: BLE001 — любой сбой превращается в безопасный ответ или тихое закрытие
             self._fail(sock, exc)
         finally:
-            if admitted:
-                self.server.ingress.release()
             self._log_request()
 
     # --- ответы ---

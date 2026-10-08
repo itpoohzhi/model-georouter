@@ -621,8 +621,8 @@ def test_ingress_semaphore_rejects_burst_with_503_and_recovers(track, start_brid
         holder.sendall(b"POST " + PATH.encode() + b" HTTP/1.1\r\nHost: h\r\n")  # голова не завершена: поток занят
         time.sleep(0.2)
         rejected = http_request(bridge.port, "GET", "/health")
-        assert rejected.status == 503 and rejected.json["error"]["type"] == "bridge_overloaded"
-        assert rejected.headers["retry-after"] == "5"
+        assert rejected.status == 503 and rejected.body == b"Service Unavailable\n"  # RW-001 (Cycle 2): inline 503 в accept
+        assert rejected.headers["retry-after"] == "1"
     finally:
         holder.close()
     assert wait_for(lambda: http_request(bridge.port, "GET", "/health").status == 200)

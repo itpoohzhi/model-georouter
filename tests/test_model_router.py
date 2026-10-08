@@ -33,7 +33,7 @@ BODIES = [
     (b'{"a":{"b":[{"c":"]}"}]},"model":"deep"}', "deep"),
     (b'{"a":[1,2,[3,{"k":"}"}]],"model":"after-array"}', "after-array"),
     ('{"model":"модель-1"}'.encode(), "модель-1"),
-    (b'{"model":"first","model":"second"}', "first"),
+    (b'{"model":"same","model":"same"}', "same"),  # RW-003: конфликтующие дубли — в test_council_cycle2
     (b"[]", None),
     (b"", None),
     (b"not json at all", None),
@@ -108,10 +108,10 @@ def test_inspector_large_late_model_is_linear():
     assert time.monotonic() - started < 3  # квадратичная деградация дала бы минуты
 
 
-def test_inspector_stops_scanning_after_model_but_keeps_buffering():
+def test_inspector_keeps_scanning_after_model_and_buffering():  # RW-003: дубли model ищутся до конца объекта
     inspector = BodyInspector(LIMIT)
     inspector.feed(b'{"model":"m",')
-    assert inspector.scan_finished and inspector.model == "m"
+    assert not inspector.scan_finished and inspector.model == "m"
     inspector.feed(b'"rest":[1,2,3]}')
     assert inspector.body == b'{"model":"m","rest":[1,2,3]}'
 
@@ -357,14 +357,14 @@ def test_classifier_uses_configured_signatures_and_gzip():
 # ───────────────────────────── Rework Cycle 1 ─────────────────────────────
 
 DUPLICATE_BODIES = [
-    (b'{"model":"a","model":"b"}', "a"),
+    (b'{"model":"a","model":"a"}', "a"),
     (b'{"model":null,"model":"b"}', "b"),
     (b'{"model":5,"x":1,"model":"b"}', "b"),
     (b'{"model":{"model":"n"},"model":"b"}', "b"),
-    (b'{"model":["m"],"model":"b","model":"c"}', "b"),
+    (b'{"model":["m"],"model":"b","model":"b"}', "b"),
     (b'{"model":"","model":"b"}', "b"),
     (b'{"model":null,"model":7}', None),
-    (b'{"x":{"model":"n"},"model":"a","y":{"model":"m"},"model":"b"}', "a"),
+    (b'{"x":{"model":"n"},"model":"a","y":{"model":"m"},"model":"a"}', "a"),
 ]
 
 

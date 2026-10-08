@@ -304,9 +304,47 @@ def _parse_rules(raw: Any, pools: Mapping[str, PoolConfig]) -> tuple[RuleConfig,
     return tuple(rules)
 
 
+def _alias(section: dict[str, Any], old: str, new: str) -> None:
+    if old in section and new not in section:  # канонический ключ главнее алиаса
+        section[new] = section[old]
+
+
+def _normalize(data: Any) -> Any:
+    """Привести устаревшие алиасы (`host`, `urls`, `prefix`) и вложенные секции `slots`/`routing` к плоской схеме."""
+    if not isinstance(data, Mapping):
+        return data
+    root = dict(data)
+    routing = root.pop("routing", None)
+    if isinstance(routing, Mapping):
+        for key, value in routing.items():
+            root.setdefault(key, value)
+    slots = root.pop("slots", None)
+    if isinstance(root.get("server"), Mapping):
+        server = root["server"] = dict(root["server"])
+        if isinstance(slots, Mapping):
+            for key, value in slots.items():
+                server.setdefault(key, value)
+        _alias(server, "host", "listen")
+    if isinstance(root.get("pools"), Mapping):
+        pools = root["pools"] = dict(root["pools"])
+        for name, pool in pools.items():
+            if isinstance(pool, Mapping):
+                pools[name] = pool = dict(pool)
+                _alias(pool, "urls", "proxies")
+    if isinstance(root.get("rules"), list):
+        rules = root["rules"] = list(root["rules"])
+        for index, rule in enumerate(rules):
+            if isinstance(rule, Mapping):
+                rules[index] = rule = dict(rule)
+                if isinstance(rule.get("prefix"), str):
+                    rule["prefix"] = [rule["prefix"]]
+                _alias(rule, "prefix", "match_prefix")
+    return root
+
+
 def parse_config(data: Any) -> BridgeConfig:
     """Провалидировать словарь конфигурации и собрать неизменяемый снимок."""
-    root = _mapping(data, "config")
+    root = _mapping(_normalize(data), "config")
     for required in ("server", "pools", "rules"):
         if required not in root:
             raise ConfigError(f"config: missing required key {required!r}")

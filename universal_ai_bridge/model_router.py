@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .config import BridgeConfig, RuleConfig
-from .errors import BodyTooLargeError
+from .errors import BadRequestError, BodyTooLargeError
 from .geo_cache import GeoCache
 
 # ───────────────────────────── BodyInspector ─────────────────────────────
@@ -39,7 +39,8 @@ class BodyInspector:
     """Буферизует тело (до `max_bytes`) и инкрементально извлекает `model` из JSON-объекта верхнего уровня.
 
     Сканер оперирует токенами: вложенные объекты/массивы/строки пропускаются без разбора,
-    поэтому `model`, вложенная глубже уровня 1, игнорируется; при дублях ключа берётся первый непустой строковый. Незавершённый токен
+    поэтому `model`, вложенная глубже уровня 1, игнорируется; дубли ключа с одинаковым значением допустимы,
+    с различными — BadRequestError (иначе прокси и upstream могли бы выбрать разные модели). Незавершённый токен
     дочитывается при следующем `feed` (позиция в строке запоминается — без квадратичной деградации).
     """
 
@@ -144,9 +145,10 @@ class BodyInspector:
                             value = _decode_json_string(bytes(buf[pos + 1 : end - 1]))
                         except ValueError:
                             value = None
-                        if value:  # побеждает первый корректный строковый `model`; прочие (null/число) пропускаются
-                            self._model, self._state = value, _DONE
-                            return
+                        if value:  # null/число пропускаются; два разных строковых `model` — неоднозначный запрос
+                            if self._model is not None and value != self._model:
+                                raise BadRequestError("request body has conflicting 'model' values")
+                            self._model = value
                     self._pos, self._state = end, _AFTER_VALUE
                 elif ch in (0x7B, 0x5B):
                     self._depth = 1
