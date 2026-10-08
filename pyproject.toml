@@ -1,7 +1,7 @@
 [project]
 name = "model-georouter"
 version = "1.0.0"
-description = "High-performance L7 HTTP/SSE Proxy & Multi-Proxy Geo-Router for AI Models (stdlib only)"
+description = "Non-political, zero-dependency L7 proxy & multi-proxy geo-router for unrestricted, borderless AI model access (stdlib only)"
 requires-python = ">=3.11"
 dependencies = []
 

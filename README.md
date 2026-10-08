@@ -6,7 +6,7 @@
 [![Tests](https://img.shields.io/badge/tests-380%20passed-success.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
-**model-georouter** is a lightweight, zero-dependency local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library**.
+**model-georouter** is a lightweight, zero-dependency, strictly non-political local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library** for borderless, unrestricted access to AI and LLM models worldwide.
 
 It intercepts OpenAI-compatible API requests (`baseURL`), inspects the target `model` on the fly, and selectively routes traffic through designated proxy egress channels (HTTP CONNECT, SOCKS5) while letting unrestricted models flow directly over native network interfaces.
 
