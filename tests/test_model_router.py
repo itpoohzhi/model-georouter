@@ -83,7 +83,7 @@ def test_inspector_agrees_with_json_loads_on_generated_bodies():
     for _ in range(200):
         payload = {
             "temperature": rng.random(),
-            "messages": [{"role": "user", "content": "}{\"" * rng.randint(0, 3)}],
+            "messages": [{"role": "user", "content": '}{"' * rng.randint(0, 3)}],
             "tools": [{"model": "nested"}],
         }
         model = rng.choice(["gpt-5", "claude-3", None])
@@ -130,9 +130,12 @@ def test_inspector_enforces_body_limit():
 
 
 def test_inspector_default_limit_is_16_mib_from_config():
-    assert parse_config(
-        {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
-    ).server.body_buffer_max_bytes == 16 * 1024 * 1024
+    assert (
+        parse_config(
+            {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
+        ).server.body_buffer_max_bytes
+        == 16 * 1024 * 1024
+    )
 
 
 def test_model_from_path():

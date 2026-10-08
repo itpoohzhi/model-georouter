@@ -35,7 +35,9 @@ REGION_BODY = b'{"error":{"type":"RegionError","message":"not available in your 
 
 
 def body_for(model: str, extra: str = "") -> bytes:
-    return json.dumps({"model": model, "messages": [{"role": "user", "content": "hi" + extra}], "stream": True}).encode()
+    return json.dumps(
+        {"model": model, "messages": [{"role": "user", "content": "hi" + extra}], "stream": True}
+    ).encode()
 
 
 def ok_responder(label: bytes):
@@ -172,7 +174,9 @@ def test_chunked_request_body_is_decoded_and_model_extracted(track, start_bridge
     proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
     proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
     bridge = start_bridge(
-        make_config(direct_up.port, pools=proxy_pools(proxy.port), rules=[{"match_prefix": ["claude-"], "pool": "route-de"}])
+        make_config(
+            direct_up.port, pools=proxy_pools(proxy.port), rules=[{"match_prefix": ["claude-"], "pool": "route-de"}]
+        )
     )
     payload = body_for("claude-3")
     wire = chunk(payload[:10]) + chunk(payload[10:]) + b"0\r\n\r\n"
@@ -188,7 +192,9 @@ def test_google_style_model_in_path_is_used_for_routing(track, start_bridge):
     proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
     proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
     bridge = start_bridge(
-        make_config(direct_up.port, pools=proxy_pools(proxy.port), rules=[{"match_prefix": ["gemini-"], "pool": "route-de"}])
+        make_config(
+            direct_up.port, pools=proxy_pools(proxy.port), rules=[{"match_prefix": ["gemini-"], "pool": "route-de"}]
+        )
     )
     response = http_request(bridge.port, "POST", "/v1/v1beta/models/gemini-2.5-pro:generateContent", b"{}")
     assert response.body == b"via-proxy"
@@ -365,7 +371,11 @@ def test_region_403_with_dead_fallback_returns_502_not_403(track, start_bridge):
     direct_up = track(HttpUpstream(region_blocked))
     dead = f"http://127.0.0.1:{free_port()}"
     bridge = start_bridge(
-        make_config(direct_up.port, pools={"route-de": {"type": "http_connect", "proxies": [dead]}}, geo_fallback_pool="route-de")
+        make_config(
+            direct_up.port,
+            pools={"route-de": {"type": "http_connect", "proxies": [dead]}},
+            geo_fallback_pool="route-de",
+        )
     )
     response = http_request(bridge.port, "POST", PATH, body_for("gpt-5"))
     assert response.status == 502 and response.json["error"]["retryable"] is True
@@ -498,7 +508,7 @@ def test_truncated_request_body_is_rejected(track, start_bridge):
     up = track(HttpUpstream(ok_responder(b"x")))
     bridge = start_bridge(make_config(up.port))
     with socket.create_connection(("127.0.0.1", bridge.port), timeout=5) as sock:
-        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{\"model\":\"m\"")
+        sock.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{"model":"m"')
         sock.shutdown(socket.SHUT_WR)
         assert parse_response(read_all(sock)).status == 400
     assert up.requests == [] and wait_for(bridge.slots_idle)
@@ -621,7 +631,9 @@ def test_ingress_semaphore_rejects_burst_with_503_and_recovers(track, start_brid
         holder.sendall(b"POST " + PATH.encode() + b" HTTP/1.1\r\nHost: h\r\n")  # голова не завершена: поток занят
         time.sleep(0.2)
         rejected = http_request(bridge.port, "GET", "/health")
-        assert rejected.status == 503 and rejected.body == b"Service Unavailable\n"  # RW-001 (Cycle 2): inline 503 в accept
+        assert (
+            rejected.status == 503 and rejected.body == b"Service Unavailable\n"
+        )  # RW-001 (Cycle 2): inline 503 в accept
         assert rejected.headers["retry-after"] == "1"
     finally:
         holder.close()

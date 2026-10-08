@@ -26,11 +26,11 @@ from universal_ai_bridge.http_wire import (
     EofFraming,
     LengthFraming,
     NoBodyFraming,
+    build_client_head,
     framing_for_request,
     framing_for_response,
     parse_request_head,
     parse_response_head,
-    build_client_head,
 )
 from universal_ai_bridge.logging_utils import get_logger, mask_secrets
 from universal_ai_bridge.relay import (
@@ -92,7 +92,11 @@ def test_error_response_wire_format_and_headers():
     assert b"Content-Type: application/json" in head and b"Connection: close" in head
     assert f"Content-Length: {len(body)}".encode() in head
     assert json.loads(body) == {
-        "error": {"type": "proxy_gateway_timeout", "message": "connect to h:1 via http://p:3128 timed out", "retryable": True}
+        "error": {
+            "type": "proxy_gateway_timeout",
+            "message": "connect to h:1 via http://p:3128 timed out",
+            "retryable": True,
+        }
     }
     overload = HANDLER.convert(SlotsExhaustedError("proxy"))
     assert overload.headers["Retry-After"] == "5"

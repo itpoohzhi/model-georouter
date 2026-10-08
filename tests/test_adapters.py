@@ -29,7 +29,10 @@ GENERIC = GenericAdapter(("/messages", "/chat/completions"), "openrouter-ai")
         ("/go/v1/chat/completions", "/inference/go/openai/v1/chat/completions"),
         ("/go/v1/messages", "/inference/go/anthropic/v1/messages"),
         ("/v1/v1beta/models/gemini-pro:generateContent", "/inference/google/v1beta/models/gemini-pro:generateContent"),
-        ("/go/v1/v1beta/models/gemini-pro:streamGenerateContent", "/inference/go/google/v1beta/models/gemini-pro:streamGenerateContent"),
+        (
+            "/go/v1/v1beta/models/gemini-pro:streamGenerateContent",
+            "/inference/go/google/v1beta/models/gemini-pro:streamGenerateContent",
+        ),
         ("/v1/unknown/endpoint", "/v1/unknown/endpoint"),  # неизвестные пути идут как есть
         ("//v1//chat/completions/", "/inference/openai/v1/chat/completions"),
     ],
@@ -77,14 +80,18 @@ def test_adapters_reject_foreign_paths_on_segment_boundaries():
     assert not OPENCODE.matches("/messages")
 
 
-@pytest.mark.parametrize("path", ["/v1/../etc/passwd", "/v1/%2e%2e/x", "/v1/%2E%2E%2fx/..", "/v1/a\\b", "v1/x", "/v1/\x00"])
+@pytest.mark.parametrize(
+    "path", ["/v1/../etc/passwd", "/v1/%2e%2e/x", "/v1/%2E%2E%2fx/..", "/v1/a\\b", "v1/x", "/v1/\x00"]
+)
 def test_path_traversal_and_garbage_rejected(path):
     with pytest.raises(BadRequestError):
         clean_path(path)
 
 
 def test_registry_picks_longest_prefix_across_adapters():
-    registry = AdapterRegistry.from_config(parse_config({"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}))
+    registry = AdapterRegistry.from_config(
+        parse_config({"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []})
+    )
     assert registry.resolve("/v1/messages").adapter == "opencode"
     assert registry.resolve("/go/v1/messages").adapter == "opencode"
     assert registry.resolve("/zen/v1/messages").adapter == "cordis"
@@ -205,7 +212,12 @@ def test_adapters_rewrite_paths_toward_upstream(track, start_bridge, ingress, up
 
 def test_upstream_base_path_is_prepended(track, start_bridge):
     upstream = track(HttpUpstream(echo_path))
-    config = make_config(upstream.port, upstreams={"openrouter-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False, "base_path": "/api"}})
+    config = make_config(
+        upstream.port,
+        upstreams={
+            "openrouter-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False, "base_path": "/api"}
+        },
+    )
     bridge = start_bridge(config)
     http_request(bridge.port, "POST", "/chat/completions", b"{}")
     assert upstream.requests[0].path == "/api/v1/chat/completions"

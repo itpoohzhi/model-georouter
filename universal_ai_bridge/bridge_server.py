@@ -17,7 +17,6 @@ from .config import BridgeConfig, ConfigManager, PoolConfig, UpstreamConfig
 from .error_handler import ErrorHandler, json_response_bytes
 from .errors import (
     BadRequestError,
-    BodyTooLargeError,
     BridgeError,
     ClientTimeoutError,
     FramingError,
@@ -38,7 +37,6 @@ from .http_wire import (
     connection_tokens,
     framing_for_request,
     framing_for_response,
-    header_get,
     parse_request_head,
     parse_response_head,
     read_head_block,
@@ -216,7 +214,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         self._runtime = (snapshot, runtime)
         return runtime
 
-    def handle_error(self, request, client_address) -> None:  # noqa: ARG002
+    def handle_error(self, request, client_address) -> None:
         LOGGER.exception("unhandled error in connection handler")
 
     def _check_reload(self) -> None:
@@ -234,7 +232,9 @@ class BridgeServer(socketserver.ThreadingTCPServer):
                 request.sendall(OVERLOADED_503)
                 request.shutdown(socket.SHUT_WR)
                 request.setblocking(False)  # дренаж без ожидания: accept-цикл не должен простаивать
-                request.recv(65536)  # вычитать уже пришедшее без ожидания: закрытие с непрочитанным даёт RST и стирает 503
+                request.recv(
+                    65536
+                )  # вычитать уже пришедшее без ожидания: закрытие с непрочитанным даёт RST и стирает 503
             except OSError:
                 pass
             self.shutdown_request(request)
@@ -367,11 +367,11 @@ class _Handler(socketserver.BaseRequestHandler):
             if not isinstance(exc, (BridgeError, OSError)):
                 LOGGER.error("stream aborted by internal error: %s", type(exc).__name__)
             return
-        if isinstance(exc, (ConnectionError, BrokenPipeError)) or isinstance(exc, KeyboardInterrupt):
+        if isinstance(exc, (ConnectionError, BrokenPipeError, KeyboardInterrupt)):
             self.outcome = "client_disconnected"
             return
         if not isinstance(exc, BridgeError):
-            LOGGER.error("internal error: %s", type(exc).__name__, exc_info=True)
+            LOGGER.error("internal error: %s", type(exc).__name__)
         response = srv.error_handler.convert(exc)
         self.status = response.status
         self.outcome = "error:" + response.payload["error"]["type"]
@@ -469,7 +469,9 @@ class _Handler(socketserver.BaseRequestHandler):
         first_pool = snapshot.pools[decision.pool]
         replay_allowed = bool(fallback) and fallback != decision.pool and _is_direct(first_pool)
         try:
-            self._attempt(sock, snapshot, runtime, req, route, query, upstream, inspector, decision.pool, replay_allowed)
+            self._attempt(
+                sock, snapshot, runtime, req, route, query, upstream, inspector, decision.pool, replay_allowed
+            )
         except _ReplayRequested:
             srv.geo_cache.mark_blocked(route.upstream, self.model, cfg.geo_cache_ttl_seconds)
             srv.metrics.incr("replays")
@@ -546,7 +548,9 @@ class _Handler(socketserver.BaseRequestHandler):
                     raise _ReplayRequested
                 if collector.truncated or (collector.full and not framing.complete):
                     srv.metrics.incr("classified_403_truncated")
-                    LOGGER.warning("403 body exceeds %d bytes: signatures beyond it are not checked", DIAGNOSTIC_BODY_LIMIT)
+                    LOGGER.warning(
+                        "403 body exceeds %d bytes: signatures beyond it are not checked", DIAGNOSTIC_BODY_LIMIT
+                    )
             self._relay(sock, up, head, framing, initial, initial_fed, cfg.inactivity_timeout, cfg.body_timeout)
         finally:
             close_quietly(up)

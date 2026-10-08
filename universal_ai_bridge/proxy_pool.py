@@ -306,9 +306,7 @@ class ProxyPoolManager:
         now = self._clock()
         endpoints = self.endpoints(pool)
         with self._lock:
-            return [
-                e for e in endpoints if self._penalties.get(e.raw, 0.0) <= now and e.raw not in excluded
-            ]
+            return [e for e in endpoints if self._penalties.get(e.raw, 0.0) <= now and e.raw not in excluded]
 
     def ensure_available(self, pool: PoolConfig) -> None:
         """Circuit breaker: все прокси в штрафе — мгновенный отказ без удержания слота."""

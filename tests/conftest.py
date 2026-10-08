@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from tests.helpers import BridgeHarness
+
+LOGGER = logging.getLogger(__name__)
 
 
 @pytest.fixture
@@ -13,8 +17,8 @@ def resources():
     for item in reversed(items):
         try:
             item.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("teardown close failed: %r", exc)
 
 
 @pytest.fixture

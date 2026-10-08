@@ -88,7 +88,9 @@ class ErrorHandler:
         if isinstance(exc, EgressConnectError):
             return self.build(502, "proxy_connect_failed", str(exc), retryable=True)
         if isinstance(exc, UpstreamTimeoutError):
-            return self.build(504, "upstream_timeout", str(exc) or "upstream sent no response headers in time", retryable=True)
+            return self.build(
+                504, "upstream_timeout", str(exc) or "upstream sent no response headers in time", retryable=True
+            )
         if isinstance(exc, UpstreamProtocolError):
             return self.build(502, "upstream_unreachable", str(exc), retryable=True)
         if isinstance(exc, SlotsExhaustedError):

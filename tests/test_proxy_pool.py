@@ -31,7 +31,12 @@ def roundtrip(sock, payload=b"ping") -> bytes:
 
 def test_parse_proxy_url():
     endpoint = parse_proxy_url("http://us%40er:p%3Ass@proxy.local:3128")
-    assert (endpoint.host, endpoint.port, endpoint.username, endpoint.password) == ("proxy.local", 3128, "us@er", "p:ss")
+    assert (endpoint.host, endpoint.port, endpoint.username, endpoint.password) == (
+        "proxy.local",
+        3128,
+        "us@er",
+        "p:ss",
+    )
     assert "p:ss" not in repr(endpoint) and "p:ss" not in endpoint.label
     assert parse_proxy_url("socks5h://h").port == 1080
     with pytest.raises(ValueError):

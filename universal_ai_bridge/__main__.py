@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     add_file_handler(logger, manager.get().server.log_dir)
     server = BridgeServer(manager)
 
-    def stop(signum, frame):  # noqa: ARG001
+    def stop(signum, frame):
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, stop)
