@@ -3,12 +3,22 @@
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20pip%20runtime-brightgreen.svg)]()
-[![Tests](https://img.shields.io/badge/tests-337%20passed-success.svg)]()
+[![Tests](https://img.shields.io/badge/tests-380%20passed-success.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
 **model-georouter** is a lightweight, zero-dependency local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library**.
 
 It intercepts OpenAI-compatible API requests (`baseURL`), inspects the target `model` on the fly, and selectively routes traffic through designated proxy egress channels (HTTP CONNECT, SOCKS5) while letting unrestricted models flow directly over native network interfaces.
+
+---
+
+## Mission: Open & Borderless AI Access
+
+**model-georouter is strictly non-political.** It takes no side in any dispute between states, governments, or companies.
+
+We advocate for the use and development of large language models (LLMs) and AI tooling without discriminatory restrictions, regardless of geography, nationality, jurisdiction, or political borders. Knowledge, technology, and advanced development tools should belong to the global community of engineers and researchers on equal terms.
+
+This project is a neutral piece of network plumbing: it routes each model request to the network path where that model works, so developers everywhere can build with the tools they choose.
 
 ---
 
@@ -18,7 +28,20 @@ It intercepts OpenAI-compatible API requests (`baseURL`), inspects the target `m
 
 When orchestrating autonomous AI coding agents (such as OpenCode CLI, DeepSeek Harness, Claude Code, Cursor Agent, Factory Droid, or Aider), multi-agent pipelines frequently query heterogeneous model ensembles:
 - Fast coding models (DeepSeek V4.1, Qwen 2.5) that work reliably via direct internet connections.
-- Frontier reasoning models (Muse Spark 1.3 Contributor, Claude 3.5/5.5, Gemini 3.8 Flash) that are geo-restricted in specific countries (such as Russia) and return `403 RegionError` or `403 Forbidden`.
+- Frontier reasoning models (Muse Spark 1.3 Contributor, Claude 3.5/5.5, Gemini 3.8 Flash) that are geo-restricted in specific countries and return `403 RegionError` or `403 Forbidden`.
+
+Access to frontier LLM APIs is blocked or unsupported in many jurisdictions, whether through provider region policies, sanctions and export-control compliance, or local network filtering. The countries most commonly affected include:
+
+| Country | Typical cause |
+|---|---|
+| China | Provider region policies and national network filtering |
+| Russia | Provider region policies and sanctions-related restrictions |
+| Iran | Sanctions and export-control compliance |
+| North Korea | Sanctions and export-control compliance |
+| Cuba | Sanctions and export-control compliance |
+| Syria | Sanctions and export-control compliance |
+
+The exact list varies by provider and changes over time; other regions are affected as well. Developers in these countries, and engineers who travel through them, regularly lose access to the tools their work depends on.
 
 Traditional workarounds fail in production workflows:
 
@@ -281,7 +304,7 @@ curl -X POST http://127.0.0.1:10830/v1/chat/completions \
 
 ## Testing & Verification
 
-The test suite covers 337 automated test cases testing protocol conformance, concurrency, and failure recovery:
+The test suite covers 380 automated test cases testing protocol conformance, concurrency, and failure recovery:
 
 ```bash
 pytest -v
@@ -289,7 +312,7 @@ pytest -v
 
 ```text
 ============================= test session starts ==============================
-collected 337 items
+collected 380 items
 
 tests/test_adapters.py ................................................. [ 16%]
 tests/test_config.py ...........................................         [ 30%]
@@ -298,7 +321,7 @@ tests/test_model_router.py ............................................. [ 57%]
 tests/test_proxy_pool.py ..........................                      [ 83%]
 tests/test_relay_and_errors.py ......................................... [ 100%]
 
-============================= 337 passed in 11.17s =============================
+============================= 380 passed in 11.17s =============================
 ```
 
 ---
