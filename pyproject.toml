@@ -1,7 +1,7 @@
 [project]
-name = "universal-ai-bridge"
+name = "model-georouter"
 version = "1.0.0"
-description = "Universal AI Smart Bridge & Multi-Proxy Model Router (stdlib only)"
+description = "High-performance L7 HTTP/SSE Proxy & Multi-Proxy Geo-Router for AI Models (stdlib only)"
 requires-python = ">=3.11"
 dependencies = []
 
