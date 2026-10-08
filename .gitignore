@@ -5,3 +5,17 @@ __pycache__/
 .coverage
 *.egg-info/
 
+# local env & build
+.venv/
+venv/
+build/
+dist/
+.ruff_cache/
+
+# local runtime config (see config.example.json)
+config.json
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

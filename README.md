@@ -3,7 +3,7 @@
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20pip%20runtime-brightgreen.svg)]()
-[![Tests](https://img.shields.io/badge/tests-380%20passed-success.svg)]()
+[![CI](https://github.com/itpoohzhi/model-georouter/actions/workflows/ci.yml/badge.svg)](https://github.com/itpoohzhi/model-georouter/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
 **model-georouter** is a lightweight, zero-dependency, strictly non-political local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library** for borderless, unrestricted access to AI and LLM models worldwide.
