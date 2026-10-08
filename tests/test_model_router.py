@@ -352,3 +352,79 @@ def test_classifier_uses_configured_signatures_and_gzip():
     assert classifier.classify(403, packed, "gzip").is_region_error
     assert not classifier.classify(403, b"\x00garbage", "gzip").is_region_error
     assert not classifier.classify(403, b"only-in-narnia", "br").is_region_error
+
+
+# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
+
+DUPLICATE_BODIES = [
+    (b'{"model":"a","model":"b"}', "a"),
+    (b'{"model":null,"model":"b"}', "b"),
+    (b'{"model":5,"x":1,"model":"b"}', "b"),
+    (b'{"model":{"model":"n"},"model":"b"}', "b"),
+    (b'{"model":["m"],"model":"b","model":"c"}', "b"),
+    (b'{"model":"","model":"b"}', "b"),
+    (b'{"model":null,"model":7}', None),
+    (b'{"x":{"model":"n"},"model":"a","y":{"model":"m"},"model":"b"}', "a"),
+]
+
+
+@pytest.mark.parametrize("body, expected", DUPLICATE_BODIES)
+def test_duplicate_model_keys_pick_first_valid_string_at_every_split(body, expected):  # RW-013
+    for cut in range(len(body) + 1):
+        inspector = BodyInspector(LIMIT)
+        inspector.feed(body[:cut])
+        inspector.feed(body[cut:])
+        assert inspector.model == expected, f"split at {cut}"
+    inspector = BodyInspector(LIMIT)
+    for i in range(len(body)):
+        inspector.feed(body[i : i + 1])
+    assert inspector.model == expected
+
+
+def test_geo_cache_lookups_are_not_blocked_by_slow_disk(tmp_path, monkeypatch):  # RW-007
+    import os
+
+    path = tmp_path / "c.json"
+    cache = GeoCache(path)
+    started, release = threading.Event(), threading.Event()
+    real_replace = os.replace
+
+    def slow_replace(src, dst):
+        started.set()
+        release.wait(5)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", slow_replace)
+    writer = threading.Thread(target=cache.mark_blocked, args=("u", "m"))
+    writer.start()
+    assert started.wait(2)
+    done = threading.Event()
+
+    def lookups():
+        cache.is_blocked("u", "other")
+        len(cache)
+        done.set()
+
+    reader = threading.Thread(target=lookups)
+    reader.start()
+    try:
+        assert done.wait(1.0), "lookups blocked while disk write is in progress"
+    finally:
+        release.set()
+        writer.join(5)
+        reader.join(5)
+    assert GeoCache(path).is_blocked("u", "m")
+
+
+def test_geo_cache_stale_snapshot_never_overwrites_newer_one(tmp_path):  # RW-007
+    path = tmp_path / "c.json"
+    cache = GeoCache(path)
+    with cache._lock:
+        cache._entries[("u", "old")] = time.time() + 100
+        stale = cache._snapshot()
+        cache._entries[("u", "new")] = time.time() + 100
+        fresh = cache._snapshot()
+    cache._persist(fresh)
+    cache._persist(stale)  # запоздавший писатель
+    reloaded = GeoCache(path)
+    assert reloaded.is_blocked("u", "old") and reloaded.is_blocked("u", "new")

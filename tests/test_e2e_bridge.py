@@ -8,6 +8,8 @@ import os
 import threading
 import time
 
+import pytest
+
 from tests.helpers import (
     FakeConnectProxy,
     FakeSocks5Proxy,
@@ -582,3 +584,116 @@ def test_hot_reload_changes_routing_without_restart_and_survives_bad_config(trac
         assert health["config_error"] is None
     finally:
         pass
+
+
+# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
+
+
+def test_slowloris_body_trickle_hits_single_body_deadline(track, start_bridge):  # RW-001
+    import select
+    import socket
+
+    up = track(HttpUpstream(ok_responder(b"x")))
+    bridge = start_bridge(make_config(up.port, server={"body_timeout": 1.0}))
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", bridge.port), timeout=10) as sock:
+        sock.sendall(b"POST " + PATH.encode() + b" HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n")
+        try:
+            while time.monotonic() - started < 6:
+                sock.sendall(b"{")  # каждый recv сервера получает данные раньше 1 с — прежний таймаут сбрасывался
+                if select.select([sock], [], [], 0.3)[0]:
+                    break
+        except OSError:
+            pass
+        response = parse_response(read_all(sock))
+    assert response.status == 408 and response.json["error"]["type"] == "request_timeout"
+    assert time.monotonic() - started < 3
+    assert up.requests == [] and wait_for(bridge.slots_idle)
+
+
+def test_ingress_semaphore_rejects_burst_with_503_and_recovers(track, start_bridge):  # RW-008
+    import socket
+
+    up = track(HttpUpstream(ok_responder(b"x")))
+    bridge = start_bridge(make_config(up.port, server={"max_connections": 1, "ingress_wait_timeout": 0.3}))
+    holder = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
+    try:
+        holder.sendall(b"POST " + PATH.encode() + b" HTTP/1.1\r\nHost: h\r\n")  # голова не завершена: поток занят
+        time.sleep(0.2)
+        rejected = http_request(bridge.port, "GET", "/health")
+        assert rejected.status == 503 and rejected.json["error"]["type"] == "bridge_overloaded"
+        assert rejected.headers["retry-after"] == "5"
+    finally:
+        holder.close()
+    assert wait_for(lambda: http_request(bridge.port, "GET", "/health").status == 200)
+    assert bridge.server.metrics.snapshot()["rejected_503"] >= 1
+
+
+def test_ingress_limit_is_configurable_and_validated():
+    from universal_ai_bridge.config import ConfigError, parse_config
+
+    base = {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
+    server = parse_config(base).server
+    assert server.max_connections == 256 and server.ingress_wait_timeout == 5.0
+    for key, value in (("max_connections", 0), ("ingress_wait_timeout", 0)):
+        bad = {**base, "server": {**base["server"], key: value}}
+        try:
+            parse_config(bad)
+        except ConfigError as exc:
+            assert key in str(exc)
+        else:
+            raise AssertionError(f"{key}={value} was accepted")
+
+
+def test_truncated_403_body_without_signature_is_counted(track, start_bridge):  # RW-009
+    long_plain = b"<html>" + b"x" * 40000 + b"</html>"
+    direct_up = track(HttpUpstream(lambda conn, req: respond(conn, 403, long_plain)))
+    proxied_up = track(HttpUpstream(ok_responder(b"proxy-ok")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de"))
+    response = http_request(bridge.port, "POST", PATH, body_for("m"))
+    assert response.status == 403 and response.body == long_plain  # WAF-403 по-прежнему отдаётся как есть
+    counters = http_request(bridge.port, "GET", "/metrics").json["counters"]
+    assert counters["classified_403_truncated"] == 1 and counters["classified_403_plain"] == 1
+
+    short = track(HttpUpstream(lambda conn, req: respond(conn, 403, b"<html>nope</html>")))
+    bridge2 = start_bridge(make_config(short.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de"))
+    assert http_request(bridge2.port, "POST", PATH, body_for("m")).status == 403
+    assert "classified_403_truncated" not in http_request(bridge2.port, "GET", "/metrics").json["counters"]
+
+
+@pytest.mark.parametrize(
+    "path, headers",
+    [
+        (PATH, {"Transfer-Encoding": "chunked", "Content-Length": "2"}),
+        ("/health", {"Transfer-Encoding": "chunked", "Content-Length": "2"}),
+    ],
+)
+def test_te_plus_cl_is_rejected_with_400_everywhere(track, start_bridge, path, headers):  # RW-010
+    up = track(HttpUpstream(ok_responder(b"x")))
+    bridge = start_bridge(make_config(up.port))
+    response = http_request(bridge.port, "POST", path, b"{}", headers)
+    assert response.status == 400 and up.requests == []
+
+
+def test_conflicting_duplicate_content_length_is_rejected_with_400(track, start_bridge):  # RW-010
+    import socket
+
+    up = track(HttpUpstream(ok_responder(b"x")))
+    bridge = start_bridge(make_config(up.port))
+    for path in (PATH, "/health"):
+        with socket.create_connection(("127.0.0.1", bridge.port), timeout=5) as raw:
+            raw.sendall(
+                f"POST {path} HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\n{{}}".encode()
+            )
+            assert parse_response(read_all(raw)).status == 400
+    assert up.requests == []
+
+
+def test_chunk_without_trailing_crlf_gets_400(track, start_bridge):  # RW-011
+    up = track(HttpUpstream(ok_responder(b"x")))
+    bridge = start_bridge(make_config(up.port))
+    for wire in (b'5\r\n{"a":XX0\r\n\r\n', b'5\r\n{"a":\n\n0\r\n\r\n', b'5\r\n{"a":X\n0\r\n\r\n'):
+        response = http_request(bridge.port, "POST", PATH, wire, {"Transfer-Encoding": "chunked"})
+        assert response.status == 400 and response.json["error"]["type"] == "bad_request"
+    assert up.requests == []

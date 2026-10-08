@@ -323,10 +323,11 @@ class ProxyPoolManager:
         overall = time.monotonic() + settings.total_deadline
         tried: set[str] = set()
         last: EgressConnectError | None = None
-        for _ in range(settings.retries + 1):
+        single = len(pool.proxies) == 1  # единственную прокси перебирать нечем: ретраи идут в неё же
+        for attempt in range(settings.retries + 1):
             endpoint = None
             if pool.type != "direct":
-                endpoint = self.select(pool, tried)
+                endpoint = self.select(pool, set() if single else tried)
                 if endpoint is None:
                     if last is None:
                         raise AllProxiesPenalizedError(pool.name)
@@ -341,7 +342,7 @@ class ProxyPoolManager:
                 sock = self._open(pool, endpoint, host, port, attempt_deadline)
             except (OSError, EgressConnectError) as exc:
                 last = self._normalize(exc, endpoint, host, port)
-                if endpoint is not None:
+                if endpoint is not None and (not single or attempt == settings.retries):
                     self.penalize(endpoint, settings.penalty_seconds)
                 continue
             if wrap is None:
@@ -352,7 +353,9 @@ class ProxyPoolManager:
                 wrapped = wrap(sock)
                 wrapped.settimeout(None)
                 return wrapped
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 sock.close()
-                raise EgressConnectError(f"TLS handshake with {host} failed: {type(exc).__name__}") from exc
+                last = EgressConnectError(f"TLS handshake with {host} failed: {type(exc).__name__}")
+                if endpoint is not None and (not single or attempt == settings.retries):
+                    self.penalize(endpoint, settings.penalty_seconds)
         raise last or EgressConnectError(f"cannot connect to {host}:{port}")

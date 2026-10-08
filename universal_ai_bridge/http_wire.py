@@ -123,7 +123,13 @@ def parse_request_head(block: bytes) -> RequestHead:
     parts = lines[0].split(" ")
     if len(parts) != 3 or not parts[0] or not parts[1] or not parts[2].startswith("HTTP/1."):
         raise BadRequestError("malformed request line")
-    return RequestHead(parts[0].upper(), parts[1], parts[2], _parse_header_lines(lines[1:], BadRequestError))
+    headers = _parse_header_lines(lines[1:], BadRequestError)
+    lengths = header_values(headers, "content-length")
+    if lengths and header_values(headers, "transfer-encoding"):
+        raise BadRequestError("ambiguous body framing")
+    if len({value.strip() for value in lengths}) > 1:
+        raise BadRequestError("conflicting content-length headers")
+    return RequestHead(parts[0].upper(), parts[1], parts[2], headers)
 
 
 def parse_response_head(block: bytes) -> ResponseHead:
@@ -209,6 +215,7 @@ class ChunkedFraming(Framing):
         super().__init__(sink)
         self._state = self._SIZE
         self._remaining = 0
+        self._crlf = 0
         self._line = bytearray()
 
     def _take_line(self, data: bytes, i: int) -> tuple[bytes | None, int]:
@@ -243,11 +250,12 @@ class ChunkedFraming(Framing):
                 if self._remaining == 0:
                     self._state = self._DATA_END
             elif self._state == self._DATA_END:
-                j = data.find(b"\n", i)
-                if j == -1:
-                    i = n
-                else:
-                    i = j + 1
+                if data[i] != b"\r\n"[self._crlf]:
+                    raise FramingError("chunk data is not followed by CRLF")
+                i += 1
+                self._crlf += 1
+                if self._crlf == 2:
+                    self._crlf = 0
                     self._state = self._SIZE
             else:
                 line, i = self._take_line(data, i)

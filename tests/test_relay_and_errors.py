@@ -416,3 +416,70 @@ def test_client_write_timeout_when_client_never_reads():
     threading.Thread(target=flood, daemon=True).start()
     result = rig.finish()
     assert result.outcome == CLIENT_WRITE_TIMEOUT
+
+
+# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [b"5\r\nhelloXX0\r\n\r\n", b"5\r\nhello\n\n0\r\n\r\n", b"5\r\nhello\rX0\r\n\r\n", b"5\r\nhelloX\n0\r\n\r\n"],
+)
+def test_chunked_framing_requires_crlf_after_chunk_data(bad):  # RW-011
+    with pytest.raises(FramingError):
+        ChunkedFraming().feed(bad)
+
+
+def test_chunked_framing_crlf_split_across_feeds():  # RW-011
+    framing = ChunkedFraming()
+    for part in (b"5\r\nhello\r", b"\n0\r", b"\n\r\n"):
+        framing.feed(part)
+    assert framing.complete
+    broken = ChunkedFraming()
+    broken.feed(b"5\r\nhello\r")
+    with pytest.raises(FramingError):
+        broken.feed(b"X")
+
+
+def test_parse_request_head_rejects_smuggling_headers():  # RW-010
+    base = b"POST /x HTTP/1.1\r\nHost: h\r\n"
+    for extra in (
+        b"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+        b"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n",
+        b"Content-Length: 2\r\nContent-Length: 5\r\n",
+    ):
+        with pytest.raises(BadRequestError):
+            parse_request_head(base + extra + b"\r\n")
+    assert parse_request_head(base + b"Content-Length: 2\r\n\r\n").get("content-length") == "2"
+    assert parse_request_head(base + b"Transfer-Encoding: chunked\r\n\r\n").get("transfer-encoding") == "chunked"
+
+
+def test_log_dir_and_rotated_files_are_private(tmp_path):  # RW-006
+    import os
+    import stat
+
+    from universal_ai_bridge.logging_utils import add_file_handler
+
+    logger = logging.getLogger("uab.test.private-log")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    os.chmod(directory, 0o755)
+    old_umask = os.umask(0)  # при umask 0 файлы без явного chmod получили бы 0666
+    handler = None
+    try:
+        add_file_handler(logger, directory)
+        handler = logger.handlers[-1]
+        handler.maxBytes = 300
+        for _ in range(40):
+            logger.info("x" * 60)
+    finally:
+        os.umask(old_umask)
+        if handler is not None:
+            logger.removeHandler(handler)
+            handler.close()
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    files = sorted(directory.glob("bridge.log*"))
+    assert len(files) >= 3  # текущий лог и несколько архивов ротации
+    assert {stat.S_IMODE(f.stat().st_mode) for f in files} == {0o600}

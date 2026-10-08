@@ -4,6 +4,8 @@
     "port": 10830,
     "direct_slots": 16,
     "proxy_slots": 16,
+    "max_connections": 256,
+    "ingress_wait_timeout": 5.0,
     "connect_timeout": 12.0,
     "total_egress_deadline": 20.0,
     "headers_timeout": 120.0,

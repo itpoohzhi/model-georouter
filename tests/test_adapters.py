@@ -219,3 +219,64 @@ def test_unknown_path_and_traversal_get_json_errors(track, start_bridge):
     traversal = http_request(bridge.port, "GET", "/v1/../health")
     assert traversal.status == 400 and traversal.json["error"]["type"] == "bad_request"
     assert upstream.requests == []
+
+
+# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/%2e%2e%2fsecret",  # RW-003: после одного decode сегмент содержит `/`
+        "/v1/%252e%252e/secret",  # RW-003: двойное кодирование `..`
+        "/v1/a%255cb",  # RW-003: двойное кодирование `\`
+        "/v1/%252e",
+        "/v1/a%2Fb",
+    ],
+)
+def test_clean_path_rejects_double_encoded_traversal(path):
+    with pytest.raises(BadRequestError):
+        clean_path(path)
+
+
+def test_clean_path_keeps_dots_inside_legit_segments():
+    assert clean_path("/v1/gpt-4.1//x/") == "/v1/gpt-4.1/x"
+
+
+def test_double_encoded_traversal_gets_400_from_live_server(track, start_bridge):
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    for path in ("/v1/%2e%2e%2fsecret", "/v1/%252e%252e/secret"):
+        response = http_request(bridge.port, "GET", path)
+        assert response.status == 400 and response.json["error"]["type"] == "bad_request"
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize("path", ["/health", "/metrics"])
+def test_admin_head_returns_headers_without_body(track, start_bridge, path):  # RW-012
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    head = http_request(bridge.port, "HEAD", path)
+    get = http_request(bridge.port, "GET", path)
+    assert head.status == 200 and head.body_raw == b""
+    assert head.headers["content-type"] == "application/json"
+    assert int(head.headers["content-length"]) > 0 and "content-length" in get.headers
+    assert head.headers["connection"] == "close"
+
+
+def test_admin_head_on_post_only_endpoint_is_405_without_body(track, start_bridge):  # RW-012
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    head = http_request(bridge.port, "HEAD", "/cache/flush")
+    assert head.status == 405 and head.body_raw == b"" and head.headers["allow"] == "POST"
+
+
+@pytest.mark.parametrize(
+    "method, path, status", [("POST", "/cache/flush", 200), ("POST", "/health", 405), ("POST", "/metrics", 405)]
+)
+def test_admin_early_response_drains_request_body(track, start_bridge, method, path, status):  # RW-002
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    response = http_request(bridge.port, method, path, b"x" * (8 * 1024 * 1024))
+    assert response.status == status and response.json
+    assert upstream.requests == []

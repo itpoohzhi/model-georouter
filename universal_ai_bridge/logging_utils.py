@@ -67,16 +67,34 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Ротируемый лог: каждый новый файл и архив ротации получает права 0600, независимо от umask."""
+
+    def _open(self):
+        stream = super()._open()
+        _chmod_quietly(self.baseFilename, 0o600)
+        return stream
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        for index in range(1, self.backupCount + 1):
+            _chmod_quietly(f"{self.baseFilename}.{index}", 0o600)
+
+
+def _chmod_quietly(path: str | Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def add_file_handler(logger: logging.Logger, log_dir: str | Path) -> Path:
     """Подключить ротируемый файловый лог с правами 0600 в каталоге `log_dir`."""
     directory = Path(log_dir).expanduser()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _chmod_quietly(directory, 0o700)
     path = directory / "bridge.log"
-    handler = logging.handlers.RotatingFileHandler(path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    handler = PrivateRotatingFileHandler(path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     logger.addHandler(handler)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
     return path

@@ -132,6 +132,7 @@ class BoundedCollector:
     def __init__(self, limit: int):
         self._limit = limit
         self.data = bytearray()
+        self.truncated = False
 
     @property
     def full(self) -> bool:
@@ -141,6 +142,8 @@ class BoundedCollector:
         room = self._limit - len(self.data)
         if room > 0:
             self.data += chunk[:room]
+        if len(chunk) > max(room, 0):
+            self.truncated = True
 
 
 @dataclass(frozen=True)
@@ -180,6 +183,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
             snapshot.server.geo_cache_file or None, snapshot.server.geo_cache_ttl_seconds
         )
         self.slots = SplitSlots(snapshot.server.direct_slots, snapshot.server.proxy_slots)
+        self.ingress = threading.BoundedSemaphore(snapshot.server.max_connections)
         self.metrics = Metrics()
         self.error_handler = ErrorHandler()
         self.admin = AdminAdapter()
@@ -291,11 +295,17 @@ class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         sock: socket.socket = self.request
         configure_socket(sock)
+        admitted = False
         try:
+            admitted = self.server.ingress.acquire(timeout=self.server.config_manager.get().server.ingress_wait_timeout)
+            if not admitted:
+                raise SlotsExhaustedError("ingress")
             self._serve(sock)
         except BaseException as exc:  # noqa: BLE001 — любой сбой превращается в безопасный ответ или тихое закрытие
             self._fail(sock, exc)
         finally:
+            if admitted:
+                self.server.ingress.release()
             self._log_request()
 
     # --- ответы ---
@@ -307,11 +317,16 @@ class _Handler(socketserver.BaseRequestHandler):
         except OSError:
             pass
 
-    def _respond_json(self, sock: socket.socket, status: int, payload: dict, headers: dict | None = None) -> None:
+    def _respond_json(
+        self, sock: socket.socket, status: int, payload: dict, headers: dict | None = None, head_only: bool = False
+    ) -> None:
         self.status = status
         self.outcome = "local"
         self.server.metrics.incr(f"status_{status}")
-        self._send_bytes(sock, json_response_bytes(status, payload, headers))
+        data = json_response_bytes(status, payload, headers)
+        if head_only:  # HEAD: статус и заголовки (в т.ч. Content-Length) как у GET, без тела
+            data = data.partition(b"\r\n\r\n")[0] + b"\r\n\r\n"
+        self._send_bytes(sock, data)
 
     def _fail(self, sock: socket.socket, exc: BaseException) -> None:
         srv = self.server
@@ -405,7 +420,9 @@ class _Handler(socketserver.BaseRequestHandler):
         runtime = srv.runtime_for(snapshot)
         if srv.admin.matches(path):
             status, payload, headers = srv.admin.handle(req.method, path, srv)
-            self._respond_json(sock, status, payload, headers)
+            self._respond_json(sock, status, payload, headers, head_only=req.method == "HEAD")
+            if not self.body_done:
+                self._drain(sock)
             return
         route = runtime.registry.resolve(path)
         if route is None:
@@ -435,11 +452,15 @@ class _Handler(socketserver.BaseRequestHandler):
         framing = framing_for_request(req.headers, inspector.feed, limit)
         if not framing.complete and (req.get("expect") or "").lower() == "100-continue":
             self._send_bytes(sock, b"HTTP/1.1 100 Continue\r\n\r\n")
+        deadline = time.monotonic() + timeout  # единый дедлайн на всё тело: побайтовый trickle не продлевает его
         try:
             if rest:
                 framing.feed(rest)
             while not framing.complete:
-                sock.settimeout(timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ClientTimeoutError("request body not received in time")
+                sock.settimeout(remaining)
                 data = sock.recv(65536)
                 if not data:
                     raise BadRequestError("request body is truncated")
@@ -492,6 +513,9 @@ class _Handler(socketserver.BaseRequestHandler):
                 srv.metrics.incr("classified_403_region" if result.is_region_error else "classified_403_plain")
                 if result.is_region_error:
                     raise _ReplayRequested
+                if collector.truncated or (collector.full and not framing.complete):
+                    srv.metrics.incr("classified_403_truncated")
+                    LOGGER.warning("403 body exceeds %d bytes: signatures beyond it are not checked", DIAGNOSTIC_BODY_LIMIT)
             self._relay(sock, up, head, framing, initial, initial_fed, cfg.inactivity_timeout, cfg.body_timeout)
         finally:
             close_quietly(up)
@@ -565,7 +589,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 if not data:
                     break
                 wire += data[: framing.feed(data)]
-        except OSError:  # включая таймаут: классифицируем то, что успели прочитать
+        except (OSError, FramingError):  # включая таймаут: классифицируем то, что успели прочитать
             pass
         return bytes(wire)
 

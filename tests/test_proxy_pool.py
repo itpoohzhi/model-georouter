@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import socket
+import ssl
 import time
 
 import pytest
@@ -240,3 +242,90 @@ def test_stats_report_penalized_proxies():
     stats = manager.stats([pool, PoolConfig("direct", "direct")])
     assert stats["p"] == {"type": "http_connect", "proxies_total": 2, "proxies_penalized": 1}
     assert stats["direct"]["proxies_total"] == 0
+
+
+# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
+
+
+def flaky_proxy(track, good: FakeConnectProxy, fail_first: int) -> tuple[FakeServer, list[int]]:
+    attempts: list[int] = []
+
+    def handler(conn):
+        attempts.append(1)
+        if len(attempts) <= fail_first:
+            return  # EOF посреди handshake
+        good._serve(conn)
+
+    return track(FakeServer(handler)), attempts
+
+
+def test_single_proxy_pool_retries_same_proxy_on_transient_failure(track):  # RW-005
+    upstream = track(FakeServer(echo_handler))
+    good = FakeConnectProxy(target=("127.0.0.1", upstream.port))
+    proxy, attempts = flaky_proxy(track, good, fail_first=1)
+    pool = http_pool(f"http://127.0.0.1:{proxy.port}")
+    manager = ProxyPoolManager()
+    with manager.connect(pool, "h", 1, SETTINGS) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert len(attempts) == 2
+    assert not manager.is_penalized(manager.endpoints(pool)[0])
+
+
+def test_single_proxy_pool_uses_all_retries_then_penalizes(track):  # RW-005
+    proxy, attempts = flaky_proxy(track, FakeConnectProxy(), fail_first=99)
+    pool = http_pool(f"http://127.0.0.1:{proxy.port}")
+    manager = ProxyPoolManager()
+    settings = EgressSettings(connect_timeout=2.0, total_deadline=5.0, retries=2, penalty_seconds=30)
+    with pytest.raises(EgressConnectError):
+        manager.connect(pool, "h", 1, settings)
+    assert len(attempts) == 3
+    assert manager.is_penalized(manager.endpoints(pool)[0])
+
+
+class _Handshake:
+    """`wrap`-заглушка: первые `fail_first` вызовов падают TLS-ошибкой, остальные возвращают сокет."""
+
+    def __init__(self, fail_first: int, error: Exception | None = None):
+        self.fail_first = fail_first
+        self.error = error or ssl.SSLError("handshake failure")
+        self.raw: list[socket.socket] = []
+
+    def __call__(self, raw: socket.socket) -> socket.socket:
+        self.raw.append(raw)
+        if len(self.raw) <= self.fail_first:
+            raise self.error
+        return raw
+
+
+def test_tls_handshake_failure_closes_socket_and_retries_origin(track):  # RW-004
+    upstream = track(FakeServer(echo_handler))
+    pool = PoolConfig("direct", "direct")
+    wrap = _Handshake(fail_first=1)
+    with ProxyPoolManager().connect(pool, "127.0.0.1", upstream.port, SETTINGS, wrap) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert len(wrap.raw) == 2 and wrap.raw[0].fileno() == -1  # первый сокет закрыт, FD не утёк
+
+
+def test_tls_handshake_failure_through_proxy_penalizes_proxy_and_fails_over(track):  # RW-004
+    upstream = track(FakeServer(echo_handler))
+    first = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    second = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    pool = http_pool(f"http://127.0.0.1:{first.port}", f"http://127.0.0.1:{second.port}")
+    manager = ProxyPoolManager()
+    wrap = _Handshake(fail_first=1)
+    with manager.connect(pool, "h", 1, SETTINGS, wrap) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert manager.is_penalized(manager.endpoints(pool)[0]) and not manager.is_penalized(manager.endpoints(pool)[1])
+    assert len(first.connects) == 1 and len(second.connects) == 1
+
+
+def test_persistent_tls_failure_exhausts_retries_with_egress_error(track):  # RW-004
+    upstream = track(FakeServer(echo_handler))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    pool = http_pool(f"http://127.0.0.1:{proxy.port}")
+    manager = ProxyPoolManager()
+    wrap = _Handshake(fail_first=99, error=ssl.SSLCertVerificationError("bad cert"))
+    with pytest.raises(EgressConnectError, match="TLS handshake"):
+        manager.connect(pool, "h", 1, SETTINGS, wrap)
+    assert len(wrap.raw) == 2 and all(raw.fileno() == -1 for raw in wrap.raw)
+    assert manager.is_penalized(manager.endpoints(pool)[0])

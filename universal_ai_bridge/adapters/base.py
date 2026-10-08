@@ -18,7 +18,7 @@ class AdapterRoute:
 
 
 def clean_path(path: str) -> str:
-    """Схлопнуть `//`, `.` и хвостовой `/`; `..` (в том числе %2e%2e) и управляющие символы — 400."""
+    """Схлопнуть `//`, `.` и хвостовой `/`; `..`, `/`, `\\` в сегменте после двойного decode и control-символы — 400."""
     if not path.startswith("/"):
         raise BadRequestError("request path must start with '/'")
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
@@ -27,7 +27,8 @@ def clean_path(path: str) -> str:
     for segment in path.split("/"):
         if segment in ("", "."):
             continue
-        if unquote(segment) in ("..", ".") or "\\" in unquote(segment):
+        decoded = unquote(unquote(segment))
+        if decoded in ("..", ".") or "/" in decoded or "\\" in decoded:
             raise BadRequestError("request path contains forbidden segments")
         segments.append(segment)
     return "/" + "/".join(segments)

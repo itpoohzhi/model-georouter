@@ -39,7 +39,7 @@ class BodyInspector:
     """Буферизует тело (до `max_bytes`) и инкрементально извлекает `model` из JSON-объекта верхнего уровня.
 
     Сканер оперирует токенами: вложенные объекты/массивы/строки пропускаются без разбора,
-    поэтому `model`, вложенная глубже уровня 1, игнорируется. Незавершённый токен
+    поэтому `model`, вложенная глубже уровня 1, игнорируется; при дублях ключа берётся первый непустой строковый. Незавершённый токен
     дочитывается при следующем `feed` (позиция в строке запоминается — без квадратичной деградации).
     """
 
@@ -135,21 +135,18 @@ class BodyInspector:
                     return
                 self._pos, self._state = pos + 1, _VALUE
             elif state == _VALUE:
-                if self._key == "model":
-                    if ch == _QUOTE:
-                        end = self._string_end(pos)
-                        if end < 0:
-                            return
-                        try:
-                            self._model = _decode_json_string(bytes(buf[pos + 1 : end - 1]))
-                        except ValueError:
-                            self._model = None
-                    self._state = _DONE  # нестроковый `model` — как отсутствующий
-                    return
                 if ch == _QUOTE:
                     end = self._string_end(pos)
                     if end < 0:
                         return
+                    if self._key == "model":
+                        try:
+                            value = _decode_json_string(bytes(buf[pos + 1 : end - 1]))
+                        except ValueError:
+                            value = None
+                        if value:  # побеждает первый корректный строковый `model`; прочие (null/число) пропускаются
+                            self._model, self._state = value, _DONE
+                            return
                     self._pos, self._state = end, _AFTER_VALUE
                 elif ch in (0x7B, 0x5B):
                     self._depth = 1

@@ -50,6 +50,8 @@ class ServerConfig:
     port: int
     direct_slots: int = 16
     proxy_slots: int = 16
+    max_connections: int = 256
+    ingress_wait_timeout: float = 5.0
     connect_timeout: float = 12.0
     total_egress_deadline: float = 20.0
     headers_timeout: float = 120.0
@@ -183,6 +185,8 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         port=_integer(section, "port", d.port, path, 0, 65535),
         direct_slots=_integer(section, "direct_slots", d.direct_slots, path, 1),
         proxy_slots=_integer(section, "proxy_slots", d.proxy_slots, path, 1),
+        max_connections=_integer(section, "max_connections", d.max_connections, path, 1),
+        ingress_wait_timeout=_positive_number(section, "ingress_wait_timeout", d.ingress_wait_timeout, path),
         connect_timeout=_positive_number(section, "connect_timeout", d.connect_timeout, path),
         total_egress_deadline=_positive_number(section, "total_egress_deadline", d.total_egress_deadline, path),
         headers_timeout=_positive_number(section, "headers_timeout", d.headers_timeout, path),
