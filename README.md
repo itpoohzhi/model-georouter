@@ -6,134 +6,118 @@
 [![Tests](https://img.shields.io/badge/tests-306%20passed-success.svg)]()
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 
-**model-georouter** — это автономный, высокопроизводительный локальный L7-шлюз и умный маршрутизатор сетевых запросов к AI-моделям, написанный на **чистой стандартной библиотеке Python 3.11+** (ноль сторонних runtime-зависимостей).
+**model-georouter** is a lightweight, zero-dependency local L7 reverse proxy and multi-proxy model router built exclusively on the **Python 3.11+ standard library**.
 
-Проект решает фундаментальную проблему маршрутизации API-трафика современных AI-агентов: он позволяет **прозрачно заворачивать сетевые запросы (`baseURL`) любых клиентов и агентов в единую точку**, интеллектуально разделяя трафик между прямым каналом и пулами различных прокси по имени запрашиваемой модели, исключая гео-блокировки и задержки двойного RTT.
-
----
-
-## 1. Зачем нужен этот проект? (Проблема и Решение)
-
-### Проблема 1. Разрозненность API-эндпоинтов и несовместимость путей
-Клиенты и агентские инструменты (OpenCode CLI, DeepSeek Harness Cordis, Cursor, Aider, LiteLLM) работают по протоколу HTTP/SSE, но используют специфичные схемы путей:
-- OpenCode требует префиксы `/v1` или `/go/v1`, которые затем транслируются в `/inference/...`.
-- DeepSeek Harness ожидает пути `/zen/v1` или `/zen/go/v1`.
-- Обычные библиотеки (OpenAI SDK, LangChain, curl) отправляют запросы в `/v1/chat/completions`.
-- Ряд моделей (например, `Muse Spark 1.3 Contributor`) требуют эндпоинт Responses API (`/responses`), возвращая ошибку 400 при отправке в стандартный `/chat/completions`.
-
-**Решение:** `model-georouter` предоставляет единый локальный порт `127.0.0.1:10830` со встроенными Ingress-адаптерами для каждого клиента. Достаточно прописать `baseURL: http://127.0.0.1:10830/<prefix>` в конфиге клиента — шлюз сам согласует пути, заголовки сессий и протоколы.
-
-### Проблема 2. Гео-блокировки (403 RegionError) и ложные баны ключей
-Ряд передовых моделей (например, `Muse Spark 1.3 Contributor`, `Claude 3.5/5.5`, `Gemini 3.8 Flash`) блокируют прямые запросы из определенных регионов (включая РФ), возвращая `403 Forbidden` / `RegionError`.
-- В таких клиентах, как DeepSeek Harness, получение 403 от шлюза приводит к ложному срабатыванию валидатора: агент считает, что токен невалиден (`API key is invalid [AUTH]`), и аварийно завершает сессию.
-- Стандартные сетевые ошибки (таймаут рукопожатия, обрыв туннеля) часто маскируются мостами под исходную ошибку, усугубляя проблему.
-
-**Решение:** 
-1. Шлюз на лету анализирует тело запроса (первые байты JSON) и мгновенно отправляет гео-зависимые модели в заранее выделенный прокси-пул (**Proxy-First**).
-2. Ошибки транспорта прокси возвращаются клиенту со статусами `502 Bad Gateway` / `504 Gateway Timeout` и флагом `retryable: true`, исключая ложную инвалидацию API-ключей.
-
-### Проблема 3. Двойной RTT и медленный первый токен (TTFT)
-Простые локальные прокси работают по принципу *«попробуем напрямую, упадем с 403, затем повторим через прокси»*. Это приводит к тому, что каждый запрос к модели тратит 4–6 секунд на холостой цикл ожидания перед началом генерации.
-
-**Решение:** Интеллектуальный движок маршрутизации (`ModelRuleEngine`) с префиксными и регулярными правилами направляет вызов сразу в целевой прокси-выход. Адаптивный TTL-кэш (`GeoCache`) запоминает факт блокировки новых неизвестных моделей на 24 часа.
+It intercepts OpenAI-compatible API requests (`baseURL`), inspects the target `model` on the fly, and selectively routes traffic through designated proxy egress channels (HTTP CONNECT, SOCKS5) while letting unrestricted models flow directly over native network interfaces.
 
 ---
 
-## 2. Ключевые возможности
+## Why model-georouter?
 
-- 🚀 **Zero Dependencies:** Чистый Python 3.11+ (`socketserver`, `socket`, `ssl`, `json`, `select`). Никаких тяжелых фреймворков (FastAPI, aiohttp, requests).
-- ⚡ **Zero-Buffering SSE Stream Relay:** Прозрачная передача Server-Sent Events с флагом `TCP_NODELAY`. Полная поддержка потоковых блоков рассуждений (`reasoning_content`) и prompt caching (`cached_tokens`).
-- 🛡️ **Раздельные пулы слотов (Resource Isolation):** Независимые семафоры слотов (по умолчанию 16 direct / 16 proxy). Задержки или перегрузка внешних прокси-каналов не блокируют прямой трафик к незаблокированным моделям (DeepSeek, Qwen и др.).
-- 🔄 **Мульти-прокси egress-матрица:**
-  - `direct` — прямой выход через системный сетевой стек (0 оверхеда).
-  - `http_connect` — HTTP CONNECT туннелирование через локальные или удаленные узлы (Xray, ProxyMarket, BrightData).
-  - `socks5` / `socks5h` — SOCKS5 прокси с удаленным разрешением DNS (Hysteria 2, Shadowsocks).
-- ⏱️ **Устойчивость к сбоям:** Circuit Breaker по штрафам узлов, 12-секундный таймаут подключения к прокси, единый монотонный дедлайн тела запроса (защита от Slowloris), безопасный drain сокетов.
-- 🔒 **Безопасность Production-уровня:** Принудительные права `0600` на файлы логов и `0700` на каталоги, маскирование Bearer/Basic токенов, защита от HTTP Smuggling (TE+CL) и Path Traversal (`%2e%2e%2f`).
-- 🛠️ **Hot-Reload конфигурации:** Динамическое обновление правил маршрутизации и эндпоинтов из `config.json` по `mtime` без перезапуска сервиса.
+### The Problem: Multi-Model Agent Orchestration & Geo-Restrictions
+
+When orchestrating autonomous AI coding agents (such as OpenCode CLI, DeepSeek Harness, Claude Code, Cursor Agent, Factory Droid, or Aider), multi-agent pipelines frequently query heterogeneous model ensembles:
+- Fast coding models (DeepSeek V4.1, Qwen 2.5) that work reliably via direct internet connections.
+- Frontier reasoning models (Muse Spark 1.3 Contributor, Claude 3.5/5.5, Gemini 3.8 Flash) that are geo-restricted in specific countries (such as Russia) and return `403 RegionError` or `403 Forbidden`.
+
+Traditional workarounds fail in production workflows:
+
+1. **Routing all agent traffic through a global VPN or single proxy:**
+   - Adds 200–500ms RTT overhead to every single token on models that do not need a proxy.
+   - Saturates proxy bandwidth and introduces frequent socket disconnects.
+   - Direct connection is inherently faster, more reliable, and free of third-party tunnel jitter.
+
+2. **Naïve failover proxies ("try direct, then retry on 403"):**
+   - Each request to a blocked model incurs a dead 2–4 second timeout waiting for the initial 403 response before replaying through a proxy.
+   - In clients like DeepSeek Harness, receiving a 403 response triggers false-positive credential rejection (`API key is invalid [AUTH]`), crashing the agent session.
+
+3. **Subprocess/Binary Wrapping:**
+   - Wrapping agent CLI binaries inside container wrappers or custom wrapper scripts is brittle, non-portable, and rejected by agent frameworks that lock down binary execution paths.
 
 ---
 
-## 3. Архитектура системы
+## The Solution: Selective Model-Aware URL Interception
+
+Instead of wrapping CLI binaries, **`model-georouter` intercepts network requests at the HTTP/SSE transport layer**.
+
+Agents point their standard `baseURL` to `http://127.0.0.1:10830`. The router:
+- Inspects incoming JSON request bodies (the first few kilobytes) to determine the exact `model`.
+- Matches the model against configurable prefix and regex routing rules:
+  - `muse-*`, `gpt-*`, `meta/*` $\rightarrow$ Routed immediately through high-speed Frankfurt proxies (`route-de`).
+  - `claude-*`, `anthropic/*` $\rightarrow$ Routed through Uzbekistan or Amsterdam proxies (`route-uz`, `route-hy2`).
+  - `deepseek-*`, `qwen-*`, `minimax-*` $\rightarrow$ Routed **directly** via host interfaces without proxy latency.
+- Transparently relays chunked Server-Sent Events (SSE) with `TCP_NODELAY`, preserving extended reasoning streams (`reasoning_content`) and prompt cache hits (`cached_tokens`).
+- Maintains an in-memory and persistent TTL GeoCache: if an unlisted model unexpectedly receives a 403 RegionError, the router transparently replays it through the fallback proxy pool and remembers it for 24 hours.
 
 ```
-                         [ ВХОДЯЩИЕ КЛИЕНТЫ ]
-   OpenCode CLI         DeepSeek Harness Cordis        Claude / Generic / curl
-  (:10830/v1, /go/v1)     (:10830/zen/go/v1)          (:10830/v1/chat/completions)
-          │                        │                              │
-          └────────────────────────┼──────────────────────────────┘
-                                   ▼
-             ┌───────────────────────────────────────────┐
-             │      Layer 1: Ingress Route Adapters      │
-             │   (opencode.py / cordis.py / generic.py)  │
-             └─────────────────────┬─────────────────────┘
-                                   │ path rewrite + header clean
-                                   ▼
-             ┌───────────────────────────────────────────┐
-             │         Layer 2: Core Model Router        │
-             │       - Fast JSON Stream Inspector        │
-             │       - Prefix / Regex Rule Matching      │
-             │       - Adaptive GeoCache (TTL 24h)       │
-             └─────────────────────┬─────────────────────┘
-                                   │ target pool decision
-                                   ▼
-             ┌───────────────────────────────────────────┐
-             │       Layer 3: Proxy Pool Manager         │
-             │       - Direct Slots Semaphore (16)       │
-             │       - Proxy Slots Semaphore (16)        │
-             │       - Health & Penalty Circuit Breaker  │
-             └─────────────────────┬─────────────────────┘
-                                   │ socket connection
-                                   ▼
- ┌─────────────────────────────────┼─────────────────────────────────┐
- │                                 │                                 │
- ▼                                 ▼                                 ▼
-[ direct ]                   [ route-de ]                      [ route-uz ]
-(Прямой выход)           (Xray HTTP CONNECT)             (BrightData HTTP CONNECT)
- │                                 │                                 │
- └─────────────────────────────────┼─────────────────────────────────┘
-                                   ▼
-             ┌───────────────────────────────────────────┐
-             │        Layer 4: Streaming SSE Relay       │
-             │     - Token-by-token relay (TCP_NODELAY)  │
-             │     - Reasoning stream transparency       │
-             │     - 403 RegionError Detection & Replay  │
-             │     - Client Abort -> Socket Shutdown     │
-             └───────────────────────────────────────────┘
+                           [ AI Agent Clients ]
+       OpenCode CLI        DeepSeek Harness        Claude / Aider / curl
+            │                     │                          │
+            └─────────────────────┼──────────────────────────┘
+                                  ▼
+                     http://127.0.0.1:10830
+            ┌──────────────────────────────────────────────┐
+            │          model-georouter (Local L7)          │
+            │   - Ingress Path Normalization               │
+            │   - Model JSON Extraction                    │
+            │   - Prefix / Regex Routing Table             │
+            │   - 24h Adaptive GeoCache                    │
+            └───────────────┬──────────────┬───────────────┘
+                            │              │
+      ┌─────────────────────┘              └─────────────────────┐
+      ▼                                                          ▼
+  [ Direct Pool ]                                         [ Proxy Pools ]
+  (0ms proxy overhead)                                    (Geo-bypass tunnels)
+  • deepseek-*                                            • route-de (Frankfurt Xray)
+  • qwen-*                                                • route-uz (BrightData Tashkent)
+  • glm-*                                                 • route-hy2 (Hysteria 2 SOCKS5)
+      │                                                          │
+      ▼                                                          ▼
+  Upstream AI Providers                                   Upstream AI Providers
 ```
 
 ---
 
-## 4. Быстрый старт (Quick Start)
+## Key Features
 
-### 4.1. Установка окружения
+- **Pure Standard Library:** Zero third-party Python runtime dependencies (`socketserver`, `socket`, `ssl`, `json`, `select`). Runs anywhere with Python 3.11+.
+- **Zero-Latency First Token (TTFT):** Known geo-restricted models route directly to their designated proxy on the first attempt, eliminating the 4-second penalty of dead direct calls.
+- **Resource Isolation via Separate Slots:** Independent connection semaphores (default 16 direct / 16 proxy). A slow or stalling proxy connection will never starve or block direct traffic.
+- **Transparent Streaming SSE:** Zero response buffering. Relays token chunks, thinking/reasoning blocks, and prompt caching statistics in real time.
+- **Resilient Transport:** 12-second proxy connect timeouts, pre-send connection retries for single-proxy pools, and automatic health-penalty circuit breaking.
+- **Protection Against False Bans:** Upstream transport failures yield standard `502 Bad Gateway` / `504 Gateway Timeout` with `retryable: true`, preventing agent credential validators from falsely revoking API keys.
+- **Security Hardened:** Explicit `0600` file / `0700` directory permissions on log rotations, credential redaction (Bearer/Basic/userinfo tokens masked in logs), and built-in protection against HTTP Request Smuggling (TE+CL) and Path Traversal (`%2e%2e%2f`).
+- **Live Hot-Reload:** Configuration updates in `config.json` reload automatically on file modification (`mtime`) without restarting the daemon.
 
-Требуется **Python 3.11** или новее.
+---
 
+## Quick Start
+
+### 1. Requirements
+- Python 3.11 or higher.
+- macOS or Linux.
+
+### 2. Installation
 ```bash
-# Клонирование репозитория
-git clone https://github.com/<your-username>/model-georouter.git
+git clone https://github.com/itpooh/model-georouter.git
 cd model-georouter
 
-# Создание виртуального окружения
+# Optional: Set up virtualenv for development and running the test suite
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Установка зависимостей для тестов (для рантайма зависимости не требуются!)
-pip install pytest pytest-xdist
+pip install pytest
 ```
 
-### 4.2. Настройка конфигурации
-
-Создайте конфигурационный каталог и скопируйте шаблон настроек:
+### 3. Configuration
+Create your runtime directory and base configuration:
 
 ```bash
-mkdir -p ~/.config/universal-ai-bridge/logs
-cp config.example.json ~/.config/universal-ai-bridge/config.json
-chmod 600 ~/.config/universal-ai-bridge/config.json
+mkdir -p ~/.config/model-georouter/logs
+cp config.example.json ~/.config/model-georouter/config.json
+chmod 600 ~/.config/model-georouter/config.json
 ```
 
-Пример базового `~/.config/universal-ai-bridge/config.json`:
+Edit `~/.config/model-georouter/config.json` to define your egress proxy backends and model rules:
 
 ```json
 {
@@ -157,6 +141,11 @@ chmod 600 ~/.config/universal-ai-bridge/config.json
       "type": "http_connect",
       "urls": ["http://127.0.0.1:10820"],
       "connect_timeout": 12.0
+    },
+    "route-uz": {
+      "type": "http_connect",
+      "urls": ["http://username:password@85.192.60.125:44445"],
+      "connect_timeout": 12.0
     }
   },
   "routing": {
@@ -166,45 +155,44 @@ chmod 600 ~/.config/universal-ai-bridge/config.json
       { "prefix": "muse-", "pool": "route-de" },
       { "prefix": "meta/", "pool": "route-de" },
       { "prefix": "gpt-", "pool": "route-de" },
-      { "prefix": "claude-", "pool": "route-de" },
+      { "prefix": "claude-", "pool": "route-uz" },
       { "prefix": "deepseek-", "pool": "direct" },
       { "prefix": "qwen-", "pool": "direct" }
     ]
   },
   "logging": {
-    "log_dir": "~/.config/universal-ai-bridge/logs",
+    "log_dir": "~/.config/model-georouter/logs",
     "log_level": "INFO"
   }
 }
 ```
 
-### 4.3. Запуск шлюза
+### 4. Running the Service
 
-**Запуск в терминале:**
+**Foreground:**
 ```bash
-python -m universal_ai_bridge --config ~/.config/universal-ai-bridge/config.json
+python3 -m universal_ai_bridge --config ~/.config/model-georouter/config.json
 ```
 
-**Запуск в фоне как демон macOS (LaunchAgent):**
-Создайте файл `~/Library/LaunchAgents/com.user.universal-ai-bridge.plist`:
-
+**macOS LaunchAgent (Background Daemon):**
+Create `~/Library/LaunchAgents/com.user.model-georouter.plist`:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.universal-ai-bridge</string>
+    <string>com.user.model-georouter</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
         <string>-m</string>
         <string>universal_ai_bridge</string>
         <string>--config</string>
-        <string>/Users/YOUR_USER/.config/universal-ai-bridge/config.json</string>
+        <string>/Users/YOUR_USER/.config/model-georouter/config.json</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/path/to/universal-ai-bridge</string>
+    <string>/path/to/model-georouter</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -212,18 +200,17 @@ python -m universal_ai_bridge --config ~/.config/universal-ai-bridge/config.json
 </dict>
 </plist>
 ```
-
-Загрузите агент:
+Load the daemon:
 ```bash
-launchctl load ~/Library/LaunchAgents/com.user.universal-ai-bridge.plist
+launchctl load ~/Library/LaunchAgents/com.user.model-georouter.plist
 ```
 
 ---
 
-## 5. Подключение клиентов и AI-агентов
+## Client Integration Examples
 
-### 5.1. OpenCode CLI
-В файле конфигурации `~/.config/opencode/opencode.json`:
+### OpenCode CLI
+Point OpenCode to the local router in `~/.config/opencode/opencode.json`:
 ```json
 {
   "provider": {
@@ -240,14 +227,18 @@ launchctl load ~/Library/LaunchAgents/com.user.universal-ai-bridge.plist
   }
 }
 ```
-Теперь команда:
+Now executing:
 ```bash
-opencode run -m opencode-go/muse-spark-1.3-contributor "Привет, как дела?"
+opencode run -m opencode-go/muse-spark-1.3-contributor "Explain quantum computing"
 ```
-автоматически пойдет через немецкий прокси (`route-de`) без единой ошибки и без двойного RTT!
+instantly routes through Germany, while:
+```bash
+opencode run -m opencode-go/deepseek-v4.1-flash "Write a quicksort in Python"
+```
+runs over the direct, low-latency connection.
 
-### 5.2. DeepSeek Harness (Cordis Desktop)
-В профиле `~/.dsh/profiles/desktop/cordis.patch.yml`:
+### DeepSeek Harness (Cordis)
+In your Cordis patch profile (`~/.dsh/profiles/desktop/cordis.patch.yml`):
 ```yaml
 - id: agent-default-model
   name: "@deepseek-ai/dsh-agent-default-model"
@@ -257,44 +248,44 @@ opencode run -m opencode-go/muse-spark-1.3-contributor "Привет, как д�
     baseURL: "http://127.0.0.1:10830/zen/go/v1"
 ```
 
-### 5.3. Произвольный вызов через cURL / OpenAI SDK
+### Generic OpenAI SDK / cURL
 ```bash
 curl -X POST http://127.0.0.1:10830/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -d '{
     "model": "deepseek-v4.1-flash",
-    "messages": [{"role": "user", "content": "Ping"}],
+    "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
 ```
 
 ---
 
-## 6. Мониторинг и администрирование
+## Administration & Metrics
 
-- **Проверка здоровья (Health Check):**
+- **Health Check:**
   ```bash
   curl -s http://127.0.0.1:10830/health | jq .
   ```
-  *Возвращает статус слотов, пулов и кэша гео-блокировок.*
+  Returns connection slot availability, proxy pool health, and active GeoCache entries.
 
-- **Метрики шлюза (Prometheus-совместимый формат):**
+- **Prometheus Metrics:**
   ```bash
   curl -s http://127.0.0.1:10830/metrics
   ```
-  *Выводит `bridge_requests_total`, `bridge_replayed_total`, `bridge_active_slots`, `classified_403_truncated` и др.*
+  Exports metrics including total requests, replayed requests, active slots, and truncated 403 signatures.
 
-- **Сброс кэша гео-блокировок:**
+- **Flush GeoCache:**
   ```bash
   curl -s -X POST http://127.0.0.1:10830/cache/flush | jq .
   ```
 
 ---
 
-## 7. Тестирование и надежность
+## Testing & Verification
 
-Проект протестирован с помощью исчерпывающего набора из **306 модульных, интеграционных и e2e тестов**:
+The test suite covers 306 automated test cases testing protocol conformance, concurrency, and failure recovery:
 
 ```bash
 pytest -v
@@ -308,23 +299,14 @@ tests/test_adapters.py ................................................. [ 16%]
 tests/test_config.py ...........................................         [ 30%]
 tests/test_e2e_bridge.py .....................................           [ 42%]
 tests/test_model_router.py ............................................. [ 57%]
-.....................................................                    [ 74%]
 tests/test_proxy_pool.py ..........................                      [ 83%]
-tests/test_relay_and_errors.py ......................................... [ 96%]
-...........                                                              [100%]
+tests/test_relay_and_errors.py ......................................... [ 100%]
+
 ============================= 306 passed in 11.17s =============================
 ```
 
-Покрытие включает:
-- Симуляцию Slowloris-атак и обрыва клиентов на разных фазах SSE-стриминга.
-- Защиту от HTTP Request Smuggling (конфликты `Transfer-Encoding` и `Content-Length`).
-- Защиту от Path Traversal через экранированные последовательности (`%2e%2e%2f`).
-- Атомарность записи GeoCache под высокой параллельной нагрузкой.
-- Circuit breaker и штрафные интервалы при падении промежуточных узлов.
-
 ---
 
-## 8. Лицензия
+## License
 
-Проект распространяется под открытой лицензией [MIT](LICENSE).
-Разработано для сообщества открытого AI-инструментария.
+This project is licensed under the [MIT License](LICENSE).
