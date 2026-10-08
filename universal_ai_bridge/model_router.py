@@ -39,9 +39,9 @@ class BodyInspector:
     """Буферизует тело (до `max_bytes`) и инкрементально извлекает `model` из JSON-объекта верхнего уровня.
 
     Сканер оперирует токенами: вложенные объекты/массивы/строки пропускаются без разбора,
-    поэтому `model`, вложенная глубже уровня 1, игнорируется; дубли ключа с одинаковым значением допустимы,
-    с различными — BadRequestError (иначе прокси и upstream могли бы выбрать разные модели). Незавершённый токен
-    дочитывается при следующем `feed` (позиция в строке запоминается — без квадратичной деградации).
+    поэтому `model`, вложенная глубже уровня 1, игнорируется; дубли ключа допустимы только с одинаковым
+    строковым значением, любые иные (другая строка, null, число, массив, объект) — BadRequestError (иначе прокси
+    и upstream могли бы выбрать разные модели). Незавершённый токен дочитывается при следующем `feed` (позиция в строке запоминается — без квадратичной деградации).
     """
 
     def __init__(self, max_bytes: int):
@@ -52,6 +52,8 @@ class BodyInspector:
         self._key: str | None = None
         self._depth = 0
         self._model: str | None = None
+        self._model_seen = False
+        self._model_first: str | None = None
         self._str_quote = -1
         self._str_scan = -1
 
@@ -81,6 +83,15 @@ class BodyInspector:
         self._buf += data
         if self._state != _DONE:
             self._scan()
+
+    def _note_model(self, value: str | None) -> None:
+        """Учесть вхождение ключа `model` (`None` — значение не строка); дубли допустимы только как равные строки."""
+        if self._model_seen and (value is None or self._model_first is None or value != self._model_first):
+            raise BadRequestError("Conflicting duplicate model keys in request body")
+        if not self._model_seen:
+            self._model_seen, self._model_first = True, value
+        if value:
+            self._model = value
 
     def _string_end(self, quote_pos: int) -> int:
         """Индекс после закрывающей кавычки или -1, если строка ещё не завершена."""
@@ -145,18 +156,19 @@ class BodyInspector:
                             value = _decode_json_string(bytes(buf[pos + 1 : end - 1]))
                         except ValueError:
                             value = None
-                        if value:  # null/число пропускаются; два разных строковых `model` — неоднозначный запрос
-                            if self._model is not None and value != self._model:
-                                raise BadRequestError("request body has conflicting 'model' values")
-                            self._model = value
+                        self._note_model(value)
                     self._pos, self._state = end, _AFTER_VALUE
                 elif ch in (0x7B, 0x5B):
+                    if self._key == "model":
+                        self._note_model(None)
                     self._depth = 1
                     self._pos, self._state = pos + 1, _SKIP
                 else:
                     match = _SCALAR_END.search(buf, pos)
                     if match is None:
                         return
+                    if self._key == "model":
+                        self._note_model(None)
                     self._pos, self._state = match.start(), _AFTER_VALUE
             elif state == _SKIP:
                 match = _CONTAINER_SPECIAL.search(buf, pos)

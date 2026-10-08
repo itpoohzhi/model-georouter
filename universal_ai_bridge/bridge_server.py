@@ -230,9 +230,10 @@ class BridgeServer(socketserver.ThreadingTCPServer):
             self.metrics.incr("status_503")
             self.metrics.incr("rejected_503")
             try:
-                request.setblocking(False)
-                request.send(OVERLOADED_503)
+                request.settimeout(0.5)
+                request.sendall(OVERLOADED_503)
                 request.shutdown(socket.SHUT_WR)
+                request.setblocking(False)  # дренаж без ожидания: accept-цикл не должен простаивать
                 request.recv(65536)  # вычитать уже пришедшее без ожидания: закрытие с непрочитанным даёт RST и стирает 503
             except OSError:
                 pass

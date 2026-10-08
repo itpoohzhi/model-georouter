@@ -125,7 +125,6 @@ Edit `~/.config/model-georouter/config.json` to define your egress proxy backend
     "listen": "127.0.0.1",
     "port": 10830,
     "max_connections": 256,
-    "ingress_wait_timeout": 5.0,
     "body_timeout": 60.0,
     "log_dir": "~/.config/model-georouter/logs"
   },
@@ -159,6 +158,10 @@ Edit `~/.config/model-georouter/config.json` to define your egress proxy backend
 ```
 
 Both flat (`server.direct_slots`, top-level `rules`) and nested (`slots`, `routing`) layouts are accepted. Legacy aliases keep working: `host` → `listen`, `urls` → `proxies`, `prefix` → `match_prefix`. `max_connections` is re-applied on hot-reload without a restart.
+
+**Default config location.** Without `--config` the router uses `~/.config/model-georouter/config.json` if it exists; otherwise the legacy `~/.config/universal-ai-bridge/config.json` if that one exists; otherwise it falls back to (and reports errors for) `~/.config/model-georouter/config.json`. The default `server.log_dir` follows the same order (`~/.config/model-georouter/logs`, then an already existing legacy `~/.config/universal-ai-bridge/logs`).
+
+**Deprecated:** `server.ingress_wait_timeout` is ignored — connections above `max_connections` are rejected immediately with an inline `503`. The key is still validated so existing configs keep loading.
 
 ### 4. Running the Service
 

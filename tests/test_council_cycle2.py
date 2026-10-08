@@ -136,7 +136,7 @@ def test_rw003_conflicting_model_keys_are_rejected(step):
 def test_rw003_identical_duplicates_and_nested_model_are_fine():
     assert _feed(b'{"model":"a","model":"a","z":1}', 3).model == "a"
     assert _feed(b'{"model":"a","x":{"model":"z"}}', 2).model == "a"
-    assert _feed(b'{"model":null,"model":"a"}').model == "a"
+    assert _feed(b'{"model":"","model":""}').model is None
 
 
 def test_rw003_conflicting_model_gets_400_over_the_wire(track, start_bridge):

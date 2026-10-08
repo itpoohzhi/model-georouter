@@ -1,4 +1,4 @@
-"""CLI: `python -m universal_ai_bridge --config ~/.config/universal-ai-bridge/config.json`."""
+"""CLI: `python -m universal_ai_bridge --config ~/.config/model-georouter/config.json`."""
 
 from __future__ import annotations
 
@@ -10,16 +10,19 @@ import threading
 from pathlib import Path
 
 from .bridge_server import BridgeServer
-from .config import ConfigManager
+from .config import ConfigManager, default_config_path
 from .errors import ConfigError
 from .logging_utils import add_file_handler, get_logger
-
-DEFAULT_CONFIG = Path("~/.config/universal-ai-bridge/config.json")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Universal AI Smart Bridge")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="путь к config.json")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_config_path(),
+        help="путь к config.json (по умолчанию ~/.config/model-georouter/config.json, иначе legacy universal-ai-bridge)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logger = get_logger("universal_ai_bridge")

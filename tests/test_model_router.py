@@ -9,7 +9,7 @@ import time
 import pytest
 
 from universal_ai_bridge.config import parse_config
-from universal_ai_bridge.errors import BodyTooLargeError
+from universal_ai_bridge.errors import BadRequestError, BodyTooLargeError
 from universal_ai_bridge.geo_cache import GeoCache
 from universal_ai_bridge.model_router import (
     BodyInspector,
@@ -358,18 +358,29 @@ def test_classifier_uses_configured_signatures_and_gzip():
 
 DUPLICATE_BODIES = [
     (b'{"model":"a","model":"a"}', "a"),
-    (b'{"model":null,"model":"b"}', "b"),
-    (b'{"model":5,"x":1,"model":"b"}', "b"),
-    (b'{"model":{"model":"n"},"model":"b"}', "b"),
-    (b'{"model":["m"],"model":"b","model":"b"}', "b"),
-    (b'{"model":"","model":"b"}', "b"),
-    (b'{"model":null,"model":7}', None),
     (b'{"x":{"model":"n"},"model":"a","y":{"model":"m"},"model":"a"}', "a"),
+]
+CONFLICTING_DUPLICATE_BODIES = [  # RW-001 (Cycle 3): любые дубли, кроме равных строк, — 400
+    b'{"model":null,"model":"b"}',
+    b'{"model":5,"x":1,"model":"b"}',
+    b'{"model":{"model":"n"},"model":"b"}',
+    b'{"model":["m"],"model":"b","model":"b"}',
+    b'{"model":"","model":"b"}',
+    b'{"model":null,"model":7}',
 ]
 
 
+@pytest.mark.parametrize("body", CONFLICTING_DUPLICATE_BODIES)
+def test_conflicting_duplicate_model_keys_are_rejected_at_every_split(body):
+    for cut in range(len(body) + 1):
+        inspector = BodyInspector(LIMIT)
+        with pytest.raises(BadRequestError):
+            inspector.feed(body[:cut])
+            inspector.feed(body[cut:])
+
+
 @pytest.mark.parametrize("body, expected", DUPLICATE_BODIES)
-def test_duplicate_model_keys_pick_first_valid_string_at_every_split(body, expected):  # RW-013
+def test_identical_duplicate_model_keys_are_accepted_at_every_split(body, expected):  # RW-013
     for cut in range(len(body) + 1):
         inspector = BodyInspector(LIMIT)
         inspector.feed(body[:cut])

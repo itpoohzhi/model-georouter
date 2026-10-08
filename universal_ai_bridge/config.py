@@ -7,7 +7,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -25,6 +25,8 @@ __all__ = [
     "RuleConfig",
     "ServerConfig",
     "UpstreamConfig",
+    "default_config_path",
+    "default_log_dir",
     "load_config_file",
     "parse_config",
 ]
@@ -42,6 +44,26 @@ DEFAULT_GEO_SIGNATURES = (
     "location not supported",
     "geoblocked",
 )
+CONFIG_HOME = "~/.config/model-georouter"
+LEGACY_CONFIG_HOME = "~/.config/universal-ai-bridge"
+
+
+def _resolve_default(relative: str) -> str:
+    """`model-georouter` главнее; legacy `universal-ai-bridge` — только если нового пути нет, а старый уже существует."""
+    current, legacy = f"{CONFIG_HOME}/{relative}", f"{LEGACY_CONFIG_HOME}/{relative}"
+    if not Path(current).expanduser().exists() and Path(legacy).expanduser().exists():
+        return legacy
+    return current
+
+
+def default_config_path() -> Path:
+    """Путь `config.json` по умолчанию (с `~`): `model-georouter` → legacy `universal-ai-bridge`."""
+    return Path(_resolve_default("config.json"))
+
+
+def default_log_dir() -> str:
+    """Каталог логов по умолчанию (с `~`): `model-georouter/logs` → legacy `universal-ai-bridge/logs`."""
+    return _resolve_default("logs")
 
 
 @dataclass(frozen=True)
@@ -51,7 +73,7 @@ class ServerConfig:
     direct_slots: int = 16
     proxy_slots: int = 16
     max_connections: int = 256
-    ingress_wait_timeout: float = 5.0
+    ingress_wait_timeout: float = 5.0  # deprecated/ignored: лимит соединений отказывает сразу; ключ только валидируется
     connect_timeout: float = 12.0
     total_egress_deadline: float = 20.0
     headers_timeout: float = 120.0
@@ -61,7 +83,7 @@ class ServerConfig:
     pre_send_retries: int = 1
     geo_cache_ttl_seconds: int = 86400
     proxy_fail_penalty_seconds: int = 30
-    log_dir: str = "~/.config/universal-ai-bridge/logs"
+    log_dir: str = field(default_factory=default_log_dir)
     geo_error_signatures: tuple[str, ...] = DEFAULT_GEO_SIGNATURES
     geo_cache_file: str = ""
 
@@ -198,7 +220,7 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         proxy_fail_penalty_seconds=_integer(
             section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path, 0
         ),
-        log_dir=_string(section, "log_dir", d.log_dir, path),
+        log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
         geo_cache_file=_string(section, "geo_cache_file", d.geo_cache_file, path),
     )

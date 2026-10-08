@@ -15,7 +15,7 @@
     "pre_send_retries": 1,
     "geo_cache_ttl_seconds": 86400,
     "proxy_fail_penalty_seconds": 30,
-    "geo_cache_file": "~/.config/universal-ai-bridge/geo_cache.json"
+    "geo_cache_file": "~/.config/model-georouter/geo_cache.json"
   },
   "pools": {
     "direct": { "type": "direct" },

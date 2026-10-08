@@ -31,6 +31,8 @@ SOCKS_REPLIES = {
     8: "address type not supported",
 }
 CONNECT_RESPONSE_LIMIT = 16384
+DNS_MAX_THREADS = 32
+_DNS_SEMAPHORE = threading.BoundedSemaphore(DNS_MAX_THREADS)
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,8 @@ def _resolve(host: str, port: int, deadline: float) -> list[tuple]:
         pass
     else:
         return socket.getaddrinfo(host.strip("[]"), port, type=socket.SOCK_STREAM)  # литерал: DNS не нужен
+    if not _DNS_SEMAPHORE.acquire(timeout=max(deadline - time.monotonic(), 0)):
+        raise EgressTimeoutError("DNS resolver concurrency limit reached")
     outcome: list[list[tuple] | OSError] = []
 
     def work() -> None:
@@ -123,9 +127,15 @@ def _resolve(host: str, port: int, deadline: float) -> list[tuple]:
             outcome.append(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
         except OSError as exc:
             outcome.append(exc)
+        finally:
+            _DNS_SEMAPHORE.release()
 
     resolver = threading.Thread(target=work, daemon=True)
-    resolver.start()
+    try:
+        resolver.start()
+    except BaseException:
+        _DNS_SEMAPHORE.release()
+        raise
     resolver.join(max(deadline - time.monotonic(), 0))
     if not outcome:
         raise TimeoutError("DNS resolution exceeded egress deadline")
