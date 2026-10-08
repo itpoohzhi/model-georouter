@@ -371,7 +371,9 @@ class _Handler(socketserver.BaseRequestHandler):
             self.outcome = "client_disconnected"
             return
         if not isinstance(exc, BridgeError):
-            LOGGER.error("internal error: %s", type(exc).__name__)
+            # LOG014 false positive: _fail() always runs inside `except` (see handle()),
+            # so sys.exception() is set and exc_info carries the real traceback.
+            LOGGER.error("internal error: %s", type(exc).__name__, exc_info=True)  # noqa: LOG014
         response = srv.error_handler.convert(exc)
         self.status = response.status
         self.outcome = "error:" + response.payload["error"]["type"]
