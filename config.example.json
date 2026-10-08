@@ -1,0 +1,37 @@
+{
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 10830,
+    "direct_slots": 16,
+    "proxy_slots": 16,
+    "connect_timeout": 12.0,
+    "total_egress_deadline": 20.0,
+    "headers_timeout": 120.0,
+    "inactivity_timeout": 300.0,
+    "body_timeout": 30.0,
+    "body_buffer_max_bytes": 16777216,
+    "pre_send_retries": 1,
+    "geo_cache_ttl_seconds": 86400,
+    "proxy_fail_penalty_seconds": 30,
+    "geo_cache_file": "~/.config/universal-ai-bridge/geo_cache.json"
+  },
+  "pools": {
+    "direct": { "type": "direct" },
+    "route-de": {
+      "type": "http_connect",
+      "strategy": "first_available",
+      "proxies": ["http://127.0.0.1:10820"]
+    },
+    "route-hy2": {
+      "type": "socks5",
+      "remote_dns": true,
+      "proxies": ["socks5h://127.0.0.1:10821"]
+    }
+  },
+  "rules": [
+    { "match_prefix": ["claude-", "gpt-"], "pool": "route-de", "description": "модели с гео-ограничениями" },
+    { "match_regex": "^gemini-.*-preview$", "pool": "route-hy2" }
+  ],
+  "default_pool": "direct",
+  "geo_fallback_pool": "route-de"
+}

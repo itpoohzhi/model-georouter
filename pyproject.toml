@@ -1,0 +1,15 @@
+[project]
+name = "universal-ai-bridge"
+version = "1.0.0"
+description = "Universal AI Smart Bridge & Multi-Proxy Model Router (stdlib only)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
