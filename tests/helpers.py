@@ -10,9 +10,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from universal_ai_bridge.bridge_server import BridgeServer
-from universal_ai_bridge.config import ConfigManager, parse_config
-from universal_ai_bridge.proxy_pool import ProxyPoolManager
+from model_georouter.bridge_server import BridgeServer
+from model_georouter.config import ConfigManager, parse_config
+from model_georouter.proxy_pool import ProxyPoolManager
 
 LOCALHOST = "127.0.0.1"
 

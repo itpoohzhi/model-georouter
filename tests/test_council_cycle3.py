@@ -9,13 +9,13 @@ from pathlib import Path
 
 import pytest
 
+from model_georouter import config as config_module
+from model_georouter import proxy_pool
+from model_georouter.bridge_server import OVERLOADED_503
+from model_georouter.config import default_config_path, default_log_dir, parse_config
+from model_georouter.errors import BadRequestError, EgressTimeoutError
+from model_georouter.model_router import BodyInspector
 from tests.helpers import HttpUpstream, make_config
-from universal_ai_bridge import config as config_module
-from universal_ai_bridge import proxy_pool
-from universal_ai_bridge.bridge_server import OVERLOADED_503
-from universal_ai_bridge.config import default_config_path, default_log_dir, parse_config
-from universal_ai_bridge.errors import BadRequestError, EgressTimeoutError
-from universal_ai_bridge.model_router import BodyInspector
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -113,7 +113,7 @@ def test_rw002_server_config_log_dir_follows_resolution(home):
 
 
 def test_rw002_cli_default_uses_resolved_path(home, monkeypatch, capsys):
-    from universal_ai_bridge.__main__ import main
+    from model_georouter.__main__ import main
 
     _touch(home / ".config/universal-ai-bridge")
     assert main([]) == 2  # пустой `{}` из legacy — невалидный конфиг: доказывает, что файл прочитан
@@ -179,7 +179,7 @@ def test_rw004_inline_503_is_fully_delivered(track, start_bridge):
 
 
 def test_rw004_inline_503_uses_sendall_with_timeout(monkeypatch):
-    from universal_ai_bridge.bridge_server import BridgeServer
+    from model_georouter.bridge_server import BridgeServer
 
     calls: list[tuple] = []
 
@@ -218,7 +218,7 @@ def test_rw004_inline_503_uses_sendall_with_timeout(monkeypatch):
 
 
 def test_rw004_ingress_wait_timeout_is_deprecated_but_validated():
-    from universal_ai_bridge.config import ConfigError
+    from model_georouter.config import ConfigError
 
     readme = (ROOT / "README.md").read_text()
     assert "ingress_wait_timeout" in readme and "ignored" in readme.lower()

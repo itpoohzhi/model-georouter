@@ -7,8 +7,8 @@ import os
 
 import pytest
 
-from universal_ai_bridge.config import ConfigManager, load_config_file, parse_config
-from universal_ai_bridge.errors import ConfigError
+from model_georouter.config import ConfigManager, load_config_file, parse_config
+from model_georouter.errors import ConfigError
 
 MINIMAL = {"server": {"listen": "127.0.0.1", "port": 10830}, "pools": {}, "rules": []}
 
@@ -152,7 +152,7 @@ def test_invalid_reload_keeps_previous_snapshot_and_logs(tmp_path, caplog):
     manager = ConfigManager(path, poll_interval=0)
     good = manager.get()
 
-    with caplog.at_level(logging.ERROR, logger="universal_ai_bridge.config"):
+    with caplog.at_level(logging.ERROR, logger="model_georouter.config"):
         path.write_text("{broken")
         os.utime(path, (1_700_000_100, 1_700_000_100))
         assert manager.get() is good
@@ -178,7 +178,7 @@ def test_invalid_file_is_not_re_logged_until_it_changes(tmp_path, caplog):
     manager = ConfigManager(path, poll_interval=0)
     path.write_text("{broken")
     os.utime(path, (1_700_000_100, 1_700_000_100))
-    with caplog.at_level(logging.ERROR, logger="universal_ai_bridge.config"):
+    with caplog.at_level(logging.ERROR, logger="model_georouter.config"):
         manager.get()
         manager.get()
         manager.get()

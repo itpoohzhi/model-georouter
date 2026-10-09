@@ -1,4 +1,4 @@
-"""CLI: `python -m universal_ai_bridge --config ~/.config/model-georouter/config.json`."""
+"""CLI: `python -m model_georouter --config ~/.config/model-georouter/config.json`."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logger = get_logger("universal_ai_bridge")
+    logger = get_logger("model_georouter")
     try:
         manager = ConfigManager(args.config)
     except (ConfigError, OSError) as exc:

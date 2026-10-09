@@ -10,6 +10,8 @@ import time
 
 import pytest
 
+from model_georouter.bridge_server import BridgeServer
+from model_georouter.config import ConfigManager
 from tests.helpers import (
     FakeConnectProxy,
     FakeSocks5Proxy,
@@ -26,8 +28,6 @@ from tests.helpers import (
     send_sse_head,
     wait_for,
 )
-from universal_ai_bridge.bridge_server import BridgeServer
-from universal_ai_bridge.config import ConfigManager
 
 PATH = "/v1/chat/completions"
 UPSTREAM_PATH = "/inference/openai/v1/chat/completions"
@@ -545,7 +545,7 @@ def test_expect_100_continue_is_honoured(track, start_bridge):
 def test_secrets_do_not_reach_the_log(track, start_bridge, caplog):
     up = track(HttpUpstream(ok_responder(b"ok")))
     bridge = start_bridge(make_config(up.port))
-    with caplog.at_level(logging.INFO, logger="universal_ai_bridge.server"):
+    with caplog.at_level(logging.INFO, logger="model_georouter.server"):
         http_request(
             bridge.port,
             "POST",
@@ -642,7 +642,7 @@ def test_ingress_semaphore_rejects_burst_with_503_and_recovers(track, start_brid
 
 
 def test_ingress_limit_is_configurable_and_validated():
-    from universal_ai_bridge.config import ConfigError, parse_config
+    from model_georouter.config import ConfigError, parse_config
 
     base = {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
     server = parse_config(base).server

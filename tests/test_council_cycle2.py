@@ -11,14 +11,14 @@ from pathlib import Path
 
 import pytest
 
+from model_georouter import SERVICE_NAME, SERVICE_NAME_ALIASES
+from model_georouter.bridge_server import BridgeServer
+from model_georouter.config import ConfigError, ConfigManager, PoolConfig, parse_config
+from model_georouter.errors import BadRequestError, EgressTimeoutError
+from model_georouter.http_wire import parse_request_head
+from model_georouter.model_router import BodyInspector
+from model_georouter.proxy_pool import EgressSettings, ProxyPoolManager, _resolve
 from tests.helpers import HttpUpstream, make_config, read_all, wait_for
-from universal_ai_bridge import SERVICE_NAME, SERVICE_NAME_ALIASES
-from universal_ai_bridge.bridge_server import BridgeServer
-from universal_ai_bridge.config import ConfigError, ConfigManager, PoolConfig, parse_config
-from universal_ai_bridge.errors import BadRequestError, EgressTimeoutError
-from universal_ai_bridge.http_wire import parse_request_head
-from universal_ai_bridge.model_router import BodyInspector
-from universal_ai_bridge.proxy_pool import EgressSettings, ProxyPoolManager, _resolve
 
 ROOT = Path(__file__).resolve().parent.parent
 PATH = "/v1/chat/completions"

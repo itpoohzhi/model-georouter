@@ -7,10 +7,10 @@ import time
 
 import pytest
 
+from model_georouter.config import PoolConfig
+from model_georouter.errors import AllProxiesPenalizedError, EgressConnectError, EgressTimeoutError
+from model_georouter.proxy_pool import EgressSettings, ProxyPoolManager, parse_proxy_url
 from tests.helpers import FakeConnectProxy, FakeServer, FakeSocks5Proxy, basic_token, echo_handler, free_port
-from universal_ai_bridge.config import PoolConfig
-from universal_ai_bridge.errors import AllProxiesPenalizedError, EgressConnectError, EgressTimeoutError
-from universal_ai_bridge.proxy_pool import EgressSettings, ProxyPoolManager, parse_proxy_url
 
 SETTINGS = EgressSettings(connect_timeout=2.0, total_deadline=5.0, retries=1, penalty_seconds=30)
 

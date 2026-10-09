@@ -8,10 +8,10 @@ import time
 
 import pytest
 
-from universal_ai_bridge.config import parse_config
-from universal_ai_bridge.errors import BadRequestError, BodyTooLargeError
-from universal_ai_bridge.geo_cache import GeoCache
-from universal_ai_bridge.model_router import (
+from model_georouter.config import parse_config
+from model_georouter.errors import BadRequestError, BodyTooLargeError
+from model_georouter.geo_cache import GeoCache
+from model_georouter.model_router import (
     BodyInspector,
     ModelRouter,
     RegionErrorClassifier,

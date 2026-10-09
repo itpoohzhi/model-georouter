@@ -8,9 +8,8 @@ import time
 
 import pytest
 
-from tests.helpers import chunk, dechunk
-from universal_ai_bridge.error_handler import ErrorHandler
-from universal_ai_bridge.errors import (
+from model_georouter.error_handler import ErrorHandler
+from model_georouter.errors import (
     AllProxiesPenalizedError,
     BadRequestError,
     BodyTooLargeError,
@@ -21,7 +20,7 @@ from universal_ai_bridge.errors import (
     UpstreamProtocolError,
     UpstreamTimeoutError,
 )
-from universal_ai_bridge.http_wire import (
+from model_georouter.http_wire import (
     ChunkedFraming,
     EofFraming,
     LengthFraming,
@@ -32,8 +31,8 @@ from universal_ai_bridge.http_wire import (
     parse_request_head,
     parse_response_head,
 )
-from universal_ai_bridge.logging_utils import get_logger, mask_secrets
-from universal_ai_bridge.relay import (
+from model_georouter.logging_utils import get_logger, mask_secrets
+from model_georouter.relay import (
     CLIENT_CANCELLED,
     CLIENT_WRITE_TIMEOUT,
     COMPLETE,
@@ -41,6 +40,7 @@ from universal_ai_bridge.relay import (
     UPSTREAM_TRUNCATED,
     SSERelay,
 )
+from tests.helpers import chunk, dechunk
 
 # ───────────────────────────── ErrorHandler ─────────────────────────────
 
@@ -140,7 +140,7 @@ def test_mask_secrets_leaves_ordinary_text_alone():
 
 
 def test_logger_filter_masks_secrets_in_records(caplog):
-    logger = get_logger("universal_ai_bridge.test_masking")
+    logger = get_logger("model_georouter.test_masking")
     with caplog.at_level(logging.INFO, logger=logger.name):
         logger.info("upstream said: Authorization: Bearer sk-supersecret1234 via %s", "http://u:pw123@h:1")
     assert "Bearer sk-***" in caplog.text
@@ -462,7 +462,7 @@ def test_log_dir_and_rotated_files_are_private(tmp_path):  # RW-006
     import os
     import stat
 
-    from universal_ai_bridge.logging_utils import add_file_handler
+    from model_georouter.logging_utils import add_file_handler
 
     logger = logging.getLogger("uab.test.private-log")
     logger.setLevel(logging.INFO)

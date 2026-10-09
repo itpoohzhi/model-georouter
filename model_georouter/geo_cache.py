@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .logging_utils import get_logger
 
-LOGGER = get_logger("universal_ai_bridge.geo_cache")
+LOGGER = get_logger("model_georouter.geo_cache")
 Key = tuple[str, str]
 
 

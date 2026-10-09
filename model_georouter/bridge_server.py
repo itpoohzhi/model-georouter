@@ -46,7 +46,7 @@ from .model_router import BodyInspector, ModelRouter, RegionErrorClassifier, mod
 from .proxy_pool import EgressSettings, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
 
-LOGGER = get_logger("universal_ai_bridge.server")
+LOGGER = get_logger("model_georouter.server")
 
 DIAGNOSTIC_BODY_LIMIT = 16384
 DRAIN_MAX_SECONDS = 2.0

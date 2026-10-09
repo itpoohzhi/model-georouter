@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.helpers import HttpUpstream, http_request, make_config, respond
-from universal_ai_bridge.adapters import (
+from model_georouter.adapters import (
     AdapterRegistry,
     AdminAdapter,
     CordisAdapter,
@@ -11,8 +10,9 @@ from universal_ai_bridge.adapters import (
     OpenCodeAdapter,
     clean_path,
 )
-from universal_ai_bridge.config import parse_config
-from universal_ai_bridge.errors import BadRequestError
+from model_georouter.config import parse_config
+from model_georouter.errors import BadRequestError
+from tests.helpers import HttpUpstream, http_request, make_config, respond
 
 OPENCODE = OpenCodeAdapter(("/v1", "/go/v1"), "opencode-ai")
 CORDIS = CordisAdapter(("/zen/v1", "/zen/go/v1"), "cordis-ai")

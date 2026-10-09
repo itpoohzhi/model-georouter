@@ -190,7 +190,7 @@ Both flat (`server.direct_slots`, top-level `rules`) and nested (`slots`, `routi
 
 **Foreground:**
 ```bash
-python3 -m universal_ai_bridge --config ~/.config/model-georouter/config.json
+python3 -m model_georouter --config ~/.config/model-georouter/config.json
 ```
 
 **macOS LaunchAgent (Background Daemon):**
@@ -206,7 +206,7 @@ Create `~/Library/LaunchAgents/com.user.model-georouter.plist`:
     <array>
         <string>/usr/bin/python3</string>
         <string>-m</string>
-        <string>universal_ai_bridge</string>
+        <string>model_georouter</string>
         <string>--config</string>
         <string>/Users/YOUR_USER/.config/model-georouter/config.json</string>
     </array>

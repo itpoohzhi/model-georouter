@@ -31,7 +31,7 @@ __all__ = [
     "parse_config",
 ]
 
-LOGGER = get_logger("universal_ai_bridge.config")
+LOGGER = get_logger("model_georouter.config")
 
 LOOPBACK = "127.0.0.1"
 POOL_TYPES = ("direct", "http_connect", "socks5")
