@@ -19,6 +19,8 @@ PREFIX_PATHS = (
     ("/go/v1beta/models/", "/inference/go/google/v1beta/models/"),
     ("/v1/v1beta/models/", "/inference/google/v1beta/models/"),
     ("/v1beta/models/", "/inference/google/v1beta/models/"),
+    ("/go/v1/models/", "/inference/go/google/v1beta/models/"),
+    ("/v1/models/", "/inference/google/v1beta/models/"),
 )
 
 

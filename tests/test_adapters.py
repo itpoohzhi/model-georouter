@@ -33,6 +33,15 @@ GENERIC = GenericAdapter(("/messages", "/chat/completions"), "openrouter-ai")
             "/go/v1/v1beta/models/gemini-pro:streamGenerateContent",
             "/inference/go/google/v1beta/models/gemini-pro:streamGenerateContent",
         ),
+        ("/go/v1/models", "/inference/go/openai/v1/models"),
+        (
+            "/go/v1/models/gemini-4-argon-contributor:streamGenerateContent",
+            "/inference/go/google/v1beta/models/gemini-4-argon-contributor:streamGenerateContent",
+        ),
+        (
+            "/v1/models/gemini-4-argon-contributor:generateContent",
+            "/inference/google/v1beta/models/gemini-4-argon-contributor:generateContent",
+        ),
         ("/v1/unknown/endpoint", "/v1/unknown/endpoint"),  # неизвестные пути идут как есть
         ("//v1//chat/completions/", "/inference/openai/v1/chat/completions"),
     ],
