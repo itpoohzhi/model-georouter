@@ -583,6 +583,8 @@ class _Handler(socketserver.BaseRequestHandler):
                     sock.sendall(build_client_head(final_head))
                     if req.method != "HEAD" and new_body:
                         sock.sendall(new_body)
+                    self.outcome = "complete"
+                    self.bytes_sent = len(new_body)
                 except OSError:
                     self.outcome = "client_cancelled"
                     self.server.metrics.incr("client_cancelled")

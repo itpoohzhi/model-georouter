@@ -320,6 +320,10 @@ In `~/.config/model-georouter/config.json`, verify that the `route-de` egress po
 
 ```json
 {
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 10830
+  },
   "pools": {
     "direct": { "type": "direct" },
     "route-de": {
@@ -328,6 +332,9 @@ In `~/.config/model-georouter/config.json`, verify that the `route-de` egress po
       "proxies": ["http://127.0.0.1:10820"]
     }
   },
+  "rules": [
+    { "match_prefix": ["claude-", "gpt-"], "pool": "route-de" }
+  ],
   "adapters": {
     "cloudcode": {
       "prefixes": ["/cloudcode"],
