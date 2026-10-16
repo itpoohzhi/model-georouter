@@ -211,6 +211,10 @@ python3 -m model_georouter --config ~/.config/model-georouter/config.json
 
 **macOS LaunchAgent (Background Daemon):**
 Create `~/Library/LaunchAgents/com.user.model-georouter.plist`:
+
+<details>
+<summary><b>com.user.model-georouter.plist (Click to expand)</b></summary>
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -235,6 +239,8 @@ Create `~/Library/LaunchAgents/com.user.model-georouter.plist`:
 </dict>
 </plist>
 ```
+
+</details>
 Load the daemon:
 ```bash
 launchctl load ~/Library/LaunchAgents/com.user.model-georouter.plist
