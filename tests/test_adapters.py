@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from model_georouter.adapters import (
@@ -12,6 +14,7 @@ from model_georouter.adapters import (
 )
 from model_georouter.config import parse_config
 from model_georouter.errors import BadRequestError
+from model_georouter.model_router import SKIP_THOUGHT_SIGNATURE_VALIDATOR, sanitize_google_v1beta_body
 from tests.helpers import HttpUpstream, http_request, make_config, respond
 
 OPENCODE = OpenCodeAdapter(("/v1", "/go/v1"), "opencode-ai")
@@ -301,3 +304,80 @@ def test_admin_early_response_drains_request_body(track, start_bridge, method, p
     response = http_request(bridge.port, method, path, b"x" * (8 * 1024 * 1024))
     assert response.status == status and response.json
     assert upstream.requests == []
+
+
+# ───────────────────────────── Нормализация тела Google v1beta ─────────────────────────────
+
+SKIP_SIG = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
+
+
+def _dump(payload) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops():
+    assert SKIP_THOUGHT_SIGNATURE_VALIDATOR == SKIP_SIG
+    leaked = "<unused94>thought\nplan<unused95>Real text\nend.]]> Let's stop.]]> Let's end.]]> Let's stop.]]>"
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {
+                "role": "model",
+                "parts": [
+                    {"functionCall": {"name": "bash", "args": {}}},
+                    {"functionCall": {"name": "ls", "args": {}}, "thoughtSignature": "existing-sig"},
+                    {"text": leaked},
+                ],
+            },
+        ]
+    }
+    out = json.loads(sanitize_google_v1beta_body(_dump(payload)))
+    parts = out["contents"][1]["parts"]
+    assert parts[0]["thoughtSignature"] == SKIP_SIG
+    assert parts[1]["thoughtSignature"] == "existing-sig"
+    assert parts[2] == {"text": "Real text"}
+    assert out["contents"][0] == payload["contents"][0]
+
+
+def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part():
+    payload = {"contents": [{"role": "model", "parts": [{"text": "<unused94>thought\nonly thinking<unused95>"}]}]}
+    out = json.loads(sanitize_google_v1beta_body(_dump(payload)))
+    assert out["contents"][0]["parts"] == [{"text": " "}]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not json",
+        b"[1,2]",
+        b'{"contents":"x"}',
+        b'{"contents":[{"role":"user","parts":[{"functionCall":{"name":"a"}}]}]}',
+        b'{"contents": [{"role": "model", "parts": [{"functionCall": {"name": "a"}, "thoughtSignature": "s"}]}]}',
+        b'{"contents": [{"role": "model", "parts": [{"text": "plain"}]}]}',
+    ],
+)
+def test_sanitize_google_v1beta_body_returns_same_bytes_without_mutation(raw):
+    out = sanitize_google_v1beta_body(raw)
+    assert raw is out
+
+
+def test_google_v1beta_route_sanitizes_body_and_updates_content_length(track, start_bridge):
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    payload = {"contents": [{"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]}]}
+    raw = _dump(payload)
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/go/v1/v1beta/models/gemini-4-argon-contributor:streamGenerateContent?alt=sse",
+        raw,
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200
+    seen = upstream.requests[0]
+    assert seen.path.startswith("/inference/go/google/v1beta/models/gemini-4-argon-contributor:streamGenerateContent")
+    sent = json.loads(seen.body)
+    assert sent["contents"][0]["parts"][0]["thoughtSignature"] == SKIP_SIG
+    assert seen.body != raw
+    assert seen.headers["content-length"] == str(len(seen.body))

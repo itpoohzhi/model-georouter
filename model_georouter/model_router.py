@@ -7,6 +7,7 @@ import re
 import zlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 from .config import BridgeConfig, RuleConfig
 from .errors import BadRequestError, BodyTooLargeError
@@ -27,6 +28,74 @@ def model_from_path(path: str) -> str | None:
     """Модель из пути вида `/v1beta/models/<model>:generateContent` (Google-совместимые API)."""
     match = _MODEL_PATH_RE.search(path)
     return match.group(1) if match else None
+
+
+SKIP_THOUGHT_SIGNATURE_VALIDATOR = (
+    "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="  # base64("skip_thought_signature_validator")
+)
+_THOUGHT_BLOCK_RE = re.compile(r"<unused94>thought[\s\S]*?(?:<unused95>|$)")
+_REPETITION_LOOP_RE = re.compile(r"(?:\s*(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)*\s*\]\]>){2,}[\s\S]*$")
+
+
+def _sanitize_model_parts(parts: list[Any]) -> list[Any] | None:
+    """Очищенные части `role=model` или `None`, если менять нечего."""
+    new_parts: list[Any] = []
+    changed = False
+    for part in parts:
+        if not isinstance(part, dict):
+            new_parts.append(part)
+            continue
+        if "functionCall" in part and not part.get("thoughtSignature"):
+            part = {**part, "thoughtSignature": SKIP_THOUGHT_SIGNATURE_VALIDATOR}
+            changed = True
+        text = part.get("text")
+        if isinstance(text, str):
+            cleaned = text
+            if "<unused94>thought" in cleaned or "<unused95>" in cleaned:
+                cleaned = _THOUGHT_BLOCK_RE.sub("", cleaned).replace("<unused95>", "")
+            if cleaned.count("]]>") >= 4:
+                cleaned = _REPETITION_LOOP_RE.sub("", cleaned).rstrip()
+            if cleaned != text:
+                part = {**part, "text": cleaned}
+                changed = True
+                if not cleaned.strip() and not part.get("thoughtSignature") and "functionCall" not in part:
+                    continue
+        new_parts.append(part)
+    if not changed:
+        return None
+    return new_parts or [{"text": " "}]
+
+
+def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
+    """Нормализует тело Google `v1beta`: `thoughtSignature` для `functionCall` и очистка утёкших мыслей/петель.
+
+    Без мутаций возвращает исходные байты как есть (тот же объект).
+    """
+    if not raw_body:
+        return raw_body
+    try:
+        payload = json.loads(raw_body)
+    except (ValueError, RecursionError):
+        return raw_body
+    if not isinstance(payload, dict):
+        return raw_body
+    contents = payload.get("contents")
+    if not isinstance(contents, list):
+        return raw_body
+    mutated = False
+    for content in contents:
+        if not isinstance(content, dict) or content.get("role") != "model":
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        new_parts = _sanitize_model_parts(parts)
+        if new_parts is not None:
+            content["parts"] = new_parts
+            mutated = True
+    if not mutated:
+        return raw_body
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def _decode_json_string(raw: bytes) -> str:
@@ -76,6 +145,10 @@ class BodyInspector:
     @property
     def body(self) -> bytes:
         return bytes(self._buf)
+
+    def replace_body(self, data: bytes) -> None:
+        """Подменить буфер нормализованным телом (для отправки и гео-повтора)."""
+        self._buf = bytearray(data)
 
     def feed(self, data: bytes) -> None:
         if len(self._buf) + len(data) > self._max:

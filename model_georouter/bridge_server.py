@@ -42,7 +42,13 @@ from .http_wire import (
     read_head_block,
 )
 from .logging_utils import get_logger
-from .model_router import BodyInspector, ModelRouter, RegionErrorClassifier, model_from_path
+from .model_router import (
+    BodyInspector,
+    ModelRouter,
+    RegionErrorClassifier,
+    model_from_path,
+    sanitize_google_v1beta_body,
+)
 from .proxy_pool import EgressSettings, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
 
@@ -463,6 +469,8 @@ class _Handler(socketserver.BaseRequestHandler):
 
         inspector = self._read_request_body(sock, req, rest, cfg.body_buffer_max_bytes, cfg.body_timeout)
         self.model = inspector.model or model_from_path(path)
+        if req.method == "POST" and "/v1beta/models/" in route.path and inspector.size > 0:
+            inspector.replace_body(sanitize_google_v1beta_body(inspector.body))
         decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache)
         if decision.source == "geo_cache":
             srv.metrics.incr("geo_cache_hits")
