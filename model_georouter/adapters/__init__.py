@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from ..config import BridgeConfig
 from .admin import AdminAdapter
 from .base import AdapterRoute, ClientAdapter, clean_path
+from .cloudcode import CloudCodeAdapter
 from .cordis import CordisAdapter
 from .generic import GenericAdapter
 from .opencode import OpenCodeAdapter
@@ -15,6 +16,7 @@ ADAPTER_CLASSES: dict[str, type[ClientAdapter]] = {
     "opencode": OpenCodeAdapter,
     "cordis": CordisAdapter,
     "generic": GenericAdapter,
+    "cloudcode": CloudCodeAdapter,
 }
 
 
@@ -28,11 +30,18 @@ class AdapterRegistry:
     def from_config(cls, config: BridgeConfig) -> AdapterRegistry:
         return cls(
             [
-                ADAPTER_CLASSES[name](adapter.prefixes, adapter.upstream)
+                ADAPTER_CLASSES[name](adapter.prefixes, adapter.upstream, pool=adapter.pool)
                 for name, adapter in config.adapters.items()
                 if name in ADAPTER_CLASSES
             ]
         )
+
+    def get(self, name: str) -> ClientAdapter | None:
+        """Получить адаптер по его имени."""
+        for adapter in self.adapters:
+            if adapter.name == name:
+                return adapter
+        return None
 
     def resolve(self, path: str) -> AdapterRoute | None:
         cleaned = clean_path(path)
@@ -51,6 +60,7 @@ __all__ = [
     "AdapterRoute",
     "AdminAdapter",
     "ClientAdapter",
+    "CloudCodeAdapter",
     "CordisAdapter",
     "GenericAdapter",
     "OpenCodeAdapter",

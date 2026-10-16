@@ -709,3 +709,121 @@ def test_chunk_without_trailing_crlf_gets_400(track, start_bridge):  # RW-011
         response = http_request(bridge.port, "POST", PATH, wire, {"Transfer-Encoding": "chunked"})
         assert response.status == 400 and response.json["error"]["type"] == "bad_request"
     assert up.requests == []
+
+
+def test_cloudcode_routes_via_adapter_pool_and_sanitizes(track, start_bridge):
+    google_payload = {
+        "currentTier": {"id": "standard-tier"},
+        "paidTier": {"id": "g1-ultra-tier"},
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    encoded = json.dumps(google_payload).encode("utf-8")
+
+    def upstream_handler(conn, req):
+        assert req.path == "/v1internal:loadCodeAssist"
+        respond(conn, 200, encoded, {"Content-Type": "application/json"})
+
+    up = track(HttpUpstream(upstream_handler))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", up.port)))
+    cfg = make_config(
+        up.port,
+        pools={
+            "direct": {"type": "direct"},
+            "route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{proxy.port}"]},
+        },
+        default_pool="direct",
+        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": up.port, "use_tls": False}},
+        adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa", "pool": "route-de"}},
+    )
+    bridge = start_bridge(cfg)
+
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/cloudcode/v1internal:loadCodeAssist",
+        b"{}",
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200
+    data = json.loads(response.body)
+    assert data["ineligibleTiers"] == []
+    assert len(proxy.connections) == 1
+
+
+def test_cloudcode_chunked_response_sanitized(track, start_bridge):
+    google_payload = {
+        "currentTier": {"id": "standard-tier"},
+        "paidTier": {"id": "g1-ultra-tier"},
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    encoded = json.dumps(google_payload).encode("utf-8")
+    part1, part2 = encoded[:15], encoded[15:]
+
+    def upstream_handler(conn, req):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        conn.sendall(f"{len(part1):x}\r\n".encode() + part1 + b"\r\n")
+        conn.sendall(f"{len(part2):x}\r\n".encode() + part2 + b"\r\n")
+        conn.sendall(b"0\r\n\r\n")
+
+    up = track(HttpUpstream(upstream_handler))
+    cfg = make_config(
+        up.port,
+        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": up.port, "use_tls": False}},
+        adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
+    )
+    bridge = start_bridge(cfg)
+
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/cloudcode/v1internal:loadCodeAssist",
+        b"{}",
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200
+    data = json.loads(response.body)
+    assert data["ineligibleTiers"] == []
+    assert "transfer-encoding" not in response.headers
+    assert response.headers["content-length"] == str(len(response.body))
+
+
+def test_cloudcode_unmodified_chunked_response_framing_normalized(track, start_bridge):
+    """Chunked-ответ без мутации (например, без unsupported_location) нормализуется с Content-Length без IncompleteRead (RW-001)."""
+    google_payload = {
+        "currentTier": {"id": "standard-tier"},
+        "ineligibleTiers": [{"reasonCode": "PAYMENT_REQUIRED", "tierId": "pro-tier"}],
+    }
+    encoded = json.dumps(google_payload).encode("utf-8")
+    part1, part2 = encoded[:10], encoded[10:]
+
+    def upstream_handler(conn, req):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        conn.sendall(f"{len(part1):x}\r\n".encode() + part1 + b"\r\n")
+        conn.sendall(f"{len(part2):x}\r\n".encode() + part2 + b"\r\n")
+        conn.sendall(b"0\r\n\r\n")
+
+    up = track(HttpUpstream(upstream_handler))
+    cfg = make_config(
+        up.port,
+        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": up.port, "use_tls": False}},
+        adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
+    )
+    bridge = start_bridge(cfg)
+
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/cloudcode/v1internal:loadCodeAssist",
+        b"{}",
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200
+    data = json.loads(response.body)
+    assert data["ineligibleTiers"] == [{"reasonCode": "PAYMENT_REQUIRED", "tierId": "pro-tier"}]
+    assert "transfer-encoding" not in response.headers
+    assert response.headers["content-length"] == str(len(response.body))
+    assert response.body == encoded

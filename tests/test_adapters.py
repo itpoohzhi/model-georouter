@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
 from model_georouter.adapters import (
     AdapterRegistry,
     AdminAdapter,
+    CloudCodeAdapter,
     CordisAdapter,
     GenericAdapter,
     OpenCodeAdapter,
@@ -14,12 +18,14 @@ from model_georouter.adapters import (
 )
 from model_georouter.config import parse_config
 from model_georouter.errors import BadRequestError
+from model_georouter.http_wire import ResponseHead
 from model_georouter.model_router import SKIP_THOUGHT_SIGNATURE_VALIDATOR, sanitize_google_v1beta_body
-from tests.helpers import HttpUpstream, http_request, make_config, respond
+from tests.helpers import BridgeHarness, FakeConnectProxy, HttpUpstream, http_request, make_config, respond
 
 OPENCODE = OpenCodeAdapter(("/v1", "/go/v1"), "opencode-ai")
 CORDIS = CordisAdapter(("/zen/v1", "/zen/go/v1"), "cordis-ai")
 GENERIC = GenericAdapter(("/messages", "/chat/completions"), "openrouter-ai")
+CLOUDCODE = CloudCodeAdapter(("/cloudcode",), "cloudcode-pa", "route-de")
 
 
 @pytest.mark.parametrize(
@@ -311,11 +317,11 @@ def test_admin_early_response_drains_request_body(track, start_bridge, method, p
 SKIP_SIG = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
 
 
-def _dump(payload) -> bytes:
+def _dump(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops():
+def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops() -> None:
     assert SKIP_THOUGHT_SIGNATURE_VALIDATOR == SKIP_SIG
     leaked = "<unused94>thought\nplan<unused95>Real text\nend.]]> Let's stop.]]> Let's end.]]> Let's stop.]]>"
     payload = {
@@ -339,7 +345,7 @@ def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops(
     assert out["contents"][0] == payload["contents"][0]
 
 
-def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part():
+def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part() -> None:
     payload = {"contents": [{"role": "model", "parts": [{"text": "<unused94>thought\nonly thinking<unused95>"}]}]}
     out = json.loads(sanitize_google_v1beta_body(_dump(payload)))
     assert out["contents"][0]["parts"] == [{"text": " "}]
@@ -355,14 +361,34 @@ def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part()
         b'{"contents":[{"role":"user","parts":[{"functionCall":{"name":"a"}}]}]}',
         b'{"contents": [{"role": "model", "parts": [{"functionCall": {"name": "a"}, "thoughtSignature": "s"}]}]}',
         b'{"contents": [{"role": "model", "parts": [{"text": "plain"}]}]}',
+        # непарные `]]>` в «соседних» CDATA без петли: хвостовые пробелы не теряются
+        _dump(
+            {
+                "contents": [
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": "Keep <x><![CDATA[a]]></x> <x><![CDATA[b]]></x> "
+                                "<x><![CDATA[c]]></x> <x><![CDATA[d]]></x>  "
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        # < 4 маркеров `]]>`: порог не достигнут, короткая петля остаётся как есть
+        _dump({"contents": [{"role": "model", "parts": [{"text": "Real]]> Let's stop.]]> Let's stop.]]>"}]}]}),
     ],
 )
-def test_sanitize_google_v1beta_body_returns_same_bytes_without_mutation(raw):
+def test_sanitize_google_v1beta_body_returns_same_bytes_without_mutation(raw: bytes) -> None:
     out = sanitize_google_v1beta_body(raw)
     assert raw is out
 
 
-def test_google_v1beta_route_sanitizes_body_and_updates_content_length(track, start_bridge):
+def test_google_v1beta_route_sanitizes_body_and_updates_content_length(
+    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
+) -> None:
     upstream = track(HttpUpstream(echo_path))
     bridge = start_bridge(make_config(upstream.port))
     payload = {"contents": [{"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]}]}
@@ -381,3 +407,279 @@ def test_google_v1beta_route_sanitizes_body_and_updates_content_length(track, st
     assert sent["contents"][0]["parts"][0]["thoughtSignature"] == SKIP_SIG
     assert seen.body != raw
     assert seen.headers["content-length"] == str(len(seen.body))
+
+
+def test_sanitize_google_v1beta_body_whitespace_prefix_is_linear_and_unchanged() -> None:
+    raw = _dump({"contents": [{"role": "model", "parts": [{"text": " " * 20000 + "x]]> x]]> x]]> x]]>"}]}]})
+    started = time.perf_counter()
+    out = sanitize_google_v1beta_body(raw)
+    assert time.perf_counter() - started < 0.2
+    assert out is raw
+
+
+def test_sanitize_google_v1beta_body_strips_loop_after_long_whitespace_prefix_quickly() -> None:
+    text = "Answer" + " " * 20000 + "end.]]> Let's stop.]]> stop.]]> end.]]>"
+    raw = _dump({"contents": [{"role": "model", "parts": [{"text": text}]}]})
+    started = time.perf_counter()
+    out = json.loads(sanitize_google_v1beta_body(raw))
+    assert time.perf_counter() - started < 0.2
+    assert out["contents"][0]["parts"] == [{"text": "Answer"}]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # петля начинается с голого `]]>`, повторы с литералом
+        "Answer]]> Let's stop.]]> Let's stop.]]> Let's stop.]]>",
+        # цепочка из одних `]]>` без литералов
+        "Answer]]>]]>]]>]]>",
+    ],
+)
+def test_sanitize_google_v1beta_body_strips_loop_with_bare_marker(text: str) -> None:
+    raw = _dump({"contents": [{"role": "model", "parts": [{"text": text}]}]})
+    out = json.loads(sanitize_google_v1beta_body(raw))
+    assert out["contents"][0]["parts"] == [{"text": "Answer"}]
+
+
+def test_sanitize_google_v1beta_body_survives_unpaired_surrogate() -> None:
+    raw = (
+        b'{"contents":[{"role":"model","parts":[{"functionCall":{"name":"f"}}]},'
+        b'{"role":"user","parts":[{"text":"\\ud800"}]}]}'
+    )
+    out = sanitize_google_v1beta_body(raw)
+    assert out is not raw
+    parsed = json.loads(out)
+    assert parsed["contents"][0]["parts"][0]["thoughtSignature"] == SKIP_SIG
+    assert parsed["contents"][1]["parts"][0]["text"] == "\ud800"
+
+
+def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_attempts(
+    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
+) -> None:
+    region_body = b'{"error":{"type":"RegionError","message":"not available in your region"}}'
+
+    def region_blocked(conn: Any, req: Any) -> None:
+        respond(conn, 403, region_body, {"Content-Type": "application/json"})
+
+    def ok(conn: Any, req: Any) -> None:
+        respond(conn, 200, b"served-via-proxy", {"Content-Type": "text/plain"})
+
+    direct_up = track(HttpUpstream(region_blocked))
+    proxied_up = track(HttpUpstream(ok))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(
+        make_config(
+            direct_up.port,
+            pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{proxy.port}"]}},
+            geo_fallback_pool="route-de",
+            server={"geo_error_signatures": ["RegionError"]},
+        )
+    )
+    raw = _dump(
+        {
+            "contents": [
+                {"role": "user", "parts": [{"text": "Привет, мир"}]},
+                {"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]},
+            ]
+        }
+    )
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/go/v1/v1beta/models/gemini-4-argon-contributor:generateContent",
+        raw,
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200 and response.body == b"served-via-proxy"
+    assert len(direct_up.requests) == 1 and len(proxied_up.requests) == 1
+    first, second = direct_up.requests[0], proxied_up.requests[0]
+    assert first.body == second.body != raw
+    assert "Привет, мир" in first.body.decode("utf-8")
+    assert json.loads(first.body)["contents"][1]["parts"][0]["thoughtSignature"] == SKIP_SIG
+    assert first.headers["content-length"] == second.headers["content-length"] == str(len(first.body))
+
+
+def test_cloudcode_normalization():
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    assert route.adapter == "cloudcode"
+    assert route.upstream == "cloudcode-pa"
+    assert route.path == "/v1internal:loadCodeAssist"
+    assert route.pool == "route-de"
+
+    route_root = CLOUDCODE.route("/cloudcode")
+    assert route_root is not None
+    assert route_root.path == "/"
+
+    route_clean = CLOUDCODE.route("//cloudcode//v1internal:loadCodeAssist/")
+    assert route_clean is not None
+    assert route_clean.path == "/v1internal:loadCodeAssist"
+
+    assert CLOUDCODE.route("/other/endpoint") is None
+
+
+def test_cloudcode_wants_transform():
+    route_assist = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route_assist is not None
+    head_200 = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
+    head_403 = ResponseHead("HTTP/1.1", 403, "Forbidden", (("Content-Type", "application/json"),))
+    head_500 = ResponseHead("HTTP/1.1", 500, "Internal Server Error", (("Content-Type", "application/json"),))
+
+    assert CLOUDCODE.wants_transform(route_assist, head_200) is True
+    assert CLOUDCODE.wants_transform(route_assist, head_403) is False
+    assert CLOUDCODE.wants_transform(route_assist, head_500) is False
+
+    route_other = CLOUDCODE.route("/cloudcode/v1/models")
+    assert route_other is not None
+    assert CLOUDCODE.wants_transform(route_other, head_200) is False
+
+
+def test_cloudcode_transform_response_strips_unsupported_location():
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead(
+        "HTTP/1.1",
+        200,
+        "OK",
+        (
+            ("Content-Type", "application/json"),
+            ("Content-Length", "999"),
+            ("Transfer-Encoding", "chunked"),
+        ),
+    )
+    original = {
+        "currentTier": {"id": "standard-tier"},
+        "paidTier": {"id": "g1-ultra-tier"},
+        "allowedTiers": [{"tierId": "standard-tier"}],
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    body = json.dumps(original).encode("utf-8")
+    new_head, new_body = CLOUDCODE.transform_response(route, head, body)
+
+    transformed = json.loads(new_body)
+    assert transformed["currentTier"] == {"id": "standard-tier"}
+    assert transformed["paidTier"] == {"id": "g1-ultra-tier"}
+    assert transformed["allowedTiers"] == [{"tierId": "standard-tier"}]
+    assert transformed["ineligibleTiers"] == []
+    assert new_head.get("content-length") == str(len(new_body))
+    assert new_head.get("transfer-encoding") is None
+
+
+def test_cloudcode_transform_response_preserves_other_reasons():
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
+    original = {
+        "currentTier": {"id": "standard-tier"},
+        "ineligibleTiers": [{"reasonCode": "PAYMENT_REQUIRED", "tierId": "premium-tier"}],
+    }
+    body = json.dumps(original).encode("utf-8")
+    new_head, new_body = CLOUDCODE.transform_response(route, head, body)
+    assert new_body == body
+    assert new_head == head
+
+
+def test_cloudcode_transform_response_fail_safe_on_invalid_json():
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
+    invalid_body = b"not a valid json {{"
+    new_head, new_body = CLOUDCODE.transform_response(route, head, invalid_body)
+    assert new_body == invalid_body
+    assert new_head == head
+
+
+def test_cloudcode_transform_response_handles_gzip():
+    import gzip
+
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead(
+        "HTTP/1.1",
+        200,
+        "OK",
+        (
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ),
+    )
+    original = {
+        "currentTier": {"id": "standard-tier"},
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    compressed = gzip.compress(json.dumps(original).encode("utf-8"))
+    new_head, new_body = CLOUDCODE.transform_response(route, head, compressed)
+
+    transformed = json.loads(new_body)
+    assert transformed["ineligibleTiers"] == []
+    assert new_head.get("content-encoding") is None
+    assert new_head.get("content-length") == str(len(new_body))
+
+
+def test_cloudcode_bridge_end_to_end(track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]):
+    google_payload = {
+        "currentTier": {"id": "standard-tier"},
+        "paidTier": {"id": "g1-ultra-tier"},
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    encoded = json.dumps(google_payload).encode("utf-8")
+
+    def upstream_handler(conn: Any, req: Any):
+        assert req.path == "/v1internal:loadCodeAssist"
+        respond(conn, 200, encoded, {"Content-Type": "application/json"})
+
+    up = track(HttpUpstream(upstream_handler))
+    cfg = make_config(
+        up.port,
+        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": up.port, "use_tls": False}},
+        adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
+    )
+    bridge = start_bridge(cfg)
+
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/cloudcode/v1internal:loadCodeAssist",
+        b"{}",
+        {"Content-Type": "application/json"},
+    )
+    assert response.status == 200
+    data = json.loads(response.body)
+    assert data["currentTier"] == {"id": "standard-tier"}
+    assert data["paidTier"] == {"id": "g1-ultra-tier"}
+    assert data["ineligibleTiers"] == []
+    assert response.headers["content-length"] == str(len(response.body))
+
+
+def test_cloudcode_transform_response_requires_tier():
+    """Без currentTier и без paidTier ineligibleTiers НЕ удаляются (RW-002)."""
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
+    original = {
+        "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
+    }
+    body = json.dumps(original).encode("utf-8")
+    new_head, new_body = CLOUDCODE.transform_response(route, head, body)
+    assert new_body == body
+    assert new_head == head
+
+
+def test_cloudcode_transform_response_handles_corrupt_gzip():
+    """Повреждённый gzip-поток (zlib.error / BadGzipFile) возвращает исходный ответ без исключения (RW-003)."""
+    route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
+    assert route is not None
+    head = ResponseHead(
+        "HTTP/1.1",
+        200,
+        "OK",
+        (
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ),
+    )
+    # Валидный заголовок gzip, но повреждённый deflate-поток
+    corrupt_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\x00\x00"
+    new_head, new_body = CLOUDCODE.transform_response(route, head, corrupt_gzip)
+    assert new_body == corrupt_gzip
+    assert new_head == head

@@ -88,6 +88,7 @@ def test_explicit_values_override_defaults():
         (lambda d: d.update(adapters={"opencode": {"upstream": "ghost"}}), "upstream"),
         (lambda d: d.update(adapters={"mystery": {}}), "unknown adapter"),
         (lambda d: d.update(adapters={"opencode": {"prefixes": ["v1"]}}), "prefix"),
+        (lambda d: d.update(adapters={"cloudcode": {"pool": "ghost"}}), "pool"),
         (lambda d: d.update(upstreams={"x": {"port": 1}}), "host"),
     ],
 )

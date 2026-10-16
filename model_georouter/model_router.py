@@ -34,7 +34,13 @@ SKIP_THOUGHT_SIGNATURE_VALIDATOR = (
     "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="  # base64("skip_thought_signature_validator")
 )
 _THOUGHT_BLOCK_RE = re.compile(r"<unused94>thought[\s\S]*?(?:<unused95>|$)")
-_REPETITION_LOOP_RE = re.compile(r"(?:\s*(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)*\s*\]\]>){2,}[\s\S]*$")
+# Литерал-префикс необязателен; без ведущего `\s*` матч стартует только на `end.`/`stop.`/`Let's`/`]]>`,
+# а в повторе первые символы `\s*`, литерала и `]]>` не пересекаются — иначе суперлинейный backtracking.
+_REPETITION_LOOP_RE = re.compile(
+    r"(?:(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)\s*)?\]\]>"
+    r"(?:\s*(?:(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)\s*)?\]\]>)+[\s\S]*$"
+)
+_REPETITION_LOOP_MIN_MARKERS = 4
 
 
 def _sanitize_model_parts(parts: list[Any]) -> list[Any] | None:
@@ -53,8 +59,10 @@ def _sanitize_model_parts(parts: list[Any]) -> list[Any] | None:
             cleaned = text
             if "<unused94>thought" in cleaned or "<unused95>" in cleaned:
                 cleaned = _THOUGHT_BLOCK_RE.sub("", cleaned).replace("<unused95>", "")
-            if cleaned.count("]]>") >= 4:
-                cleaned = _REPETITION_LOOP_RE.sub("", cleaned).rstrip()
+            if cleaned.count("]]>") >= _REPETITION_LOOP_MIN_MARKERS:
+                loop_match = _REPETITION_LOOP_RE.search(cleaned)
+                if loop_match is not None:
+                    cleaned = cleaned[: loop_match.start()].rstrip()
             if cleaned != text:
                 part = {**part, "text": cleaned}
                 changed = True
@@ -69,7 +77,10 @@ def _sanitize_model_parts(parts: list[Any]) -> list[Any] | None:
 def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
     """Нормализует тело Google `v1beta`: `thoughtSignature` для `functionCall` и очистка утёкших мыслей/петель.
 
-    Без мутаций возвращает исходные байты как есть (тот же объект).
+    Без мутаций возвращает исходные байты как есть (тот же объект). Петля повторов вырезается только при
+    `count("]]>") >= 4` в тексте части: короткие одиночные/парные CDATA-маркеры (`<![CDATA[a]]>`) не трогаются.
+    Непарные UTF-16 суррогаты (`\\ud800`) проходят `json.loads`, но не кодируются в UTF-8: при
+    `UnicodeEncodeError` тело сериализуется с `ensure_ascii=True` (суррогат остаётся экранированным).
     """
     if not raw_body:
         return raw_body
@@ -95,7 +106,10 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
             mutated = True
     if not mutated:
         return raw_body
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
 def _decode_json_string(raw: bytes) -> str:
@@ -297,18 +311,25 @@ class ModelRouter:
     def from_config(cls, config: BridgeConfig) -> ModelRouter:
         return cls(config)
 
-    def match(self, model: str | None) -> RouteDecision:
+    def match(self, model: str | None, default_pool: str | None = None) -> RouteDecision:
         if model:
             for index, (rule, pattern) in enumerate(self._rules):
                 if any(model.startswith(prefix) for prefix in rule.match_prefix) or (
                     pattern is not None and pattern.search(model)
                 ):
                     return RouteDecision(rule.pool, "rule", index)
-        return RouteDecision(self._default, "default")
+        chosen_default = default_pool if (default_pool and default_pool in self._pools) else self._default
+        return RouteDecision(chosen_default, "default")
 
-    def decide(self, model: str | None, upstream: str, geo_cache: GeoCache | None = None) -> RouteDecision:
+    def decide(
+        self,
+        model: str | None,
+        upstream: str,
+        geo_cache: GeoCache | None = None,
+        default_pool: str | None = None,
+    ) -> RouteDecision:
         """Правила + Geo-Cache: закэшированная гео-блокировка прямого маршрута уводит в `geo_fallback_pool`."""
-        decision = self.match(model)
+        decision = self.match(model, default_pool=default_pool)
         if (
             geo_cache is not None
             and self._fallback

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import unquote
 
 from ..errors import BadRequestError
+
+if TYPE_CHECKING:
+    from ..http_wire import ResponseHead
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,7 @@ class AdapterRoute:
     adapter: str
     upstream: str
     path: str
+    pool: str = ""
 
 
 def clean_path(path: str) -> str:
@@ -43,9 +48,10 @@ class ClientAdapter:
 
     name = "adapter"
 
-    def __init__(self, prefixes: tuple[str, ...], upstream: str):
+    def __init__(self, prefixes: tuple[str, ...], upstream: str, pool: str = ""):
         self.prefixes = prefixes
         self.upstream = upstream
+        self.pool = pool
 
     def match_length(self, path: str) -> int:
         """Длина самого длинного подходящего префикса (0 — путь не наш)."""
@@ -61,4 +67,12 @@ class ClientAdapter:
         cleaned = clean_path(path)
         if not self.match_length(cleaned):
             return None
-        return AdapterRoute(self.name, self.upstream, self.normalize(cleaned))
+        return AdapterRoute(self.name, self.upstream, self.normalize(cleaned), self.pool)
+
+    def wants_transform(self, route: AdapterRoute, head: ResponseHead) -> bool:
+        """Определяет, требует ли ответ апстрима буферизации и модификации."""
+        return False
+
+    def transform_response(self, route: AdapterRoute, head: ResponseHead, body: bytes) -> tuple[ResponseHead, bytes]:
+        """Модифицирует заголовки и тело ответа перед отправкой клиенту."""
+        return head, body

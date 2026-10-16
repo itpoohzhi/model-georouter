@@ -471,7 +471,7 @@ class _Handler(socketserver.BaseRequestHandler):
         self.model = inspector.model or model_from_path(path)
         if req.method == "POST" and "/v1beta/models/" in route.path and inspector.size > 0:
             inspector.replace_body(sanitize_google_v1beta_body(inspector.body))
-        decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache)
+        decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache, default_pool=route.pool or None)
         if decision.source == "geo_cache":
             srv.metrics.incr("geo_cache_hits")
         upstream = snapshot.upstreams[route.upstream]
@@ -545,6 +545,48 @@ class _Handler(socketserver.BaseRequestHandler):
             up = self._connect_upstream(snapshot, pool, upstream)
             self._send_upstream_request(up, req, route, query, upstream, inspector, cfg.body_timeout)
             head, rest = self._read_upstream_head(up, cfg.headers_timeout)
+            adapter = runtime.registry.get(route.adapter)
+            if adapter and adapter.wants_transform(route, head):
+                body_collector = bytearray()
+                framing = framing_for_response(req.method, head.status, head.headers, body_collector.extend)
+                if rest:
+                    framing.feed(rest)
+                deadline = time.monotonic() + cfg.body_timeout
+                while not framing.complete:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise UpstreamTimeoutError("upstream response body timeout")
+                    up.settimeout(remaining)
+                    chunk = up.recv(65536)
+                    if not chunk:
+                        if not framing.complete and not framing.on_eof():
+                            raise UpstreamProtocolError("upstream response body truncated")
+                        break
+                    framing.feed(chunk)
+                new_head, new_body = adapter.transform_response(route, head, bytes(body_collector))
+                # Нормализация HTTP-фрейминга: тело было буферизовано и лишено чанковой разметки.
+                # Клиент обязан получить Content-Length и чистый ответ без Transfer-Encoding: chunked.
+                norm_headers = [
+                    (k, v) for k, v in new_head.headers if k.lower() not in {"transfer-encoding", "content-length"}
+                ]
+                norm_headers.append(("Content-Length", str(len(new_body))))
+                final_head = ResponseHead(
+                    version=new_head.version,
+                    status=new_head.status,
+                    reason=new_head.reason,
+                    headers=tuple(norm_headers),
+                )
+                self.status = final_head.status
+                self.committed = True
+                try:
+                    sock.settimeout(cfg.body_timeout)
+                    sock.sendall(build_client_head(final_head))
+                    if req.method != "HEAD" and new_body:
+                        sock.sendall(new_body)
+                except OSError:
+                    self.outcome = "client_cancelled"
+                    self.server.metrics.incr("client_cancelled")
+                return
             framing = framing_for_response(req.method, head.status, head.headers)
             initial, initial_fed = rest, False
             if head.status == 403 and replay_allowed:

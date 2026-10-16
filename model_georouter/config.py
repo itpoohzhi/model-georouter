@@ -100,6 +100,7 @@ class UpstreamConfig:
 class AdapterConfig:
     prefixes: tuple[str, ...]
     upstream: str
+    pool: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,11 +137,13 @@ DEFAULT_UPSTREAMS = {
     "opencode-ai": UpstreamConfig("opencode.ai", 443, True),
     "cordis-ai": UpstreamConfig("opencode.ai", 443, True),
     "openrouter-ai": UpstreamConfig("openrouter.ai", 443, True, "/api"),
+    "cloudcode-pa": UpstreamConfig("daily-cloudcode-pa.googleapis.com", 443, True),
 }
 DEFAULT_ADAPTERS = {
     "opencode": AdapterConfig(("/v1", "/go/v1"), "opencode-ai"),
     "cordis": AdapterConfig(("/zen/v1", "/zen/go/v1"), "cordis-ai"),
     "generic": AdapterConfig(("/messages", "/chat/completions"), "openrouter-ai"),
+    "cloudcode": AdapterConfig(("/cloudcode",), "cloudcode-pa", "route-de"),
 }
 _SERVER_DEFAULTS = ServerConfig(listen=LOOPBACK, port=10830)
 
@@ -245,7 +248,11 @@ def _parse_upstreams(raw: Any) -> dict[str, UpstreamConfig]:
     return upstreams
 
 
-def _parse_adapters(raw: Any, upstreams: Mapping[str, UpstreamConfig]) -> dict[str, AdapterConfig]:
+def _parse_adapters(
+    raw: Any,
+    upstreams: Mapping[str, UpstreamConfig],
+    pools: Mapping[str, PoolConfig] | None = None,
+) -> dict[str, AdapterConfig]:
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
         path = f"adapters.{name}"
@@ -256,7 +263,14 @@ def _parse_adapters(raw: Any, upstreams: Mapping[str, UpstreamConfig]) -> dict[s
         prefixes = _string_list(section, "prefixes", default.prefixes, path)
         if any(not p.startswith("/") or (len(p) > 1 and p.endswith("/")) for p in prefixes):
             raise ConfigError(f"{path}.prefixes: each prefix must start with '/' and not end with '/'")
-        adapters[name] = AdapterConfig(prefixes, _string(section, "upstream", default.upstream, path))
+        pool = _string(section, "pool", default.pool, path)
+        if "pool" in section and pool and pools is not None and pool not in pools:
+            raise ConfigError(f"{path}.pool: unknown pool {pool!r}")
+        adapters[name] = AdapterConfig(
+            prefixes,
+            _string(section, "upstream", default.upstream, path),
+            pool=pool,
+        )
     for name, adapter in adapters.items():
         if adapter.upstream not in upstreams:
             raise ConfigError(f"adapters.{name}.upstream: unknown upstream {adapter.upstream!r}")
@@ -372,8 +386,8 @@ def parse_config(data: Any) -> BridgeConfig:
             raise ConfigError(f"config: missing required key {required!r}")
     server = _parse_server(_mapping(root["server"], "server"))
     upstreams = _parse_upstreams(root.get("upstreams", {}))
-    adapters = _parse_adapters(root.get("adapters", {}), upstreams)
     pools = _parse_pools(root["pools"])
+    adapters = _parse_adapters(root.get("adapters", {}), upstreams, pools)
     rules = _parse_rules(root["rules"], pools)
     default_pool = _string(root, "default_pool", "direct", "config")
     if default_pool not in pools:
