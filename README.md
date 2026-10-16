@@ -69,21 +69,22 @@ Agents point their standard `baseURL` to `http://127.0.0.1:10830`. The router:
   - `muse-*`, `gpt-*`, `meta/*` $\rightarrow$ Routed immediately through high-speed Frankfurt proxies (`route-de`).
   - `claude-*`, `anthropic/*` $\rightarrow$ Routed through Uzbekistan or Amsterdam proxies (`route-uz`, `route-hy2`).
   - `deepseek-*`, `qwen-*`, `minimax-*` $\rightarrow$ Routed **directly** via host interfaces without proxy latency.
+- Directs client-specific protocol adapters (e.g. `CloudCodeAdapter`) to upstream APIs with dedicated egress routing (e.g. `/cloudcode/*` $\rightarrow$ `https://daily-cloudcode-pa.googleapis.com` via `route-de`).
 - Transparently relays chunked Server-Sent Events (SSE) with `TCP_NODELAY`, preserving extended reasoning streams (`reasoning_content`) and prompt cache hits (`cached_tokens`).
 - Maintains an in-memory and persistent TTL GeoCache: if an unlisted model unexpectedly receives a 403 RegionError, the router transparently replays it through the fallback proxy pool and remembers it for 24 hours.
 
 ```
                            [ AI Agent Clients ]
-       OpenCode CLI        DeepSeek Harness        Claude / Aider / curl
+       OpenCode CLI        DeepSeek Harness        Google Antigravity CLI (agy)
             │                     │                          │
             └─────────────────────┼──────────────────────────┘
                                   ▼
                      http://127.0.0.1:10830
             ┌──────────────────────────────────────────────┐
             │          model-georouter (Local L7)          │
-            │   - Ingress Path Normalization               │
-            │   - Model JSON Extraction                    │
-            │   - Prefix / Regex Routing Table             │
+            │   - Ingress Path Normalization & Adapters    │
+            │   - Model JSON Extraction & Regex Routing    │
+            │   - Response Rewriting & Geo-Sanitization    │
             │   - 24h Adaptive GeoCache                    │
             └───────────────┬──────────────┬───────────────┘
                             │              │
@@ -99,12 +100,22 @@ Agents point their standard `baseURL` to `http://127.0.0.1:10830`. The router:
   Upstream AI Providers                                   Upstream AI Providers
 ```
 
+### Protocol Adapters & Upstream Routing
+
+| Adapter | Ingress Prefixes | Upstream Host | Egress Pool | Capabilities |
+|---|---|---|---|---|
+| `OpenCodeAdapter` | `/v1`, `/go/v1` | `opencode.ai:443` | Dynamic by model (`rules`) | Model extraction, streaming SSE |
+| `CordisAdapter` | `/zen/v1`, `/zen/go/v1` | `opencode.ai:443` | Dynamic by model (`rules`) | Path normalization, streaming SSE |
+| `GenericAdapter` | `/messages`, `/chat/completions` | `openrouter.ai:443` | Dynamic by model (`rules`) | Universal OpenAI/Anthropic format |
+| `CloudCodeAdapter` | `/cloudcode` | `daily-cloudcode-pa.googleapis.com:443` | Dedicated (`route-de`) | Response rewriting & `loadCodeAssist` geo-sanitization |
+
 ---
 
 ## Key Features
 
 - **Pure Standard Library:** Zero third-party Python runtime dependencies (`socketserver`, `socket`, `ssl`, `json`, `select`). Runs anywhere with Python 3.11+.
 - **Zero-Latency First Token (TTFT):** Known geo-restricted models route directly to their designated proxy on the first attempt, eliminating the 4-second penalty of dead direct calls.
+- **Response Rewriting & Geo-Sanitization (Google Cloud Code / Antigravity CLI):** Dedicated `CloudCodeAdapter` with selective downstream response transformation. Intercepts Google Cloud Code responses (`/v1internal:loadCodeAssist`), sanitizes false-positive `UNSUPPORTED_LOCATION` errors in `ineligibleTiers` when an active paid or current subscription tier is present, and recalculates downstream HTTP framing (`Content-Length`) while routing traffic through the Frankfurt proxy pool (`route-de`).
 - **Resource Isolation via Separate Slots:** Independent connection semaphores (default 16 direct / 16 proxy). A slow or stalling proxy connection will never starve or block direct traffic.
 - **Transparent Streaming SSE:** Zero response buffering. Relays token chunks, thinking/reasoning blocks, and prompt caching statistics in real time.
 - **Resilient Transport:** 12-second proxy connect timeouts, pre-send connection retries for single-proxy pools, and automatic health-penalty circuit breaking.
@@ -267,6 +278,71 @@ In your Cordis patch profile (`~/.dsh/profiles/desktop/cordis.patch.yml`):
     baseURL: "http://127.0.0.1:10830/zen/go/v1"
 ```
 
+### Google Antigravity CLI (agy)
+
+#### The Problem: False Location Eligibility Rejection
+Google Antigravity CLI (`agy`) communicates with Google's Cloud Code internal API (`daily-cloudcode-pa.googleapis.com`). On startup and before issuing agent prompts, `agy` performs an eligibility check by calling `/v1internal:loadCodeAssist` (handled in `server_oauth.go`).
+
+For accounts subscribed to Google AI Pro or Ultra, Google's API response includes both the active paid tier and a legacy free tier marked as ineligible due to geographic location:
+```json
+{
+  "currentTier": { "id": "tier-pro", "name": "Google AI Pro" },
+  "ineligibleTiers": [
+    { "id": "tier-free", "reasonCode": "UNSUPPORTED_LOCATION" }
+  ]
+}
+```
+The client-side logic iterates through all returned `ineligibleTiers`. Because `UNSUPPORTED_LOCATION` is present, `agy` terminates execution immediately:
+```text
+Eligibility check failed: ... location
+```
+Even when routing egress through a US or EU proxy, the account profile itself returns `tier-free` as unsupported, blocking all headless execution and agentic evaluations.
+
+#### The Solution: Ingress Rewriting via `CloudCodeAdapter`
+`model-georouter` provides built-in support for Google Cloud Code via `CloudCodeAdapter`:
+1. **Targeted Ingress & Egress:** Requests targeting `/cloudcode/*` are normalized and forwarded via TLS to `daily-cloudcode-pa.googleapis.com` through the Frankfurt proxy pool (`route-de` at `127.0.0.1:10820`).
+2. **On-the-Fly Sanitization:** When `/v1internal:loadCodeAssist` returns HTTP 200, the adapter inspects the JSON payload. If `currentTier` or `paidTier` is present, it strips any `ineligibleTiers` entries bearing `reasonCode: UNSUPPORTED_LOCATION`.
+3. **Framing Normalization:** Decompresses gzip if present, recalculates `Content-Length`, strips `Transfer-Encoding: chunked`, and delivers a clean 200 OK response to the CLI.
+
+#### Configuration
+In `~/.config/model-georouter/config.json`, verify that the `route-de` egress pool is defined:
+
+```json
+{
+  "pools": {
+    "direct": { "type": "direct" },
+    "route-de": {
+      "type": "http_connect",
+      "strategy": "first_available",
+      "proxies": ["http://127.0.0.1:10820"]
+    }
+  },
+  "adapters": {
+    "cloudcode": {
+      "prefixes": ["/cloudcode"],
+      "upstream": "cloudcode-pa",
+      "pool": "route-de"
+    }
+  }
+}
+```
+*(Note: `cloudcode` adapter and upstream definitions are part of the default built-in configuration and work out of the box without manual declaration).*
+
+#### Automated Launch Integration (`agy-cli.sh`)
+The CLI launch script `~/.config/agy-launch/agy-cli.sh` automatically detects if `model-georouter` is listening on port 10830 and sets `CLOUD_CODE_URL`:
+
+```bash
+# Transparently route Cloud Code through model-georouter when active
+GEOROUTER_PORT=10830
+if (echo >"/dev/tcp/127.0.0.1/$GEOROUTER_PORT") 2>/dev/null; then
+  export CLOUD_CODE_URL="${CLOUD_CODE_URL:-http://127.0.0.1:$GEOROUTER_PORT/cloudcode}"
+fi
+
+exec "$REAL" "$@"
+```
+
+When invoking `agy -p "Reply with exactly PONG"` or running agent judging panels, the request is transparently sanitized and completes successfully with exit code 0.
+
 ### Generic OpenAI SDK / cURL
 ```bash
 curl -X POST http://127.0.0.1:10830/v1/chat/completions \
@@ -304,7 +380,7 @@ curl -X POST http://127.0.0.1:10830/v1/chat/completions \
 
 ## Testing & Verification
 
-The test suite covers 380 automated test cases testing protocol conformance, concurrency, and failure recovery:
+The test suite covers 393 automated test cases testing protocol conformance, concurrency, and failure recovery:
 
 ```bash
 pytest -v
@@ -312,16 +388,16 @@ pytest -v
 
 ```text
 ============================= test session starts ==============================
-collected 380 items
+collected 393 items
 
-tests/test_adapters.py ................................................. [ 16%]
-tests/test_config.py ...........................................         [ 30%]
-tests/test_e2e_bridge.py .....................................           [ 42%]
-tests/test_model_router.py ............................................. [ 57%]
-tests/test_proxy_pool.py ..........................                      [ 83%]
+tests/test_adapters.py ................................................. [ 20%]
+tests/test_config.py ...........................................         [ 31%]
+tests/test_e2e_bridge.py .....................................           [ 41%]
+tests/test_model_router.py ............................................. [ 66%]
+tests/test_proxy_pool.py ..........................                      [ 73%]
 tests/test_relay_and_errors.py ......................................... [ 100%]
 
-============================= 380 passed in 11.17s =============================
+============================= 393 passed in 12.45s =============================
 ```
 
 ---
