@@ -73,31 +73,36 @@ Agents point their standard `baseURL` to `http://127.0.0.1:10830`. The router:
 - Transparently relays chunked Server-Sent Events (SSE) with `TCP_NODELAY`, preserving extended reasoning streams (`reasoning_content`) and prompt cache hits (`cached_tokens`).
 - Maintains an in-memory and persistent TTL GeoCache: if an unlisted model unexpectedly receives a 403 RegionError, the router transparently replays it through the fallback proxy pool and remembers it for 24 hours.
 
-```
-                           [ AI Agent Clients ]
-       OpenCode CLI        DeepSeek Harness        Google Antigravity CLI (agy)
-            │                     │                          │
-            └─────────────────────┼──────────────────────────┘
-                                  ▼
-                     http://127.0.0.1:10830
-            ┌──────────────────────────────────────────────┐
-            │          model-georouter (Local L7)          │
-            │   - Ingress Path Normalization & Adapters    │
-            │   - Model JSON Extraction & Regex Routing    │
-            │   - Response Rewriting & Geo-Sanitization    │
-            │   - 24h Adaptive GeoCache                    │
-            └───────────────┬──────────────┬───────────────┘
-                            │              │
-      ┌─────────────────────┘              └─────────────────────┐
-      ▼                                                          ▼
-  [ Direct Pool ]                                         [ Proxy Pools ]
-  (0ms proxy overhead)                                    (Geo-bypass tunnels)
-  • deepseek-*                                            • route-de (Frankfurt Xray)
-  • qwen-*                                                • route-uz (BrightData Tashkent)
-  • glm-*                                                 • route-hy2 (Hysteria 2 SOCKS5)
-      │                                                          │
-      ▼                                                          ▼
-  Upstream AI Providers                                   Upstream AI Providers
+```mermaid
+flowchart TD
+    subgraph Clients["AI Agent Clients"]
+        direction LR
+        C1["OpenCode CLI"]
+        C2["DeepSeek Harness"]
+        C3["Antigravity CLI (agy)"]
+        C4["Claude / Aider / curl"]
+    end
+
+    Router["model-georouter (127.0.0.1:10830)<br/>• Ingress Path Normalization & Adapters<br/>• Model JSON Extraction & Regex Routing<br/>• Response Rewriting & Geo-Sanitization<br/>• 24h Adaptive GeoCache"]
+
+    C1 --> Router
+    C2 --> Router
+    C3 --> Router
+    C4 --> Router
+
+    subgraph DirectPool["Direct Pool (0ms proxy overhead)"]
+        D1["• deepseek-*<br/>• qwen-*<br/>• glm-*"]
+    end
+
+    subgraph ProxyPools["Proxy Pools (Geo-bypass tunnels)"]
+        P1["• route-de (Frankfurt Xray)<br/>• route-uz (Tashkent Proxy)<br/>• route-hy2 (Hysteria 2 SOCKS5)"]
+    end
+
+    Router -->|"Direct Traffic"| DirectPool
+    Router -->|"Geo-Restricted & CloudCode"| ProxyPools
+
+    DirectPool --> UpstreamDirect["Upstream AI Providers<br/>(Direct Internet)"]
+    ProxyPools --> UpstreamProxy["Upstream AI Providers & Google APIs<br/>(via Proxy Egress)"]
 ```
 
 ### Protocol Adapters & Upstream Routing
@@ -176,7 +181,7 @@ Edit `~/.config/model-georouter/config.json` to define your egress proxy backend
     },
     "route-uz": {
       "type": "http_connect",
-      "proxies": ["http://username:password@85.192.60.125:44445"]
+      "proxies": ["http://username:password@proxy.example.com:8080"]
     }
   },
   "routing": {
