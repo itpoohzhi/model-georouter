@@ -15,6 +15,9 @@
     "pre_send_retries": 1,
     "geo_cache_ttl_seconds": 86400,
     "proxy_fail_penalty_seconds": 30,
+    "retry_sleep_seconds": 0.5,
+    "retry_backoff_factor": 2.0,
+    "retry_max_sleep_seconds": 3.0,
     "geo_cache_file": "~/.config/model-georouter/geo_cache.json"
   },
   "pools": {

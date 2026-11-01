@@ -28,6 +28,7 @@ def test_minimal_config_gets_spec_defaults():
     assert server.body_buffer_max_bytes == 16777216
     assert (server.direct_slots, server.proxy_slots) == (16, 16)
     assert server.proxy_fail_penalty_seconds == 30
+    assert (server.retry_sleep_seconds, server.retry_backoff_factor, server.retry_max_sleep_seconds) == (0.5, 2.0, 3.0)
     assert server.geo_cache_ttl_seconds == 86400
     assert "RegionError" in server.geo_error_signatures
     assert cfg.default_pool == "direct"
@@ -70,6 +71,25 @@ def test_explicit_values_override_defaults():
         (lambda d: d["server"].update(headers_timeout="x"), "headers_timeout"),
         (lambda d: d["server"].update(direct_slots=0), "direct_slots"),
         (lambda d: d["server"].update(pre_send_retries=-1), "pre_send_retries"),
+        (lambda d: d["server"].update(pre_send_retries=51), "pre_send_retries"),
+        (lambda d: d["server"].update(retry_sleep_seconds=10**400), "retry_sleep_seconds"),
+        (lambda d: d["server"].update(connect_timeout=10**400), "connect_timeout"),
+        (lambda d: d["server"].update(retry_sleep_seconds=-0.1), "retry_sleep_seconds"),
+        (lambda d: d["server"].update(retry_backoff_factor=0), "retry_backoff_factor"),
+        (lambda d: d["server"].update(retry_max_sleep_seconds="3"), "retry_max_sleep_seconds"),
+        (lambda d: d["server"].update(retry_sleep_seconds=float("inf")), "retry_sleep_seconds"),
+        (lambda d: d["server"].update(retry_sleep_seconds=float("nan")), "retry_sleep_seconds"),
+        (lambda d: d["server"].update(retry_sleep_seconds=30.5), "retry_sleep_seconds"),
+        (lambda d: d["server"].update(retry_backoff_factor=float("inf")), "retry_backoff_factor"),
+        (lambda d: d["server"].update(retry_backoff_factor=float("nan")), "retry_backoff_factor"),
+        (lambda d: d["server"].update(retry_backoff_factor=-1.5), "retry_backoff_factor"),
+        (lambda d: d["server"].update(retry_backoff_factor=10.5), "retry_backoff_factor"),
+        (lambda d: d["server"].update(retry_max_sleep_seconds=float("-inf")), "retry_max_sleep_seconds"),
+        (lambda d: d["server"].update(retry_max_sleep_seconds=float("nan")), "retry_max_sleep_seconds"),
+        (lambda d: d["server"].update(retry_max_sleep_seconds=-1), "retry_max_sleep_seconds"),
+        (lambda d: d["server"].update(retry_max_sleep_seconds=61), "retry_max_sleep_seconds"),
+        (lambda d: d["server"].update(connect_timeout=float("inf")), "connect_timeout"),
+        (lambda d: d["server"].update(connect_timeout=float("nan")), "connect_timeout"),
         (lambda d: d["server"].update(geo_error_signatures="RegionError"), "geo_error_signatures"),
         (lambda d: d["server"].update(geo_error_signatures=[""]), "geo_error_signatures"),
         (lambda d: d.update(pools={"p": {"type": "vpn"}}), "type"),
@@ -98,6 +118,39 @@ def test_invalid_configs_are_rejected(mutate, fragment):
     with pytest.raises(ConfigError) as info:
         parse_config(data)
     assert fragment in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("retry_sleep_seconds", 0),
+        ("retry_sleep_seconds", 30),
+        ("retry_backoff_factor", 10),
+        ("retry_max_sleep_seconds", 0),
+        ("retry_max_sleep_seconds", 60.0),
+    ],
+)
+def test_retry_settings_accept_boundaries(key, value):  # F-007: границы включительно
+    data = minimal()
+    data["server"][key] = value
+    assert getattr(parse_config(data).server, key) == value
+
+
+def test_pre_send_retries_accepts_ceiling():  # F-002 (cycle 2): потолок включительно
+    data = minimal()
+    data["server"]["pre_send_retries"] = 50
+    assert parse_config(data).server.pre_send_retries == 50
+
+
+@pytest.mark.parametrize("prefixes", [["a-", "b/"], "a-"])
+def test_rule_prefixes_alias_maps_to_match_prefix(prefixes):  # F-001 (cycle 2)
+    rule = parse_config(minimal(rules=[{"pool": "direct", "prefixes": prefixes}])).rules[0]
+    assert rule.match_prefix == (tuple(prefixes) if isinstance(prefixes, list) else (prefixes,))
+
+
+def test_canonical_match_prefix_wins_over_prefixes_alias():  # F-001 (cycle 2)
+    rule = parse_config(minimal(rules=[{"pool": "direct", "match_prefix": ["x-"], "prefixes": ["y-"]}])).rules[0]
+    assert rule.match_prefix == ("x-",)
 
 
 def test_non_object_config_rejected():

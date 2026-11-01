@@ -73,6 +73,9 @@ class EgressSettings:
     total_deadline: float
     retries: int
     penalty_seconds: float
+    retry_sleep_seconds: float = 0.5
+    retry_backoff_factor: float = 2.0
+    retry_max_sleep_seconds: float = 3.0
 
     @classmethod
     def from_server(cls, server: ServerConfig) -> EgressSettings:
@@ -81,6 +84,9 @@ class EgressSettings:
             total_deadline=server.total_egress_deadline,
             retries=server.pre_send_retries,
             penalty_seconds=server.proxy_fail_penalty_seconds,
+            retry_sleep_seconds=server.retry_sleep_seconds,
+            retry_backoff_factor=server.retry_backoff_factor,
+            retry_max_sleep_seconds=server.retry_max_sleep_seconds,
         )
 
 
@@ -357,6 +363,26 @@ class ProxyPoolManager:
             return EgressTimeoutError(f"connect to {host}:{port}{via} timed out")
         return EgressConnectError(f"cannot connect to {host}:{port}{via}: {type(exc).__name__}")
 
+    @staticmethod
+    def _backoff_pause(pool: PoolConfig, settings: EgressSettings, attempt: int, single: bool, overall: float) -> None:
+        """Экспоненциальная пауза перед повтором к той же цели (direct или единственный прокси).
+
+        Пул из нескольких прокси не спит: непробованный кандидат берётся мгновенно, а без
+        кандидатов цикл завершается — пауза перед выходом бессмысленна. После последней
+        попытки и когда пауза не укладывается в остаток общего дедлайна — тоже без сна.
+        """
+        if attempt >= settings.retries or (pool.type != "direct" and not single):
+            return
+        retry_number = attempt + 1  # attempt считается с 0: после первой неудачи идёт повтор №1
+        exponent = retry_number - 1
+        try:
+            raw_pause = settings.retry_sleep_seconds * (settings.retry_backoff_factor**exponent)
+        except OverflowError:  # float ** int сверх ~1.8e308 — пауза упирается в потолок
+            raw_pause = settings.retry_max_sleep_seconds
+        pause = min(raw_pause, settings.retry_max_sleep_seconds)
+        if pause > 0 and overall - time.monotonic() > pause:
+            time.sleep(pause)
+
     def connect(
         self,
         pool: PoolConfig,
@@ -390,6 +416,7 @@ class ProxyPoolManager:
                 last = self._normalize(exc, endpoint, host, port)
                 if endpoint is not None and (not single or attempt == settings.retries):
                     self.penalize(endpoint, settings.penalty_seconds)
+                self._backoff_pause(pool, settings, attempt, single, overall)
                 continue
             if wrap is None:
                 sock.settimeout(None)
@@ -404,4 +431,5 @@ class ProxyPoolManager:
                 last = EgressConnectError(f"TLS handshake with {host} failed: {type(exc).__name__}")
                 if endpoint is not None and (not single or attempt == settings.retries):
                     self.penalize(endpoint, settings.penalty_seconds)
+                self._backoff_pause(pool, settings, attempt, single, overall)
         raise last or EgressConnectError(f"cannot connect to {host}:{port}")

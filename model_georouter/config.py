@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -83,6 +84,9 @@ class ServerConfig:
     pre_send_retries: int = 1
     geo_cache_ttl_seconds: int = 86400
     proxy_fail_penalty_seconds: int = 30
+    retry_sleep_seconds: float = 0.5
+    retry_backoff_factor: float = 2.0
+    retry_max_sleep_seconds: float = 3.0
     log_dir: str = field(default_factory=default_log_dir)
     geo_error_signatures: tuple[str, ...] = DEFAULT_GEO_SIGNATURES
     geo_cache_file: str = ""
@@ -166,13 +170,37 @@ def _integer(section: Mapping[str, Any], key: str, default: int, path: str, mini
     return value
 
 
-def _positive_number(section: Mapping[str, Any], key: str, default: float, path: str) -> float:
+def _finite_number(section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None) -> float:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(f"{path}.{key}: expected number, got {type(value).__name__}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{path}.{key}: must not exceed {maximum:g}")
+    try:
+        number = float(value)  # огромный int (10**400) не влезает во float
+    except OverflowError:
+        raise ConfigError(f"{path}.{key}: value is too large") from None
+    if not math.isfinite(number):
+        raise ConfigError(f"{path}.{key}: must be finite")
+    return number
+
+
+def _positive_number(
+    section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None = None
+) -> float:
+    value = _finite_number(section, key, default, path, maximum)
     if value <= 0:
         raise ConfigError(f"{path}.{key}: must be positive")
-    return float(value)
+    return value
+
+
+def _non_negative_number(
+    section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None = None
+) -> float:
+    value = _finite_number(section, key, default, path, maximum)
+    if value < 0:
+        raise ConfigError(f"{path}.{key}: must be non-negative")
+    return value
 
 
 def _string(section: Mapping[str, Any], key: str, default: str, path: str) -> str:
@@ -218,10 +246,19 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         inactivity_timeout=_positive_number(section, "inactivity_timeout", d.inactivity_timeout, path),
         body_timeout=_positive_number(section, "body_timeout", d.body_timeout, path),
         body_buffer_max_bytes=_integer(section, "body_buffer_max_bytes", d.body_buffer_max_bytes, path, 1),
-        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0),
+        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, maximum=50),
         geo_cache_ttl_seconds=_integer(section, "geo_cache_ttl_seconds", d.geo_cache_ttl_seconds, path, 1),
         proxy_fail_penalty_seconds=_integer(
             section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path, 0
+        ),
+        retry_sleep_seconds=_non_negative_number(
+            section, "retry_sleep_seconds", d.retry_sleep_seconds, path, maximum=30.0
+        ),
+        retry_backoff_factor=_positive_number(
+            section, "retry_backoff_factor", d.retry_backoff_factor, path, maximum=10.0
+        ),
+        retry_max_sleep_seconds=_non_negative_number(
+            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, maximum=60.0
         ),
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
@@ -346,7 +383,7 @@ def _alias(section: dict[str, Any], old: str, new: str) -> None:
 
 
 def _normalize(data: Any) -> Any:
-    """Привести устаревшие алиасы (`host`, `urls`, `prefix`) и вложенные секции `slots`/`routing` к плоской схеме."""
+    """Привести устаревшие алиасы (`host`, `urls`, `prefix`/`prefixes`) и вложенные секции `slots`/`routing` к плоской схеме."""
     if not isinstance(data, Mapping):
         return data
     root = dict(data)
@@ -372,9 +409,10 @@ def _normalize(data: Any) -> Any:
         for index, rule in enumerate(rules):
             if isinstance(rule, Mapping):
                 rules[index] = rule = dict(rule)
-                if isinstance(rule.get("prefix"), str):
-                    rule["prefix"] = [rule["prefix"]]
-                _alias(rule, "prefix", "match_prefix")
+                for alias in ("prefix", "prefixes"):
+                    if isinstance(rule.get(alias), str):
+                        rule[alias] = [rule[alias]]
+                    _alias(rule, alias, "match_prefix")
     return root
 
 

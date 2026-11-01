@@ -334,3 +334,132 @@ def test_persistent_tls_failure_exhausts_retries_with_egress_error(track):  # RW
         manager.connect(pool, "h", 1, SETTINGS, wrap)
     assert len(wrap.raw) == 2 and all(raw.fileno() == -1 for raw in wrap.raw)
     assert manager.is_penalized(manager.endpoints(pool)[0])
+
+
+def test_connect_failures_back_off_exponentially_up_to_cap(monkeypatch):
+    pauses: list[float] = []
+    monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
+    settings = EgressSettings(
+        connect_timeout=2.0,
+        total_deadline=30.0,
+        retries=3,
+        penalty_seconds=30,
+        retry_sleep_seconds=0.5,
+        retry_backoff_factor=2.0,
+        retry_max_sleep_seconds=1.5,
+    )
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
+    assert pauses == [0.5, 1.0, 1.5]  # после последней попытки паузы нет
+
+
+def test_backoff_is_skipped_when_it_would_exceed_total_deadline(monkeypatch):
+    pauses: list[float] = []
+    monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
+    settings = EgressSettings(
+        connect_timeout=2.0,
+        total_deadline=1.0,
+        retries=2,
+        penalty_seconds=30,
+        retry_sleep_seconds=5.0,
+        retry_max_sleep_seconds=5.0,
+    )
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
+    assert pauses == []
+
+
+def _backoff_settings(retries: int, **overrides) -> EgressSettings:
+    values = {"retry_sleep_seconds": 0.5, "retry_backoff_factor": 2.0, "retry_max_sleep_seconds": 30.0}
+    values.update(overrides)
+    return EgressSettings(connect_timeout=2.0, total_deadline=60.0, retries=retries, penalty_seconds=30, **values)
+
+
+@pytest.fixture
+def pauses(monkeypatch) -> list[float]:
+    recorded: list[float] = []
+    monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", recorded.append)
+    return recorded
+
+
+def test_tls_handshake_failure_backs_off_before_retrying_same_target(track, pauses):  # F-002
+    upstream = track(FakeServer(echo_handler))
+    wrap = _Handshake(fail_first=2)
+    pool = PoolConfig("direct", "direct")
+    with ProxyPoolManager().connect(pool, "127.0.0.1", upstream.port, _backoff_settings(retries=2), wrap) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert len(wrap.raw) == 3
+    assert pauses == [0.5, 1.0]
+
+
+def test_tls_handshake_failure_through_single_proxy_backs_off(track, pauses):  # F-002
+    upstream = track(FakeServer(echo_handler))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    wrap = _Handshake(fail_first=99)
+    with pytest.raises(EgressConnectError, match="TLS handshake"):
+        ProxyPoolManager().connect(
+            http_pool(f"http://127.0.0.1:{proxy.port}"), "h", 1, _backoff_settings(retries=2), wrap
+        )
+    assert pauses == [0.5, 1.0]  # после третьей (последней) попытки паузы нет
+
+
+def test_failover_to_next_proxy_in_pool_does_not_sleep(track, pauses):  # F-005
+    upstream = track(FakeServer(echo_handler))
+    good = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    pool = http_pool(f"http://127.0.0.1:{free_port()}", f"http://127.0.0.1:{good.port}")
+    with ProxyPoolManager().connect(pool, "h", 1, _backoff_settings(retries=2)) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert pauses == []
+
+
+def test_tls_failover_to_next_proxy_in_pool_does_not_sleep(track, pauses):  # F-002 + F-005
+    upstream = track(FakeServer(echo_handler))
+    first = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    second = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    pool = http_pool(f"http://127.0.0.1:{first.port}", f"http://127.0.0.1:{second.port}")
+    with ProxyPoolManager().connect(pool, "h", 1, _backoff_settings(retries=2), _Handshake(fail_first=1)) as sock:
+        assert roundtrip(sock) == b"ping"
+    assert pauses == []
+
+
+def test_exhausted_pool_candidates_exit_without_sleep(pauses):  # F-003
+    pool = http_pool(f"http://127.0.0.1:{free_port()}", f"http://127.0.0.1:{free_port()}")
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(pool, "h", 1, _backoff_settings(retries=5))
+    assert pauses == []  # оба прокси испробованы: ретраить некуда, спать незачем
+
+
+def test_retry_to_same_proxy_sleeps_base_times_factor_power(track, pauses):  # F-004
+    proxy, attempts = flaky_proxy(track, FakeConnectProxy(), fail_first=99)
+    settings = _backoff_settings(retries=3, retry_sleep_seconds=0.2, retry_backoff_factor=3.0)
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(http_pool(f"http://127.0.0.1:{proxy.port}"), "h", 1, settings)
+    assert len(attempts) == 4
+    # повтор №n спит retry_sleep_seconds * factor ** (n - 1): первый — ровно retry_sleep_seconds
+    assert pauses == pytest.approx([0.2, 0.6, 1.8])
+
+
+@pytest.mark.parametrize("retries, expected", [(0, []), (1, [0.5])])
+def test_no_sleep_after_last_attempt(pauses, retries, expected):  # F-003
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(
+            PoolConfig("direct", "direct"), "127.0.0.1", free_port(), _backoff_settings(retries=retries)
+        )
+    assert pauses == expected
+
+
+def test_huge_retries_with_large_factor_do_not_overflow(pauses):  # F-002 (cycle 2)
+    settings = _backoff_settings(retries=400, retry_backoff_factor=10.0, retry_max_sleep_seconds=30.0)
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
+    assert pauses and max(pauses) <= 30.0
+    assert pauses[-1] == 30.0  # 0.5 * 10.0 ** 398 переполняет float → OverflowError → потолок
+
+
+def test_gentle_backoff_reaches_max_sleep_without_exponent_cutoff(pauses):  # Cycle 4: без потолка степени
+    settings = _backoff_settings(
+        retries=41, retry_sleep_seconds=0.000001, retry_backoff_factor=1.5, retry_max_sleep_seconds=3.0
+    )
+    ProxyPoolManager._backoff_pause(PoolConfig("direct", "direct"), settings, 40, False, time.monotonic() + 60.0)
+    # 1e-6 * 1.5 ** 40 ≈ 11.1 > 3.0 → потолок; при обрезке степени до 30 было бы ≈ 0.19
+    assert pauses == [3.0]
