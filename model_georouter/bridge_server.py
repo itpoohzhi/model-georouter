@@ -43,9 +43,11 @@ from .http_wire import (
 )
 from .logging_utils import get_logger
 from .model_router import (
+    THINKING_BINDING_BETA,
     BodyInspector,
     ModelRouter,
     RegionErrorClassifier,
+    ensure_anthropic_thinking_drop_block,
     model_from_path,
     sanitize_google_v1beta_body,
 )
@@ -302,6 +304,24 @@ def _is_direct(pool: PoolConfig) -> bool:
     return pool.type == "direct"
 
 
+_CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
+
+
+def _ensure_anthropic_beta(req: RequestHead, beta: str) -> None:
+    """Дописать значение в `anthropic-beta` (все вхождения заголовка сливаются в одно, порядок сохранён)."""
+    tokens = [
+        token.strip()
+        for key, value in req.headers
+        if key.lower() == "anthropic-beta"
+        for token in value.split(",")
+        if token.strip()
+    ]
+    if beta in tokens:
+        return
+    req.headers[:] = [(key, value) for key, value in req.headers if key.lower() != "anthropic-beta"]
+    req.headers.append(("anthropic-beta", ", ".join([*tokens, beta])))
+
+
 def build_upstream_request(
     req: RequestHead, path: str, query: str, upstream: UpstreamConfig, body_length: int
 ) -> bytes:
@@ -471,6 +491,19 @@ class _Handler(socketserver.BaseRequestHandler):
         self.model = inspector.model or model_from_path(path)
         if req.method == "POST" and "/v1beta/models/" in route.path and inspector.size > 0:
             inspector.replace_body(sanitize_google_v1beta_body(inspector.body))
+        if (
+            req.method == "POST"
+            and route.path.endswith("/v1/messages")
+            and inspector.size > 0
+            and self.model is not None
+            and self.model.startswith(_CLAUDE_MODEL_PREFIXES)
+        ):
+            raw_body = inspector.body
+            new_body, needs_beta = ensure_anthropic_thinking_drop_block(raw_body)
+            if new_body is not raw_body:
+                inspector.replace_body(new_body)
+            if needs_beta:
+                _ensure_anthropic_beta(req, THINKING_BINDING_BETA)
         decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache, default_pool=route.pool or None)
         if decision.source == "geo_cache":
             srv.metrics.incr("geo_cache_hits")
