@@ -15,9 +15,12 @@ from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
 from .errors import AllProxiesPenalizedError, EgressConnectError, EgressTimeoutError
+from .logging_utils import get_logger
 
 if TYPE_CHECKING:
     from .config import PoolConfig, ServerConfig
+
+logger = get_logger(__name__)
 
 DEFAULT_PORTS = {"http": 8080, "socks5": 1080, "socks5h": 1080}
 SOCKS_REPLIES = {
@@ -100,13 +103,13 @@ def _arm(sock: socket.socket, deadline: float) -> None:
     sock.settimeout(remaining)
 
 
-def _recv_exact(sock: socket.socket, size: int, deadline: float) -> bytes:
+def _recv_exact(sock: socket.socket, size: int, deadline: float, phase: str | None = None) -> bytes:
     buf = bytearray()
     while len(buf) < size:
         _arm(sock, deadline)
         chunk = sock.recv(size - len(buf))
         if not chunk:
-            raise EgressConnectError("proxy closed the connection during handshake")
+            raise EgressConnectError("proxy closed the connection during handshake", phase=phase)
         buf += chunk
     return bytes(buf)
 
@@ -183,6 +186,31 @@ def open_direct(host: str, port: int, deadline: float) -> socket.socket:
     return _dial(host, port, deadline)
 
 
+def _read_connect_head(sock: socket.socket, endpoint: ProxyEndpoint, deadline: float) -> bytearray:
+    """Прочитать голову ответа прокси до `\\r\\n\\r\\n` включительно, не забирая ни байта сверх неё.
+
+    `MSG_PEEK` показывает, что уже пришло; без разделителя забираем подсмотренное и блокируемся
+    на следующем peek до новых данных (без spin-wait), с разделителем — ровно до его конца.
+    Начало туннельного потока за разделителем остаётся в сокете.
+    """
+    head = bytearray()
+    while True:
+        _arm(sock, deadline)
+        peek_limit = min(4096, CONNECT_RESPONSE_LIMIT - len(head) + 4)
+        peeked = sock.recv(peek_limit, socket.MSG_PEEK)
+        if not peeked:
+            raise EgressConnectError(f"proxy {endpoint.label} closed connection during CONNECT", phase="connect_read")
+        prefix = bytes(head[-3:])  # разделитель может быть разорван между чтениями
+        idx = (prefix + peeked).find(b"\r\n\r\n")
+        found = idx != -1
+        take = idx + 4 - len(prefix) if found else len(peeked)
+        head += _recv_exact(sock, take, deadline, phase="connect_read")
+        if len(head) > CONNECT_RESPONSE_LIMIT:
+            raise EgressConnectError(f"proxy {endpoint.label} sent an oversized CONNECT response", phase="connect_read")
+        if found:
+            return head
+
+
 def open_http_connect(endpoint: ProxyEndpoint, host: str, port: int, deadline: float) -> socket.socket:
     """HTTP CONNECT-туннель (с Basic Proxy-Authorization при наличии учётных данных)."""
     sock = _dial(endpoint.host, endpoint.port, deadline)
@@ -193,18 +221,14 @@ def open_http_connect(endpoint: ProxyEndpoint, host: str, port: int, deadline: f
             token = base64.b64encode(f"{endpoint.username}:{endpoint.password or ''}".encode()).decode("ascii")
             lines.append(f"Proxy-Authorization: Basic {token}")
         _send_all(sock, ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"), deadline)
-        head = bytearray()
-        while not head.endswith(b"\r\n\r\n"):
-            if len(head) > CONNECT_RESPONSE_LIMIT:
-                raise EgressConnectError(f"proxy {endpoint.label} sent an oversized CONNECT response")
-            head += _recv_exact(sock, 1, deadline)
+        head = _read_connect_head(sock, endpoint, deadline)
         status_line = bytes(head).split(b"\r\n", 1)[0].decode("latin-1")
         fields = status_line.split(None, 2)
         if len(fields) < 2 or not fields[1].isdigit():
-            raise EgressConnectError(f"proxy {endpoint.label} sent a malformed CONNECT response")
+            raise EgressConnectError(f"proxy {endpoint.label} sent a malformed CONNECT response", phase="connect_read")
         code = int(fields[1])
         if not 200 <= code < 300:
-            raise EgressConnectError(f"proxy {endpoint.label} refused CONNECT: HTTP {code}")
+            raise EgressConnectError(f"proxy {endpoint.label} refused CONNECT: HTTP {code}", phase="connect_read")
         return sock
     except BaseException:
         sock.close()
@@ -409,27 +433,58 @@ class ProxyPoolManager:
             if remaining <= 0:
                 last = EgressTimeoutError(f"total egress deadline of {settings.total_deadline:g}s exceeded")
                 break
-            attempt_deadline = time.monotonic() + min(settings.connect_timeout, remaining)
+            attempt_start = time.monotonic()
+            attempt_deadline = attempt_start + min(settings.connect_timeout, remaining)
+            target = endpoint.label if endpoint is not None else f"{host}:{port}"  # без учётных данных прокси
+            penalize = endpoint is not None and (not single or attempt == settings.retries)
             try:
                 sock = self._open(pool, endpoint, host, port, attempt_deadline)
             except (OSError, EgressConnectError) as exc:
                 last = self._normalize(exc, endpoint, host, port)
-                if endpoint is not None and (not single or attempt == settings.retries):
+                err_phase = last.phase or "connect"
+                if endpoint is not None and penalize:
                     self.penalize(endpoint, settings.penalty_seconds)
+                logger.warning(
+                    "proxy %s failed during %s: %s (penalized=%s, elapsed=%.1fms)",
+                    target,
+                    err_phase,
+                    type(exc).__name__,
+                    penalize,
+                    (time.monotonic() - attempt_start) * 1000,
+                )
                 self._backoff_pause(pool, settings, attempt, single, overall)
                 continue
             if wrap is None:
                 sock.settimeout(None)
                 return sock
+            if time.monotonic() >= attempt_deadline:
+                # бюджет попытки ушёл на установление туннеля: прокси не виноват, штрафа нет
+                sock.close()
+                last = EgressTimeoutError(
+                    f"connect timeout of {settings.connect_timeout:g}s exceeded before TLS handshake",
+                    phase="tls_handshake",
+                )
+                logger.warning("connect timeout before TLS for %s (penalized=False)", target)
+                self._backoff_pause(pool, settings, attempt, single, overall)
+                continue
             try:
-                _arm(sock, attempt_deadline if attempt_deadline > time.monotonic() else overall)
+                _arm(sock, attempt_deadline)
                 wrapped = wrap(sock)
                 wrapped.settimeout(None)
                 return wrapped
             except (OSError, ValueError) as exc:
                 sock.close()
-                last = EgressConnectError(f"TLS handshake with {host} failed: {type(exc).__name__}")
-                if endpoint is not None and (not single or attempt == settings.retries):
+                last = EgressConnectError(
+                    f"TLS handshake with {host} failed: {type(exc).__name__}", phase="tls_handshake"
+                )
+                if endpoint is not None and penalize:
                     self.penalize(endpoint, settings.penalty_seconds)
+                logger.warning(
+                    "proxy %s failed during tls_handshake: %s (penalized=%s, elapsed=%.1fms)",
+                    target,
+                    type(exc).__name__,
+                    penalize,
+                    (time.monotonic() - attempt_start) * 1000,
+                )
                 self._backoff_pause(pool, settings, attempt, single, overall)
         raise last or EgressConnectError(f"cannot connect to {host}:{port}")

@@ -19,7 +19,12 @@ from model_georouter.adapters import (
 from model_georouter.config import parse_config
 from model_georouter.errors import BadRequestError
 from model_georouter.http_wire import ResponseHead
-from model_georouter.model_router import SKIP_THOUGHT_SIGNATURE_VALIDATOR, sanitize_google_v1beta_body
+from model_georouter.model_router import (
+    SKIP_THOUGHT_SIGNATURE_VALIDATOR,
+    THINKING_BINDING_BETA,
+    ensure_anthropic_thinking_drop_block,
+    sanitize_google_v1beta_body,
+)
 from tests.helpers import BridgeHarness, FakeConnectProxy, HttpUpstream, http_request, make_config, respond
 
 OPENCODE = OpenCodeAdapter(("/v1", "/go/v1"), "opencode-ai")
@@ -497,6 +502,117 @@ def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_
     assert "Привет, мир" in first.body.decode("utf-8")
     assert json.loads(first.body)["contents"][1]["parts"][0]["thoughtSignature"] == SKIP_SIG
     assert first.headers["content-length"] == second.headers["content-length"] == str(len(first.body))
+
+
+# ───────────────────────────── Anthropic thinking block_binding ─────────────────────────────
+
+
+@pytest.mark.parametrize("thinking_type", ["adaptive", "enabled"])
+def test_ensure_anthropic_thinking_drop_block_injects_binding(thinking_type: str) -> None:
+    payload = {
+        "model": "claude-haiku-5-5",
+        "thinking": {"type": thinking_type, "display": "summarized"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    raw = _dump(payload)
+    out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
+    assert needs_beta is True and out is not raw
+    sent = json.loads(out)
+    assert sent["thinking"] == {
+        "type": thinking_type,
+        "display": "summarized",
+        "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+    }
+    assert sent["messages"] == payload["messages"]
+    assert THINKING_BINDING_BETA == "thinking-binding-controls-2026-08-01"
+
+
+def test_ensure_anthropic_thinking_drop_block_keeps_client_behavior_but_needs_beta() -> None:
+    raw = _dump({"thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "error"}}})
+    out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
+    assert out is raw and needs_beta is True
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not json",
+        b"[1,2]",
+        b'{"messages":[]}',
+        b'{"thinking":"adaptive"}',
+        b'{"thinking":{"type":"disabled"}}',
+        b'{"thinking":{"display":"summarized"}}',
+    ],
+)
+def test_ensure_anthropic_thinking_drop_block_noop(raw: bytes) -> None:
+    out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
+    assert out is raw and needs_beta is False
+
+
+def test_ensure_anthropic_thinking_drop_block_survives_unpaired_surrogate() -> None:
+    raw = b'{"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"\\ud800"}]}'
+    out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
+    assert needs_beta is True and out is not raw
+    parsed = json.loads(out)
+    assert parsed["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
+    assert parsed["messages"][0]["content"] == "\ud800"
+
+
+def test_anthropic_messages_route_injects_drop_block_and_merges_beta_header(
+    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
+) -> None:
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    payload = {
+        "model": "claude-haiku-5-5",
+        "max_tokens": 16,
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "", "signature": "sig"}]},
+            {"role": "user", "content": "again"},
+        ],
+    }
+    raw = _dump(payload)
+    response = http_request(
+        bridge.port,
+        "POST",
+        "/go/v1/messages",
+        raw,
+        {"Content-Type": "application/json", "anthropic-beta": "interleaved-thinking-2025-05-14"},
+    )
+    assert response.status == 200
+    seen = upstream.requests[0]
+    assert seen.path == "/inference/go/anthropic/v1/messages"
+    sent = json.loads(seen.body)
+    assert sent["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
+    betas = [token.strip() for token in seen.headers["anthropic-beta"].split(",")]
+    assert betas == ["interleaved-thinking-2025-05-14", THINKING_BINDING_BETA]
+    assert seen.headers["content-length"] == str(len(seen.body))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # не-Claude на anthropic-протоколе: чужой upstream может не знать block_binding/beta
+        {"model": "deepseek-v4.1-flash", "thinking": {"type": "adaptive"}, "messages": []},
+        # Claude без включённого thinking: подписывать и дропать нечего
+        {"model": "claude-haiku-5-5", "thinking": {"type": "disabled"}, "messages": []},
+        {"model": "claude-haiku-5-5", "messages": []},
+    ],
+)
+def test_anthropic_messages_route_leaves_other_requests_untouched(
+    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness], payload: dict[str, Any]
+) -> None:
+    upstream = track(HttpUpstream(echo_path))
+    bridge = start_bridge(make_config(upstream.port))
+    raw = _dump(payload)
+    response = http_request(bridge.port, "POST", "/go/v1/messages", raw, {"Content-Type": "application/json"})
+    assert response.status == 200
+    seen = upstream.requests[0]
+    assert seen.body == raw
+    assert "anthropic-beta" not in seen.headers
 
 
 def test_cloudcode_normalization():

@@ -54,6 +54,10 @@ class AllProxiesPenalizedError(BridgeError):
 class EgressConnectError(BridgeError):
     """Не удалось установить соединение с upstream (напрямую или через прокси)."""
 
+    def __init__(self, message: str, phase: str | None = None):
+        super().__init__(message)
+        self.phase = phase
+
 
 class EgressTimeoutError(EgressConnectError):
     """Таймаут установления соединения (connect или общий дедлайн egress)."""

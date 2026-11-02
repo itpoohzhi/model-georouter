@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import logging
 import random
 import socket
 import ssl
+import threading
 import time
 
 import pytest
 
 from model_georouter.config import PoolConfig
 from model_georouter.errors import AllProxiesPenalizedError, EgressConnectError, EgressTimeoutError
-from model_georouter.proxy_pool import EgressSettings, ProxyPoolManager, parse_proxy_url
-from tests.helpers import FakeConnectProxy, FakeServer, FakeSocks5Proxy, basic_token, echo_handler, free_port
+from model_georouter.proxy_pool import (
+    CONNECT_RESPONSE_LIMIT,
+    EgressSettings,
+    ProxyPoolManager,
+    open_http_connect,
+    parse_proxy_url,
+)
+from tests.helpers import (
+    FakeConnectProxy,
+    FakeServer,
+    FakeSocks5Proxy,
+    basic_token,
+    echo_handler,
+    free_port,
+    recv_head,
+)
 
 SETTINGS = EgressSettings(connect_timeout=2.0, total_deadline=5.0, retries=1, penalty_seconds=30)
 
@@ -463,3 +479,172 @@ def test_gentle_backoff_reaches_max_sleep_without_exponent_cutoff(pauses):  # Cy
     ProxyPoolManager._backoff_pause(PoolConfig("direct", "direct"), settings, 40, False, time.monotonic() + 60.0)
     # 1e-6 * 1.5 ** 40 ≈ 11.1 > 3.0 → потолок; при обрезке степени до 30 было бы ≈ 0.19
     assert pauses == [3.0]
+
+
+# ───────────────────── буферизованный CONNECT и согласование таймаутов ─────────────────────
+
+
+class _CountingSocket:
+    """Обёртка сокета: считает вызовы `recv`, остальное делегирует."""
+
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self.recv_calls: list[int] = []
+
+    def recv(self, size: int, flags: int = 0) -> bytes:
+        self.recv_calls.append(flags)
+        return self._sock.recv(size, flags)
+
+    def __getattr__(self, name: str):
+        return getattr(self._sock, name)
+
+
+@pytest.fixture
+def connect_peer(monkeypatch):
+    """`open_http_connect` поверх socketpair: тест пишет «ответ прокси» в `peer`, клиент читает свой конец."""
+    client, peer = socket.socketpair()
+    counting = _CountingSocket(client)
+    monkeypatch.setattr("model_georouter.proxy_pool._dial", lambda host, port, deadline: counting)
+    yield counting, peer
+    for sock in (client, peer):
+        sock.close()
+
+
+def _connect(deadline_in: float = 3.0):
+    endpoint = parse_proxy_url("http://user:s3cret@proxy.local:3128")
+    return open_http_connect(endpoint, "api.example.com", 443, time.monotonic() + deadline_in)
+
+
+def test_open_http_connect_buffered_fast(connect_peer):
+    counting, peer = connect_peer
+    peer.sendall(b"HTTP/1.1 200 Connection established\r\nProxy-Agent: fake\r\n\r\n")
+    sock = _connect()
+    assert sock is counting
+    assert len(counting.recv_calls) <= 2  # один peek + один забор, не recv(1) на байт
+    assert b"CONNECT api.example.com:443 HTTP/1.1" in peer.recv(4096)
+    sock.sendall(b"ping")
+    peer.settimeout(2)
+    assert peer.recv(10) == b"ping"  # туннель рабочий
+
+
+def test_open_http_connect_eof_peek_fails_fast(track):
+    server = track(FakeServer(recv_head))  # вычитывает CONNECT и закрывает соединение, ничего не ответив
+    endpoint = parse_proxy_url(f"http://127.0.0.1:{server.port}")
+    started = time.monotonic()
+    with pytest.raises(EgressConnectError) as excinfo:
+        open_http_connect(endpoint, "h", 443, time.monotonic() + 5)
+    assert excinfo.value.phase == "connect_read"
+    assert time.monotonic() - started < 1  # EOF виден сразу, дедлайн не выжигается
+
+
+def test_open_http_connect_fragmented_no_cpu_spin(connect_peer):
+    counting, peer = connect_peer
+    response = b"HTTP/1.1 200 Connection established\r\nX-Pad: " + b"a" * 30 + b"\r\n\r\n"
+    chunks = [response[i : i + 10] for i in range(0, len(response), 10)]
+
+    def feed() -> None:
+        for piece in chunks:
+            time.sleep(0.03)
+            peer.sendall(piece)
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    assert _connect() is counting
+    feeder.join()
+    # на каждый кусок — peek + забор (плюс финальный): холостого цикла нет
+    assert len(counting.recv_calls) <= 2 * len(chunks) + 2
+
+
+def test_open_http_connect_oversized_limit(connect_peer):
+    _, peer = connect_peer
+    flood = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * (CONNECT_RESPONSE_LIMIT + 100)  # разделителя нет
+    # буфер socketpair меньше ответа: пишем из потока, иначе sendall блокируется до чтения клиента
+    threading.Thread(target=lambda: peer.sendall(flood), daemon=True).start()
+    with pytest.raises(EgressConnectError, match="oversized") as excinfo:
+        _connect()
+    assert excinfo.value.phase == "connect_read"
+
+
+def test_open_http_connect_preserves_trailing_tls_bytes(connect_peer):
+    _, peer = connect_peer
+    tls_hello = b"\x16\x03\x03\x00\x05hello"
+    peer.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n" + tls_hello)
+    sock = _connect()
+    sock.settimeout(2)
+    assert sock.recv(100) == tls_hello  # ни одного байта за \r\n\r\n не потеряно
+
+
+@pytest.mark.parametrize("code", [403, 502])
+def test_open_http_connect_rejects_non_2xx_and_closes_socket(connect_peer, code):
+    counting, peer = connect_peer
+    peer.sendall(f"HTTP/1.1 {code} X\r\n\r\n".encode())
+    with pytest.raises(EgressConnectError, match=f"HTTP {code}") as excinfo:
+        _connect()
+    assert excinfo.value.phase == "connect_read"
+    assert counting.fileno() == -1
+
+
+def test_open_http_connect_accepts_2xx_range(connect_peer):
+    counting, peer = connect_peer
+    peer.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+    assert _connect() is counting
+    assert counting.fileno() != -1
+
+
+def test_proxy_pool_logs_safe_label_no_password(caplog):
+    port = free_port()
+    pool = http_pool(f"http://alice:Sup3rS3cret@127.0.0.1:{port}")
+    with caplog.at_level(logging.WARNING, logger="model_georouter.proxy_pool"), pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(pool, "h", 443, SETTINGS)
+    assert f"http://127.0.0.1:{port}" in caplog.text
+    assert "Sup3rS3cret" not in caplog.text and "alice" not in caplog.text
+
+
+def test_tls_handshake_respects_remaining_attempt_deadline(track):
+    upstream = track(FakeServer(echo_handler))
+    seen: list[float | None] = []
+
+    def wrap(raw: socket.socket) -> socket.socket:
+        seen.append(raw.gettimeout())
+        return raw
+
+    settings = EgressSettings(connect_timeout=1.0, total_deadline=60.0, retries=0, penalty_seconds=30)
+    ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", upstream.port, settings, wrap).close()
+    assert seen[0] is not None and 0 < seen[0] <= 1.0  # остаток попытки, а не total_deadline
+
+
+def test_no_penalty_when_attempt_timeout_before_tls(track):
+    upstream = track(FakeServer(echo_handler))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    pool = http_pool(f"http://127.0.0.1:{proxy.port}")
+    manager = ProxyPoolManager()
+    real_open = manager._open
+
+    def slow_open(*args):
+        sock = real_open(*args)
+        time.sleep(0.15)  # туннель поднят, но бюджет попытки (0.1 с) исчерпан
+        return sock
+
+    manager._open = slow_open  # type: ignore[method-assign]
+    wrap = _Handshake(fail_first=0)
+    settings = EgressSettings(connect_timeout=0.1, total_deadline=5.0, retries=0, penalty_seconds=30)
+    with pytest.raises(EgressTimeoutError, match="before TLS"):
+        manager.connect(pool, "h", 443, settings, wrap)
+    assert wrap.raw == []  # хендшейк не начинался
+    assert not manager.is_penalized(manager.endpoints(pool)[0])
+
+
+def test_connect_overall_deadline_bounds_retries():
+    settings = EgressSettings(
+        connect_timeout=2.0,
+        total_deadline=0.5,
+        retries=20,
+        penalty_seconds=30,
+        retry_sleep_seconds=0.2,
+        retry_backoff_factor=1.0,
+        retry_max_sleep_seconds=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(EgressConnectError):
+        ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
+    assert time.monotonic() - started < 0.5 + 0.4  # паузы backoff не выходят за общий дедлайн
