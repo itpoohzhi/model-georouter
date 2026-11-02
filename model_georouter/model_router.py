@@ -112,6 +112,41 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
+THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+
+
+def ensure_anthropic_thinking_drop_block(raw_body: bytes) -> tuple[bytes, bool]:
+    """Доставить `thinking.block_binding.prefix_mismatch_behavior=drop_block` в тело Anthropic Messages.
+
+    Подписанный `thinking`-блок привязан к точному префиксу разговора: клиент, переписавший историю
+    (сплайс/компрессия), получает персистентный `400 Invalid signature in thinking block`. С `drop_block`
+    upstream молча отбрасывает такой блок вместо отказа хода. Возвращает `(тело, нужен_beta)`: настройка
+    действует только вместе со значением `THINKING_BINDING_BETA` в заголовке `anthropic-beta`, который
+    добавляет вызывающий. Явно заданное клиентом `prefix_mismatch_behavior` не перетирается (тело то же,
+    beta по-прежнему нужен). Без включённого thinking — исходные байты как есть и `False`. Непарные
+    UTF-16 суррогаты сериализуются с `ensure_ascii=True`, как в `sanitize_google_v1beta_body`.
+    """
+    if not raw_body:
+        return raw_body, False
+    try:
+        payload = json.loads(raw_body)
+    except (ValueError, RecursionError):
+        return raw_body, False
+    if not isinstance(payload, dict):
+        return raw_body, False
+    thinking = payload.get("thinking")
+    if not isinstance(thinking, dict) or thinking.get("type") not in ("adaptive", "enabled"):
+        return raw_body, False
+    binding = thinking.get("block_binding")
+    if isinstance(binding, dict) and "prefix_mismatch_behavior" in binding:
+        return raw_body, True
+    thinking["block_binding"] = {"prefix_mismatch_behavior": "drop_block"}
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), True
+    except UnicodeEncodeError:
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii"), True
+
+
 def _decode_json_string(raw: bytes) -> str:
     if b"\\" not in raw:
         return raw.decode("utf-8", "replace")
