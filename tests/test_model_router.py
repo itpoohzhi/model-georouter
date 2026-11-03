@@ -222,6 +222,33 @@ def test_router_without_fallback_ignores_geo_cache():
     assert router.decide("m", "up", cache).pool == "direct"
 
 
+# ───────────────────── явный pool адаптера авторитетнее правил (task-6) ─────────────────────
+
+
+def test_adapter_pool_wins_over_model_rules():
+    """Пул адаптера (adapter.pool) главнее глобальных правил по model-id: opencode-go не трогаем."""
+    router = ModelRouter.from_config(make_cfg([{"match_prefix": ["deepseek-", "gpt-"], "pool": "route-de"}]))
+    pinned = router.decide("deepseek-v4.1-flash", "opencode-ai", None, default_pool="direct")
+    assert (pinned.pool, pinned.source, pinned.rule_index) == ("direct", "adapter", None)
+    # без adapter-pool то же имя уходит по глобальному правилу — прежнее поведение
+    assert router.decide("deepseek-v4.1-flash", "opencode-ai").pool == "route-de"
+
+
+def test_adapter_pool_is_not_overridden_by_geo_cache():
+    router = ModelRouter.from_config(make_cfg([], geo_fallback_pool="route-de"))
+    cache = GeoCache()
+    cache.mark_blocked("up", "m")
+    decision = router.decide("m", "up", cache, default_pool="direct")
+    assert (decision.pool, decision.source) == ("direct", "adapter")
+
+
+def test_unknown_adapter_pool_falls_back_to_rules():
+    router = ModelRouter.from_config(make_cfg([{"match_prefix": ["claude-"], "pool": "route-de"}]))
+    # parse_config такой пул не пропустит; защита на случай прямого вызова decide()
+    decision = router.decide("claude-1", "up", None, default_pool="ghost")
+    assert (decision.pool, decision.source) == ("route-de", "rule")
+
+
 # ───────────────────────────── GeoCache ─────────────────────────────
 
 

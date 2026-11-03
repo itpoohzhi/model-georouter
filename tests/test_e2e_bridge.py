@@ -827,3 +827,43 @@ def test_cloudcode_unmodified_chunked_response_framing_normalized(track, start_b
     assert "transfer-encoding" not in response.headers
     assert response.headers["content-length"] == str(len(response.body))
     assert response.body == encoded
+
+
+# ─────────────── явный pool адаптера авторитетнее правил по model-id (task-6) ───────────────
+
+
+def test_adapter_pool_beats_global_model_rule(track, start_bridge):
+    direct_up = track(HttpUpstream(ok_responder(b"direct")))
+    proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(
+        make_config(
+            direct_up.port,
+            pools=proxy_pools(proxy.port),
+            rules=[{"match_prefix": ["claude-"], "pool": "direct"}],
+            upstreams={"vendor-ai": {"host": "127.0.0.1", "port": direct_up.port, "use_tls": False}},
+            adapters={"pinned": {"prefixes": ["/pinned"], "upstream": "vendor-ai", "pool": "route-de"}},
+        )
+    )
+    pinned = http_request(bridge.port, "POST", "/pinned/chat/completions", body_for("claude-3-opus"))
+    assert pinned.body == b"via-proxy" and len(proxy.connects) == 1  # pool адаптера победил правило
+    plain = http_request(bridge.port, "POST", "/chat/completions", body_for("claude-3-opus"))
+    assert plain.body == b"direct"  # адаптер без pool — по правилу
+
+
+def test_cloudcode_adapter_pool_survives_conflicting_rule(track, start_bridge):
+    """Обратная совместимость: у cloudcode pool=route-de из DEFAULT_ADAPTERS, правило его не перебивает."""
+    direct_up = track(HttpUpstream(ok_responder(b"direct")))
+    proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(
+        make_config(
+            direct_up.port,
+            pools=proxy_pools(proxy.port),
+            rules=[{"match_prefix": ["gemini-"], "pool": "direct"}],
+            upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": direct_up.port, "use_tls": False}},
+            adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
+        )
+    )
+    response = http_request(bridge.port, "POST", "/cloudcode/v1internal:generateContent", body_for("gemini-3"))
+    assert response.status == 200 and response.body == b"via-proxy" and len(proxy.connects) == 1

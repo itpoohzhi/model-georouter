@@ -365,15 +365,19 @@ model rules:
   "upstreams": { "vendor-ai": { "host": "api.vendor.example", "base_path": "/v1" } },
   "adapters": { "sg-vendor": { "prefixes": ["/sg-vendor"], "upstream": "vendor-ai", "pool": "route-sg" } },
   "rules": [
-    { "match_prefix": ["vendor-model-1"], "pool": "route-sg" },
     { "match_prefix": ["claude-", "gpt-"], "pool": "route-de" }
   ]
 }
 ```
 `POST http://127.0.0.1:10830/sg-vendor/chat/completions` then goes to
-`https://api.vendor.example/v1/chat/completions` via `route-sg`. Rules are evaluated in
-order, so an exact model id (`vendor-model-1`) above the generic `gpt-` rule wins without
-changing the generic rule.
+`https://api.vendor.example/v1/chat/completions` via `route-sg`.
+
+**Pool precedence:** an adapter's explicit `pool` is authoritative — when it is set, that pool
+is used and model-id `rules` are not consulted (rules stay global and affect only adapters
+without a pool). For adapters without `pool` the behaviour is unchanged: `rules` in order
+(first match wins), then `default_pool`, then `geo_fallback_pool` for direct pools blocked by
+the Geo-Cache. This is how vendor-specific SG egress stays pinned to its own adapter without
+changing global model rules (e.g. an `opencode-go` consumer keeps its previous pool).
 
 #### Automated Launch Integration (`agy-cli.sh`)
 The CLI launch script `~/.config/agy-launch/agy-cli.sh` automatically detects if `model-georouter` is listening on port 10830 and sets `CLOUD_CODE_URL`:
