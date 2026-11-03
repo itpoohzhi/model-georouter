@@ -51,7 +51,7 @@ from .model_router import (
     model_from_path,
     sanitize_google_v1beta_body,
 )
-from .proxy_pool import EgressSettings, ProxyPoolManager
+from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
 
 LOGGER = get_logger("model_georouter.server")
@@ -350,6 +350,7 @@ class _Handler(socketserver.BaseRequestHandler):
         self.path = "-"
         self.model: str | None = None
         self.pool_name = "-"
+        self.proxy_endpoint = "-"
         self.status = 0
         self.outcome = "-"
         self.replayed = False
@@ -438,11 +439,12 @@ class _Handler(socketserver.BaseRequestHandler):
 
     def _log_request(self) -> None:
         LOGGER.info(
-            "request method=%s path=%s model=%s pool=%s status=%s outcome=%s bytes=%d replayed=%s dur_ms=%d",
+            "request method=%s path=%s model=%s pool=%s proxy=%s status=%s outcome=%s bytes=%d replayed=%s dur_ms=%d",
             self.method,
             self.path,
             self.model or "-",
             self.pool_name,
+            self.proxy_endpoint,
             self.status or "-",
             self.outcome,
             self.bytes_sent,
@@ -567,6 +569,7 @@ class _Handler(socketserver.BaseRequestHandler):
         cfg = snapshot.server
         pool = snapshot.pools[pool_name]
         self.pool_name = pool_name
+        self.proxy_endpoint = "-"
         direct = _is_direct(pool)
         if not direct:
             srv.proxy_manager.ensure_available(pool)  # circuit breaker: до слота, за доли миллисекунды
@@ -653,7 +656,18 @@ class _Handler(socketserver.BaseRequestHandler):
                 return context.wrap_socket(raw, server_hostname=upstream.host)
 
         settings = EgressSettings.from_server(snapshot.server)
-        return srv.proxy_manager.connect(pool, upstream.host, upstream.port, settings, wrap)
+
+        def on_attempt(endpoint: ProxyEndpoint | None) -> None:
+            # Только authority: ни URL, ни userinfo не сохраняются в состоянии запроса.
+            self.proxy_endpoint = (
+                f"[{endpoint.host}]:{endpoint.port}"
+                if endpoint is not None and ":" in endpoint.host
+                else f"{endpoint.host}:{endpoint.port}"
+                if endpoint is not None
+                else "-"
+            )
+
+        return srv.proxy_manager._connect(pool, upstream.host, upstream.port, settings, wrap, on_attempt)
 
     @staticmethod
     def _send_upstream_request(

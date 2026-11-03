@@ -416,6 +416,18 @@ class ProxyPoolManager:
         wrap: Callable[[socket.socket], socket.socket] | None = None,
     ) -> socket.socket:
         """Открыть соединение к host:port через пул: ретраи до отправки, штраф упавших прокси, общий дедлайн."""
+        return self._connect(pool, host, port, settings, wrap)
+
+    def _connect(
+        self,
+        pool: PoolConfig,
+        host: str,
+        port: int,
+        settings: EgressSettings,
+        wrap: Callable[[socket.socket], socket.socket] | None = None,
+        on_attempt: Callable[[ProxyEndpoint | None], None] | None = None,
+    ) -> socket.socket:
+        """Внутренний вариант connect с наблюдением за фактически начатой попыткой."""
         overall = time.monotonic() + settings.total_deadline
         tried: set[str] = set()
         last: EgressConnectError | None = None
@@ -437,6 +449,8 @@ class ProxyPoolManager:
             attempt_deadline = attempt_start + min(settings.connect_timeout, remaining)
             target = endpoint.label if endpoint is not None else f"{host}:{port}"  # без учётных данных прокси
             penalize = endpoint is not None and (not single or attempt == settings.retries)
+            if on_attempt is not None:
+                on_attempt(endpoint)
             try:
                 sock = self._open(pool, endpoint, host, port, attempt_deadline)
             except (OSError, EgressConnectError) as exc:
