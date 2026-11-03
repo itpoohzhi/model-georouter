@@ -14,6 +14,7 @@ from model_georouter.adapters import (
     CordisAdapter,
     GenericAdapter,
     OpenCodeAdapter,
+    PassthroughAdapter,
     clean_path,
 )
 from model_georouter.config import parse_config
@@ -141,6 +142,41 @@ def test_registry_honours_configured_prefixes():
     assert registry.resolve("/v1/chat/completions") is None
 
 
+# ───────────────────────────── новые адаптеры из конфига ─────────────────────────────
+
+SG_CONFIG = {
+    "upstreams": {"vendor-ai": {"host": "api.vendor.example", "base_path": "/v1"}},
+    "pools": {"route-sg": {"type": "http_connect", "proxies": ["http://127.0.0.1:9"]}},
+    "adapters": {"sg-vendor": {"prefixes": ["/sg-vendor"], "upstream": "vendor-ai", "pool": "route-sg"}},
+}
+
+
+def test_passthrough_adapter_strips_longest_prefix():
+    adapter = PassthroughAdapter(("/sg", "/sg/kimi"), "vendor-ai", "route-sg", name="sg-kimi")
+    assert adapter.route("/sg/kimi/chat/completions").path == "/chat/completions"
+    assert adapter.route("/sg/kimi").path == "/"
+    assert adapter.route("/sg/kimi/").path == "/"
+    assert adapter.route("/sg/other").path == "/other"
+    assert adapter.route("/other") is None
+    route = adapter.route("/sg/kimi/v1/messages")
+    assert (route.adapter, route.upstream, route.pool) == ("sg-kimi", "vendor-ai", "route-sg")
+
+
+def test_registry_builds_custom_adapters_from_config():
+    cfg = parse_config({"server": {"listen": "127.0.0.1", "port": 1}, "rules": [], **SG_CONFIG})
+    registry = AdapterRegistry.from_config(cfg)
+    route = registry.resolve("/sg-vendor/chat/completions")
+    assert (route.adapter, route.upstream, route.path, route.pool) == (
+        "sg-vendor",
+        "vendor-ai",
+        "/chat/completions",
+        "route-sg",
+    )
+    assert registry.get("sg-vendor") is not None
+    assert registry.get("opencode") is not None  # встроенные адаптеры остались
+    assert registry.resolve("/nothing/here") is None
+
+
 class FakeProvider:
     def health_payload(self):
         return {"status": "ok"}
@@ -244,6 +280,23 @@ def test_upstream_base_path_is_prepended(track, start_bridge):
     bridge = start_bridge(config)
     http_request(bridge.port, "POST", "/chat/completions", b"{}")
     assert upstream.requests[0].path == "/api/v1/chat/completions"
+
+
+def test_custom_adapter_rewrites_path_and_prepends_base_path(track, start_bridge):
+    upstream = track(HttpUpstream(echo_path))
+    config = make_config(
+        upstream.port,
+        upstreams={
+            "vendor-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False, "base_path": "/v1"},
+        },
+        adapters={
+            "sg-vendor": {"prefixes": ["/sg-vendor"], "upstream": "vendor-ai"},
+        },
+    )
+    bridge = start_bridge(config)
+    response = http_request(bridge.port, "POST", "/sg-vendor/chat/completions", b'{"model":"vendor-1"}')
+    assert response.status == 200
+    assert upstream.requests[0].path == "/v1/chat/completions"
 
 
 def test_unknown_path_and_traversal_get_json_errors(track, start_bridge):

@@ -76,3 +76,24 @@ class ClientAdapter:
     def transform_response(self, route: AdapterRoute, head: ResponseHead, body: bytes) -> tuple[ResponseHead, bytes]:
         """Модифицирует заголовки и тело ответа перед отправкой клиенту."""
         return head, body
+
+
+class PassthroughAdapter(ClientAdapter):
+    """Адаптер из конфига: снимает самый длинный совпавший префикс и пробрасывает путь как есть.
+
+    Достаточен для вендорских OpenAI/Anthropic-совместимых API, у которых путь клиента
+    уже совпадает с путём upstream (`/sg-kimi/chat/completions` → `/chat/completions`).
+    """
+
+    def __init__(self, prefixes: tuple[str, ...], upstream: str, pool: str = "", name: str = "passthrough"):
+        super().__init__(prefixes, upstream, pool)
+        self.name = name
+
+    def normalize(self, path: str) -> str:
+        cleaned = clean_path(path)
+        matched = max((p for p in self.prefixes if prefix_match(cleaned, p)), key=len, default="")
+        if not matched:
+            return cleaned
+        if cleaned == matched:
+            return "/"
+        return clean_path(cleaned[len(matched) :])

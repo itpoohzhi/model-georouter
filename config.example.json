@@ -27,13 +27,29 @@
       "strategy": "first_available",
       "proxies": ["http://127.0.0.1:10820"]
     },
+    "route-sg": {
+      "type": "http_connect",
+      "strategy": "first_available",
+      "proxies": ["http://user:pass@sg-node-1.example:3128", "http://user:pass@sg-node-2.example:3128"]
+    },
     "route-hy2": {
       "type": "socks5",
       "remote_dns": true,
       "proxies": ["socks5h://127.0.0.1:10821"]
     }
   },
+  "upstreams": {
+    "vendor-ai": { "host": "api.vendor.example", "base_path": "/v1" }
+  },
+  "adapters": {
+    "sg-vendor": {
+      "prefixes": ["/sg-vendor"],
+      "upstream": "vendor-ai",
+      "pool": "route-sg"
+    }
+  },
   "rules": [
+    { "match_prefix": ["vendor-model-1"], "pool": "route-sg", "description": "точное правило: только этот id в SG, до общего правила" },
     { "match_prefix": ["claude-", "gpt-"], "pool": "route-de", "description": "модели с гео-ограничениями" },
     { "match_regex": "^gemini-.*-preview$", "pool": "route-hy2" }
   ],

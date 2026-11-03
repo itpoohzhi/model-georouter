@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from model_georouter.config import ConfigManager, load_config_file, parse_config
+from model_georouter.config import AdapterConfig, ConfigManager, load_config_file, parse_config
 from model_georouter.errors import ConfigError
 
 MINIMAL = {"server": {"listen": "127.0.0.1", "port": 10830}, "pools": {}, "rules": []}
@@ -42,6 +42,55 @@ def test_default_adapters_and_upstreams():
     assert cfg.adapters["cordis"].prefixes == ("/zen/v1", "/zen/go/v1")
     assert cfg.adapters["generic"].prefixes == ("/messages", "/chat/completions")
     assert cfg.adapters["opencode"].upstream in cfg.upstreams
+
+
+# Новые адаптеры из конфига (SG-пул вендоров): имя свободное, upstream и prefixes обязательны.
+SG_CONFIG = {
+    "upstreams": {"vendor-ai": {"host": "api.vendor.example", "base_path": "/v1"}},
+    "pools": {"route-sg": {"type": "http_connect", "proxies": ["http://u:p@127.0.0.1:3128"]}},
+    "adapters": {"sg-vendor": {"prefixes": ["/sg-vendor"], "upstream": "vendor-ai", "pool": "route-sg"}},
+}
+
+
+def test_custom_adapter_from_config_is_accepted():
+    cfg = parse_config(minimal(**SG_CONFIG))
+    adapter = cfg.adapters["sg-vendor"]
+    assert adapter == AdapterConfig(("/sg-vendor",), "vendor-ai", "route-sg")
+    assert cfg.upstreams["vendor-ai"].base_path == "/v1"
+
+
+def test_custom_adapter_pool_is_optional_and_builtin_defaults_survive():
+    cfg = parse_config(
+        minimal(
+            upstreams={"vendor-ai": {"host": "api.vendor.example"}},
+            adapters={"sg-vendor": {"prefixes": ["/sg-vendor"], "upstream": "vendor-ai"}},
+        )
+    )
+    assert cfg.adapters["sg-vendor"].pool == ""
+    assert cfg.adapters["cloudcode"].pool == "route-de"  # встроенные адаптеры не задеты
+    assert cfg.adapters["opencode"].prefixes == ("/v1", "/go/v1")
+
+
+@pytest.mark.parametrize(
+    "adapter, fragment",
+    [
+        ({"prefixes": ["/sg-vendor"]}, "new adapter requires 'upstream'"),
+        ({"upstream": "self-ai"}, "new adapter requires 'prefixes'"),
+        ({"upstream": "self-ai", "prefixes": []}, "prefixes"),
+        ({"upstream": "self-ai", "prefixes": ["sg-vendor"]}, "prefix"),
+        ({"upstream": "self-ai", "prefixes": ["/sg-vendor/"]}, "prefix"),
+        ({"upstream": "self-ai", "prefixes": ["/sg-vendor"], "pool": "ghost"}, "unknown pool"),
+    ],
+)
+def test_custom_adapter_requires_valid_fields(adapter, fragment):
+    data = minimal(
+        upstreams={"self-ai": {"host": "api.example.com"}},
+        pools={"route-sg": {"type": "http_connect", "proxies": ["http://127.0.0.1:3128"]}},
+        adapters={"sg-vendor": adapter},
+    )
+    with pytest.raises(ConfigError) as info:
+        parse_config(data)
+    assert fragment in str(info.value)
 
 
 def test_explicit_values_override_defaults():
@@ -106,7 +155,9 @@ def test_explicit_values_override_defaults():
         (lambda d: d.update(default_pool="ghost"), "default_pool"),
         (lambda d: d.update(geo_fallback_pool="ghost"), "geo_fallback_pool"),
         (lambda d: d.update(adapters={"opencode": {"upstream": "ghost"}}), "upstream"),
-        (lambda d: d.update(adapters={"mystery": {}}), "unknown adapter"),
+        (lambda d: d.update(adapters={"mystery": {}}), "new adapter requires"),
+        (lambda d: d.update(adapters={"mystery": {"prefixes": ["/m"]}}), "new adapter requires"),
+        (lambda d: d.update(adapters={"mystery": {"upstream": "ghost", "prefixes": ["/m"]}}), "unknown upstream"),
         (lambda d: d.update(adapters={"opencode": {"prefixes": ["v1"]}}), "prefix"),
         (lambda d: d.update(adapters={"cloudcode": {"pool": "ghost"}}), "pool"),
         (lambda d: d.update(upstreams={"x": {"port": 1}}), "host"),

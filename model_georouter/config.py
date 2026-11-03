@@ -290,24 +290,33 @@ def _parse_adapters(
     upstreams: Mapping[str, UpstreamConfig],
     pools: Mapping[str, PoolConfig] | None = None,
 ) -> dict[str, AdapterConfig]:
+    """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя из конфига требует `upstream` и `prefixes`.
+
+    Новый адаптер обслуживается passthrough-классом: путь очищается и с него снимается
+    самый длинный совпавший префикс из `prefixes`. `pool` для нового имени опционален.
+    """
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
         path = f"adapters.{name}"
-        if name not in DEFAULT_ADAPTERS:
-            raise ConfigError(f"{path}: unknown adapter (expected one of {sorted(DEFAULT_ADAPTERS)})")
         section = _mapping(value, path)
-        default = DEFAULT_ADAPTERS[name]
-        prefixes = _string_list(section, "prefixes", default.prefixes, path)
+        default = DEFAULT_ADAPTERS.get(name)
+        if default is None:
+            for required in ("upstream", "prefixes"):
+                if required not in section:
+                    raise ConfigError(f"{path}: new adapter requires {required!r}")
+            prefixes = _string_list(section, "prefixes", (), path)
+            if not prefixes:
+                raise ConfigError(f"{path}.prefixes: expected list of non-empty strings")
+            default_pool, default_upstream = "", ""
+        else:
+            prefixes = _string_list(section, "prefixes", default.prefixes, path)
+            default_pool, default_upstream = default.pool, default.upstream
         if any(not p.startswith("/") or (len(p) > 1 and p.endswith("/")) for p in prefixes):
             raise ConfigError(f"{path}.prefixes: each prefix must start with '/' and not end with '/'")
-        pool = _string(section, "pool", default.pool, path)
+        pool = _string(section, "pool", default_pool, path)
         if "pool" in section and pool and pools is not None and pool not in pools:
             raise ConfigError(f"{path}.pool: unknown pool {pool!r}")
-        adapters[name] = AdapterConfig(
-            prefixes,
-            _string(section, "upstream", default.upstream, path),
-            pool=pool,
-        )
+        adapters[name] = AdapterConfig(prefixes, _string(section, "upstream", default_upstream, path), pool=pool)
     for name, adapter in adapters.items():
         if adapter.upstream not in upstreams:
             raise ConfigError(f"adapters.{name}.upstream: unknown upstream {adapter.upstream!r}")
