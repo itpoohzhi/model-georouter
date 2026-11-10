@@ -16,6 +16,7 @@ from typing import Any
 from .errors import ConfigError
 from .logging_utils import get_logger
 from .proxy_pool import parse_proxy_url
+from .retry_budget import RetryBudgetSpec
 
 __all__ = [
     "AdapterConfig",
@@ -82,6 +83,7 @@ class ServerConfig:
     body_timeout: float = 30.0
     body_buffer_max_bytes: int = 16777216
     pre_send_retries: int = 1
+    single_pool_max_retries: int = RetryBudgetSpec().single_pool_max_retries
     geo_cache_ttl_seconds: int = 86400
     proxy_fail_penalty_seconds: int = 30
     retry_sleep_seconds: float = 0.5
@@ -247,6 +249,7 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         body_timeout=_positive_number(section, "body_timeout", d.body_timeout, path),
         body_buffer_max_bytes=_integer(section, "body_buffer_max_bytes", d.body_buffer_max_bytes, path, 1),
         pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, maximum=50),
+        single_pool_max_retries=_integer(section, "single_pool_max_retries", d.single_pool_max_retries, path, 0, 0),
         geo_cache_ttl_seconds=_integer(section, "geo_cache_ttl_seconds", d.geo_cache_ttl_seconds, path, 1),
         proxy_fail_penalty_seconds=_integer(
             section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path, 0

@@ -10,7 +10,7 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
@@ -79,6 +79,7 @@ class EgressSettings:
     retry_sleep_seconds: float = 0.5
     retry_backoff_factor: float = 2.0
     retry_max_sleep_seconds: float = 3.0
+    single_pool_max_retries: int | None = None
 
     @classmethod
     def from_server(cls, server: ServerConfig) -> EgressSettings:
@@ -90,6 +91,7 @@ class EgressSettings:
             retry_sleep_seconds=server.retry_sleep_seconds,
             retry_backoff_factor=server.retry_backoff_factor,
             retry_max_sleep_seconds=server.retry_max_sleep_seconds,
+            single_pool_max_retries=server.single_pool_max_retries,
         )
 
 
@@ -432,6 +434,8 @@ class ProxyPoolManager:
         tried: set[str] = set()
         last: EgressConnectError | None = None
         single = len(pool.proxies) == 1  # единственную прокси перебирать нечем: ретраи идут в неё же
+        if single and settings.single_pool_max_retries is not None:
+            settings = replace(settings, retries=min(settings.retries, settings.single_pool_max_retries))
         for attempt in range(settings.retries + 1):
             endpoint = None
             if pool.type != "direct":
