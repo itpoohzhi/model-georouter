@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 import time
+from typing import cast
 
 import pytest
 
@@ -14,6 +15,7 @@ from model_georouter.errors import AllProxiesPenalizedError, EgressConnectError,
 from model_georouter.proxy_pool import (
     CONNECT_RESPONSE_LIMIT,
     EgressSettings,
+    ProxyEndpoint,
     ProxyPoolManager,
     open_http_connect,
     parse_proxy_url,
@@ -27,6 +29,8 @@ from tests.helpers import (
     free_port,
     recv_head,
 )
+from tests.proxy_pool_support import StallingFakeServer
+from tests.proxy_pool_support import backoff_settings as _backoff_settings
 
 SETTINGS = EgressSettings(connect_timeout=2.0, total_deadline=5.0, retries=1, penalty_seconds=30)
 
@@ -115,7 +119,11 @@ def test_socks5_remote_dns_flag_applies_to_plain_socks5_scheme(track):
     assert proxy.requests[0]["atyp"] == 0x03
 
 
-def test_socks5_local_dns_when_disabled(track):
+def test_socks5_local_dns_when_disabled(track, monkeypatch):
+    monkeypatch.setattr(
+        "model_georouter.proxy_pool._resolve",
+        lambda _host, port, _deadline: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))],
+    )
     upstream = track(FakeServer(echo_handler))
     proxy = track(FakeSocks5Proxy(target=("127.0.0.1", upstream.port)))
     pool = socks_pool(f"socks5://127.0.0.1:{proxy.port}", remote_dns=False)
@@ -199,12 +207,12 @@ def test_first_available_prefers_first_and_random_covers_all():
     urls = [f"http://127.0.0.1:{4000 + i}" for i in range(3)]
     manager = ProxyPoolManager(rng=random.Random(7))
     first = http_pool(*urls)
-    assert all(manager.select(first).port == 4000 for _ in range(10))
+    assert all(cast(ProxyEndpoint, manager.select(first)).port == 4000 for _ in range(10))
     rand = http_pool(*urls, strategy="random")
-    seen = {manager.select(rand).port for _ in range(60)}
+    seen = {cast(ProxyEndpoint, manager.select(rand)).port for _ in range(60)}
     assert seen == {4000, 4001, 4002}
     manager.penalize(manager.endpoints(rand)[1], 30)
-    assert {manager.select(rand).port for _ in range(60)} == {4000, 4002}
+    assert {cast(ProxyEndpoint, manager.select(rand)).port for _ in range(60)} == {4000, 4002}
 
 
 def test_circuit_breaker_fails_fast_when_all_penalized():
@@ -237,7 +245,7 @@ def test_circuit_breaker_closes_after_penalty_expires():
 
 
 def test_connect_timeout_gives_egress_timeout_error(track):
-    hang = track(FakeServer(lambda conn: time.sleep(3)))  # принимает, но молчит на CONNECT
+    hang = track(StallingFakeServer())  # принимает, но молчит на CONNECT
     pool = http_pool(f"http://127.0.0.1:{hang.port}")
     settings = EgressSettings(connect_timeout=0.3, total_deadline=5.0, retries=0, penalty_seconds=30)
     started = time.monotonic()
@@ -247,7 +255,7 @@ def test_connect_timeout_gives_egress_timeout_error(track):
 
 
 def test_total_egress_deadline_bounds_all_attempts(track):
-    hang = track(FakeServer(lambda conn: time.sleep(3)))
+    hang = track(StallingFakeServer())
     pool = http_pool(f"http://127.0.0.1:{hang.port}", f"http://127.0.0.1:{hang.port}/x")
     settings = EgressSettings(connect_timeout=5.0, total_deadline=0.4, retries=1, penalty_seconds=30)
     started = time.monotonic()
@@ -265,9 +273,6 @@ def test_stats_report_penalized_proxies():
     assert stats["direct"]["proxies_total"] == 0
 
 
-# ───────────────────────────── Rework Cycle 1 ─────────────────────────────
-
-
 def flaky_proxy(track, good: FakeConnectProxy, fail_first: int) -> tuple[FakeServer, list[int]]:
     attempts: list[int] = []
 
@@ -282,7 +287,7 @@ def flaky_proxy(track, good: FakeConnectProxy, fail_first: int) -> tuple[FakeSer
 
 def test_single_proxy_pool_retries_same_proxy_on_transient_failure(track):  # RW-005
     upstream = track(FakeServer(echo_handler))
-    good = FakeConnectProxy(target=("127.0.0.1", upstream.port))
+    good = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
     proxy, attempts = flaky_proxy(track, good, fail_first=1)
     pool = http_pool(f"http://127.0.0.1:{proxy.port}")
     manager = ProxyPoolManager()
@@ -293,7 +298,7 @@ def test_single_proxy_pool_retries_same_proxy_on_transient_failure(track):  # RW
 
 
 def test_single_proxy_pool_uses_all_retries_then_penalizes(track):  # RW-005
-    proxy, attempts = flaky_proxy(track, FakeConnectProxy(), fail_first=99)
+    proxy, attempts = flaky_proxy(track, track(FakeConnectProxy()), fail_first=99)
     pool = http_pool(f"http://127.0.0.1:{proxy.port}")
     manager = ProxyPoolManager()
     settings = EgressSettings(connect_timeout=2.0, total_deadline=5.0, retries=2, penalty_seconds=30)
@@ -355,15 +360,7 @@ def test_persistent_tls_failure_exhausts_retries_with_egress_error(track):  # RW
 def test_connect_failures_back_off_exponentially_up_to_cap(monkeypatch):
     pauses: list[float] = []
     monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
-    settings = EgressSettings(
-        connect_timeout=2.0,
-        total_deadline=30.0,
-        retries=3,
-        penalty_seconds=30,
-        retry_sleep_seconds=0.5,
-        retry_backoff_factor=2.0,
-        retry_max_sleep_seconds=1.5,
-    )
+    settings = EgressSettings(2.0, 30.0, 3, 30, 0.5, 2.0, 1.5)
     with pytest.raises(EgressConnectError):
         ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
     assert pauses == [0.5, 1.0, 1.5]  # после последней попытки паузы нет
@@ -372,23 +369,10 @@ def test_connect_failures_back_off_exponentially_up_to_cap(monkeypatch):
 def test_backoff_is_skipped_when_it_would_exceed_total_deadline(monkeypatch):
     pauses: list[float] = []
     monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
-    settings = EgressSettings(
-        connect_timeout=2.0,
-        total_deadline=1.0,
-        retries=2,
-        penalty_seconds=30,
-        retry_sleep_seconds=5.0,
-        retry_max_sleep_seconds=5.0,
-    )
+    settings = EgressSettings(2.0, 1.0, 2, 30, 5.0, 2.0, 5.0)
     with pytest.raises(EgressConnectError):
         ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
     assert pauses == []
-
-
-def _backoff_settings(retries: int, **overrides) -> EgressSettings:
-    values = {"retry_sleep_seconds": 0.5, "retry_backoff_factor": 2.0, "retry_max_sleep_seconds": 30.0}
-    values.update(overrides)
-    return EgressSettings(connect_timeout=2.0, total_deadline=60.0, retries=retries, penalty_seconds=30, **values)
 
 
 @pytest.fixture
@@ -446,7 +430,7 @@ def test_exhausted_pool_candidates_exit_without_sleep(pauses):  # F-003
 
 
 def test_retry_to_same_proxy_sleeps_base_times_factor_power(track, pauses):  # F-004
-    proxy, attempts = flaky_proxy(track, FakeConnectProxy(), fail_first=99)
+    proxy, attempts = flaky_proxy(track, track(FakeConnectProxy()), fail_first=99)
     settings = _backoff_settings(retries=3, retry_sleep_seconds=0.2, retry_backoff_factor=3.0)
     with pytest.raises(EgressConnectError):
         ProxyPoolManager().connect(http_pool(f"http://127.0.0.1:{proxy.port}"), "h", 1, settings)
@@ -556,13 +540,25 @@ def test_open_http_connect_fragmented_no_cpu_spin(connect_peer):
 
 
 def test_open_http_connect_oversized_limit(connect_peer):
-    _, peer = connect_peer
+    counting, peer = connect_peer
     flood = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * (CONNECT_RESPONSE_LIMIT + 100)  # разделителя нет
-    # буфер socketpair меньше ответа: пишем из потока, иначе sendall блокируется до чтения клиента
-    threading.Thread(target=lambda: peer.sendall(flood), daemon=True).start()
-    with pytest.raises(EgressConnectError, match="oversized") as excinfo:
-        _connect()
-    assert excinfo.value.phase == "connect_read"
+
+    def send_flood() -> None:
+        try:
+            peer.sendall(flood)
+        except OSError:
+            pass
+
+    writer = threading.Thread(target=send_flood, daemon=True)
+    writer.start()
+    try:
+        with pytest.raises(EgressConnectError, match="oversized") as excinfo:
+            _connect()
+        assert excinfo.value.phase == "connect_read"
+    finally:
+        counting.close()
+        peer.close()
+        writer.join(1.0)
 
 
 def test_open_http_connect_preserves_trailing_tls_bytes(connect_peer):
@@ -620,12 +616,14 @@ def test_no_penalty_when_attempt_timeout_before_tls(track):
     manager = ProxyPoolManager()
     real_open = manager._open
 
-    def slow_open(*args):
-        sock = real_open(*args)
+    def slow_open(
+        pool: PoolConfig, endpoint: ProxyEndpoint | None, host: str, port: int, deadline: float
+    ) -> socket.socket:
+        sock = real_open(pool, endpoint, host, port, deadline)
         time.sleep(0.15)  # туннель поднят, но бюджет попытки (0.1 с) исчерпан
         return sock
 
-    manager._open = slow_open  # type: ignore[method-assign]
+    object.__setattr__(manager, "_open", slow_open)
     wrap = _Handshake(fail_first=0)
     settings = EgressSettings(connect_timeout=0.1, total_deadline=5.0, retries=0, penalty_seconds=30)
     with pytest.raises(EgressTimeoutError, match="before TLS"):

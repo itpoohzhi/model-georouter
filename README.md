@@ -346,6 +346,39 @@ In `~/.config/model-georouter/config.json`, verify that the `route-de` egress po
 ```
 *(Note: `cloudcode` adapter and upstream definitions are part of the default built-in configuration and work out of the box without manual declaration).*
 
+#### Custom adapters from config (`upstream` + `prefixes`)
+Besides the four built-in names (`opencode`, `cordis`, `generic`, `cloudcode`), any new
+adapter name may be declared in `adapters`. For a new name both `upstream` and `prefixes`
+are required (`pool` is optional); the adapter is passthrough — it strips the longest
+matching path prefix and forwards the rest unchanged, with `base_path` of the upstream
+prepended. This keeps vendor traffic behind one bridge prefix while the pool is chosen by
+model rules:
+
+```json
+{
+  "server": { "listen": "127.0.0.1", "port": 10830 },
+  "pools": {
+    "direct": { "type": "direct" },
+    "route-de": { "type": "http_connect", "proxies": ["http://127.0.0.1:10820"] },
+    "route-sg": { "type": "http_connect", "proxies": ["http://user:pass@sg-node:3128"] }
+  },
+  "upstreams": { "vendor-ai": { "host": "api.vendor.example", "base_path": "/v1" } },
+  "adapters": { "sg-vendor": { "prefixes": ["/sg-vendor"], "upstream": "vendor-ai", "pool": "route-sg" } },
+  "rules": [
+    { "match_prefix": ["claude-", "gpt-"], "pool": "route-de" }
+  ]
+}
+```
+`POST http://127.0.0.1:10830/sg-vendor/chat/completions` then goes to
+`https://api.vendor.example/v1/chat/completions` via `route-sg`.
+
+**Pool precedence:** an adapter's explicit `pool` is authoritative — when it is set, that pool
+is used and model-id `rules` are not consulted (rules stay global and affect only adapters
+without a pool). For adapters without `pool` the behaviour is unchanged: `rules` in order
+(first match wins), then `default_pool`, then `geo_fallback_pool` for direct pools blocked by
+the Geo-Cache. This is how vendor-specific SG egress stays pinned to its own adapter without
+changing global model rules (e.g. an `opencode-go` consumer keeps its previous pool).
+
 #### Automated Launch Integration (`agy-cli.sh`)
 The CLI launch script `~/.config/agy-launch/agy-cli.sh` automatically detects if `model-georouter` is listening on port 10830 and sets `CLOUD_CODE_URL`:
 

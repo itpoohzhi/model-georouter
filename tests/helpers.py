@@ -8,11 +8,14 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from model_georouter.bridge_server import BridgeServer
 from model_georouter.config import ConfigManager, parse_config
 from model_georouter.proxy_pool import ProxyPoolManager
+from tests.fake_server import FakeServer
 
 LOCALHOST = "127.0.0.1"
 
@@ -42,7 +45,7 @@ def pipe(a: socket.socket, b: socket.socket, stop: threading.Event | None = None
     """Двунаправленная перекачка до закрытия любой стороны."""
     try:
         while not (stop and stop.is_set()):
-            readable, _, _ = select.select([a, b], [], [], 0.2)
+            readable, _, _ = select.select([a, b], [], [], 0.05)
             for sock in readable:
                 data = sock.recv(65536)
                 if not data:
@@ -54,58 +57,6 @@ def pipe(a: socket.socket, b: socket.socket, stop: threading.Event | None = None
         for sock in (a, b):
             try:
                 sock.close()
-            except OSError:
-                pass
-
-
-class FakeServer:
-    """TCP-сервер: каждое соединение обслуживает `handler(conn)` в своём потоке."""
-
-    def __init__(self, handler):
-        self._handler = handler
-        self._sock = socket.socket()
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((LOCALHOST, 0))
-        self._sock.listen(64)
-        self._sock.settimeout(0.1)
-        self.port = self._sock.getsockname()[1]
-        self._closed = threading.Event()
-        self.connections: list[socket.socket] = []
-        self.stop = threading.Event()
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-
-    def _accept_loop(self) -> None:
-        while not self._closed.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            self.connections.append(conn)
-            threading.Thread(target=self._run, args=(conn,), daemon=True).start()
-
-    def _run(self, conn: socket.socket) -> None:
-        try:
-            self._handler(conn)
-        except (OSError, ValueError):
-            pass
-        finally:
-            try:
-                conn.close()
-            except OSError:
-                pass
-
-    def close(self) -> None:
-        self._closed.set()
-        self.stop.set()
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-        for conn in self.connections:
-            try:
-                conn.close()
             except OSError:
                 pass
 
@@ -142,7 +93,7 @@ def read_http_request(conn: socket.socket) -> Req | None:
 class HttpUpstream(FakeServer):
     """Фейковый upstream: читает запрос, записывает его и вызывает `responder(conn, req)`."""
 
-    def __init__(self, responder):
+    def __init__(self, responder: Callable[[socket.socket, Req], None]):
         self.requests: list[Req] = []
         self.responder = responder
         super().__init__(self._serve)
@@ -155,7 +106,7 @@ class HttpUpstream(FakeServer):
         self.responder(conn, req)
 
 
-def respond(conn: socket.socket, status: int = 200, body: bytes = b"", headers: dict | None = None) -> None:
+def respond(conn: socket.socket, status: int = 200, body: bytes = b"", headers: dict[str, str] | None = None) -> None:
     lines = [f"HTTP/1.1 {status} X", f"Content-Length: {len(body)}", "Connection: close"]
     lines.extend(f"{k}: {v}" for k, v in (headers or {}).items())
     conn.sendall(("\r\n".join(lines) + "\r\n\r\n").encode() + body)
@@ -177,7 +128,7 @@ class FakeConnectProxy(FakeServer):
     def __init__(self, target: tuple[str, int] | None = None, status: int = 200):
         self.target = target
         self.status = status
-        self.connects: list[dict] = []
+        self.connects: list[dict[str, Any]] = []
         super().__init__(self._serve)
 
     def _serve(self, conn: socket.socket) -> None:
@@ -204,7 +155,7 @@ class FakeSocks5Proxy(FakeServer):
         self.target = target
         self.reply = reply
         self.require_auth = require_auth
-        self.requests: list[dict] = []
+        self.requests: list[dict[str, Any]] = []
         super().__init__(self._serve)
 
     @staticmethod
@@ -221,7 +172,7 @@ class FakeSocks5Proxy(FakeServer):
         conn.settimeout(5)
         _, nmethods = self._exact(conn, 2)
         methods = list(self._exact(conn, nmethods))
-        record: dict = {"methods": methods, "auth": None}
+        record: dict[str, Any] = {"methods": methods, "auth": None}
         if self.require_auth:
             conn.sendall(b"\x05\x02")
             _, ulen = self._exact(conn, 2)
@@ -291,7 +242,7 @@ class RawResponse:
     body_raw: bytes
     body: bytes = b""
     terminated: bool = True
-    json: dict = field(default_factory=dict)
+    json: dict[str, Any] = field(default_factory=dict)
 
 
 def parse_response(raw: bytes) -> RawResponse:
@@ -307,7 +258,7 @@ def parse_response(raw: bytes) -> RawResponse:
     body, terminated = body_raw, True
     if headers.get("transfer-encoding", "").lower() == "chunked":
         body, terminated = dechunk(body_raw)
-    parsed: dict = {}
+    parsed: dict[str, Any] = {}
     if headers.get("content-type", "").startswith("application/json"):
         try:
             parsed = _json.loads(body)
@@ -316,7 +267,7 @@ def parse_response(raw: bytes) -> RawResponse:
     return RawResponse(raw, status, headers, body_raw, body, terminated, parsed)
 
 
-def request_bytes(method: str, path: str, body: bytes = b"", headers: dict | None = None) -> bytes:
+def request_bytes(method: str, path: str, body: bytes = b"", headers: dict[str, str] | None = None) -> bytes:
     lines = [f"{method} {path} HTTP/1.1", f"Host: {LOCALHOST}"]
     merged = dict(headers or {})
     if body and not any(k.lower() == "transfer-encoding" for k in merged):
@@ -325,7 +276,9 @@ def request_bytes(method: str, path: str, body: bytes = b"", headers: dict | Non
     return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
 
 
-def open_request(port: int, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> socket.socket:
+def open_request(
+    port: int, method: str, path: str, body: bytes = b"", headers: dict[str, str] | None = None
+) -> socket.socket:
     sock = socket.create_connection((LOCALHOST, port), timeout=10)
     sock.sendall(request_bytes(method, path, body, headers))
     return sock
@@ -363,7 +316,9 @@ def read_all(sock: socket.socket, timeout: float = 10.0) -> bytes:
         buf += data
 
 
-def http_request(port: int, method: str, path: str, body: bytes = b"", headers: dict | None = None) -> RawResponse:
+def http_request(
+    port: int, method: str, path: str, body: bytes = b"", headers: dict[str, str] | None = None
+) -> RawResponse:
     sock = open_request(port, method, path, body, headers)
     try:
         return parse_response(read_all(sock))
@@ -371,7 +326,7 @@ def http_request(port: int, method: str, path: str, body: bytes = b"", headers: 
         sock.close()
 
 
-def wait_for(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
+def wait_for(predicate: Callable[[], bool], timeout: float = 5.0, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -383,7 +338,12 @@ def wait_for(predicate, timeout: float = 5.0, interval: float = 0.02) -> bool:
 # ───────────────────────────── мост ─────────────────────────────
 
 
-def make_config(upstream_port: int, pools: dict | None = None, rules: list | None = None, **extra) -> dict:
+def make_config(
+    upstream_port: int,
+    pools: dict[str, Any] | None = None,
+    rules: list[dict[str, Any]] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
     """Конфигурация моста для тестов: все три upstream указывают на один фейковый порт без TLS."""
     server = {
         "listen": LOCALHOST,
@@ -411,15 +371,16 @@ def make_config(upstream_port: int, pools: dict | None = None, rules: list | Non
 
 
 class BridgeHarness:
-    def __init__(self, config: dict, **kwargs):
+    def __init__(self, config: dict[str, Any], **kwargs: Any):
         self.server = BridgeServer(ConfigManager.from_dict(config), **kwargs)
         self.thread = self.server.start_background()
         self.port = self.server.server_address[1]
 
     def close(self) -> None:
         self.server.stop()
+        self.thread.join(1.0)
 
-    def health(self) -> dict:
+    def health(self) -> dict[str, Any]:
         return http_request(self.port, "GET", "/health").json
 
     def slots_idle(self) -> bool:
@@ -431,5 +392,5 @@ def new_proxy_manager() -> ProxyPoolManager:
     return ProxyPoolManager()
 
 
-def config_from(data: dict):
+def config_from(data: dict[str, Any]):
     return parse_config(data)

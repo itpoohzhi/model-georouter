@@ -827,3 +827,76 @@ def test_cloudcode_unmodified_chunked_response_framing_normalized(track, start_b
     assert "transfer-encoding" not in response.headers
     assert response.headers["content-length"] == str(len(response.body))
     assert response.body == encoded
+
+
+# ─────────────── явный pool адаптера авторитетнее правил по model-id (task-6) ───────────────
+
+
+def test_adapter_pool_beats_global_model_rule(track, start_bridge):
+    direct_up = track(HttpUpstream(ok_responder(b"direct")))
+    proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(
+        make_config(
+            direct_up.port,
+            pools=proxy_pools(proxy.port),
+            rules=[{"match_prefix": ["claude-"], "pool": "direct"}],
+            upstreams={"vendor-ai": {"host": "127.0.0.1", "port": direct_up.port, "use_tls": False}},
+            adapters={"pinned": {"prefixes": ["/pinned"], "upstream": "vendor-ai", "pool": "route-de"}},
+        )
+    )
+    pinned = http_request(bridge.port, "POST", "/pinned/chat/completions", body_for("claude-3-opus"))
+    assert pinned.body == b"via-proxy" and len(proxy.connects) == 1  # pool адаптера победил правило
+    plain = http_request(bridge.port, "POST", "/chat/completions", body_for("claude-3-opus"))
+    assert plain.body == b"direct"  # адаптер без pool — по правилу
+
+
+def test_cloudcode_adapter_pool_survives_conflicting_rule(track, start_bridge):
+    """Обратная совместимость: у cloudcode pool=route-de из DEFAULT_ADAPTERS, правило его не перебивает."""
+    direct_up = track(HttpUpstream(ok_responder(b"direct")))
+    proxied_up = track(HttpUpstream(ok_responder(b"via-proxy")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    bridge = start_bridge(
+        make_config(
+            direct_up.port,
+            pools=proxy_pools(proxy.port),
+            rules=[{"match_prefix": ["gemini-"], "pool": "direct"}],
+            upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": direct_up.port, "use_tls": False}},
+            adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
+        )
+    )
+    response = http_request(bridge.port, "POST", "/cloudcode/v1internal:generateContent", body_for("gemini-3"))
+    assert response.status == 200 and response.body == b"via-proxy" and len(proxy.connects) == 1
+
+
+@pytest.mark.parametrize("proxied,retry", [(False, False), (True, False), (True, True)])
+def test_request_log_records_actual_proxy_endpoint(track, start_bridge, caplog, proxied, retry):
+    upstream = track(HttpUpstream(ok_responder(b"ok")))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    rejected = track(FakeConnectProxy(status=502))
+    urls = [f"http://loguser:logpassword@127.0.0.1:{proxy.port}"]
+    if retry:
+        urls.insert(0, f"http://retryuser:retrypassword@127.0.0.1:{rejected.port}")
+    config = make_config(
+        upstream.port,
+        pools={"route-de": {"type": "http_connect", "proxies": urls}},
+        rules=[{"match_prefix": ["proxied"], "pool": "route-de"}],
+        server={"pre_send_retries": 1},
+    )
+    bridge = start_bridge(config)
+    with caplog.at_level(logging.INFO, logger="model_georouter.server"):
+        response = http_request(bridge.port, "POST", PATH, body_for("proxied" if proxied else "direct"))
+        assert response.status == 200
+        assert wait_for(lambda: any(r.getMessage().startswith("request method=POST") for r in caplog.records))
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("request method=POST")]
+    assert len(lines) == 1
+    line = lines[0]
+    expected = f"127.0.0.1:{proxy.port}" if proxied else "-"
+    assert f" proxy={expected} status=200 " in line
+    assert f" pool={'route-de' if proxied else 'direct'} " in line
+    assert "loguser" not in line and "logpassword" not in line
+    assert "retryuser" not in line and "retrypassword" not in line
+    if retry:
+        assert len(rejected.connects) == 1 and len(proxy.connects) == 1
+        assert f"proxy=127.0.0.1:{rejected.port}" not in line
+    print(line)

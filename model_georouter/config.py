@@ -16,6 +16,7 @@ from typing import Any
 from .errors import ConfigError
 from .logging_utils import get_logger
 from .proxy_pool import parse_proxy_url
+from .retry_budget import RetryBudgetSpec
 
 __all__ = [
     "AdapterConfig",
@@ -82,6 +83,7 @@ class ServerConfig:
     body_timeout: float = 30.0
     body_buffer_max_bytes: int = 16777216
     pre_send_retries: int = 1
+    single_pool_max_retries: int = RetryBudgetSpec().single_pool_max_retries
     geo_cache_ttl_seconds: int = 86400
     proxy_fail_penalty_seconds: int = 30
     retry_sleep_seconds: float = 0.5
@@ -246,19 +248,14 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         inactivity_timeout=_positive_number(section, "inactivity_timeout", d.inactivity_timeout, path),
         body_timeout=_positive_number(section, "body_timeout", d.body_timeout, path),
         body_buffer_max_bytes=_integer(section, "body_buffer_max_bytes", d.body_buffer_max_bytes, path, 1),
-        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, maximum=50),
+        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, 50),
+        single_pool_max_retries=_integer(section, "single_pool_max_retries", d.single_pool_max_retries, path, 0, 0),
         geo_cache_ttl_seconds=_integer(section, "geo_cache_ttl_seconds", d.geo_cache_ttl_seconds, path, 1),
-        proxy_fail_penalty_seconds=_integer(
-            section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path, 0
-        ),
-        retry_sleep_seconds=_non_negative_number(
-            section, "retry_sleep_seconds", d.retry_sleep_seconds, path, maximum=30.0
-        ),
-        retry_backoff_factor=_positive_number(
-            section, "retry_backoff_factor", d.retry_backoff_factor, path, maximum=10.0
-        ),
+        proxy_fail_penalty_seconds=_integer(section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path),
+        retry_sleep_seconds=_non_negative_number(section, "retry_sleep_seconds", d.retry_sleep_seconds, path, 30.0),
+        retry_backoff_factor=_positive_number(section, "retry_backoff_factor", d.retry_backoff_factor, path, 10.0),
         retry_max_sleep_seconds=_non_negative_number(
-            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, maximum=60.0
+            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0
         ),
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
@@ -290,24 +287,29 @@ def _parse_adapters(
     upstreams: Mapping[str, UpstreamConfig],
     pools: Mapping[str, PoolConfig] | None = None,
 ) -> dict[str, AdapterConfig]:
+    """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя требует `upstream` и `prefixes`."""
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
         path = f"adapters.{name}"
-        if name not in DEFAULT_ADAPTERS:
-            raise ConfigError(f"{path}: unknown adapter (expected one of {sorted(DEFAULT_ADAPTERS)})")
         section = _mapping(value, path)
-        default = DEFAULT_ADAPTERS[name]
-        prefixes = _string_list(section, "prefixes", default.prefixes, path)
+        default = DEFAULT_ADAPTERS.get(name)
+        if default is None:
+            for required in ("upstream", "prefixes"):
+                if required not in section:
+                    raise ConfigError(f"{path}: new adapter requires {required!r}")
+            prefixes = _string_list(section, "prefixes", (), path)
+            if not prefixes:
+                raise ConfigError(f"{path}.prefixes: expected list of non-empty strings")
+            default_pool, default_upstream = "", ""
+        else:
+            prefixes = _string_list(section, "prefixes", default.prefixes, path)
+            default_pool, default_upstream = default.pool, default.upstream
         if any(not p.startswith("/") or (len(p) > 1 and p.endswith("/")) for p in prefixes):
             raise ConfigError(f"{path}.prefixes: each prefix must start with '/' and not end with '/'")
-        pool = _string(section, "pool", default.pool, path)
+        pool = _string(section, "pool", default_pool, path)
         if "pool" in section and pool and pools is not None and pool not in pools:
             raise ConfigError(f"{path}.pool: unknown pool {pool!r}")
-        adapters[name] = AdapterConfig(
-            prefixes,
-            _string(section, "upstream", default.upstream, path),
-            pool=pool,
-        )
+        adapters[name] = AdapterConfig(prefixes, _string(section, "upstream", default_upstream, path), pool=pool)
     for name, adapter in adapters.items():
         if adapter.upstream not in upstreams:
             raise ConfigError(f"adapters.{name}.upstream: unknown upstream {adapter.upstream!r}")

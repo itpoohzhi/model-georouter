@@ -327,12 +327,12 @@ class BodyInspector:
 @dataclass(frozen=True)
 class RouteDecision:
     pool: str
-    source: str  # rule | default | geo_cache
+    source: str  # adapter | rule | default | geo_cache
     rule_index: int | None = None
 
 
 class ModelRouter:
-    """Сопоставление имени модели с пулом: правила по порядку (префикс ИЛИ regex), затем `default_pool`."""
+    """Сопоставление имени модели с пулом: явный `pool` адаптера, иначе правила по порядку, затем `default_pool`."""
 
     def __init__(self, config: BridgeConfig):
         self._rules: list[tuple[RuleConfig, re.Pattern[str] | None]] = [
@@ -363,7 +363,15 @@ class ModelRouter:
         geo_cache: GeoCache | None = None,
         default_pool: str | None = None,
     ) -> RouteDecision:
-        """Правила + Geo-Cache: закэшированная гео-блокировка прямого маршрута уводит в `geo_fallback_pool`."""
+        """Маршрут запроса: явный `pool` адаптера (`default_pool`) главнее правил по model-id.
+
+        `source="adapter"` возвращается сразу: правила не применяются, Geo-Cache его не подменяет —
+        так вендорский адаптер со своим пулом (например SG) не зависит от глобальных правил,
+        которые матчатся по model-id и затрагивают чужие адаптеры. Без `pool` поведение прежнее:
+        правила → `default_pool` → `geo_fallback_pool` (только для direct-пула по Geo-Cache).
+        """
+        if default_pool and default_pool in self._pools:
+            return RouteDecision(default_pool, "adapter")
         decision = self.match(model, default_pool=default_pool)
         if (
             geo_cache is not None

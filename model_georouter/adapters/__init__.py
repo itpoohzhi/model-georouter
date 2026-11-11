@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from ..config import BridgeConfig
+from ..config import AdapterConfig, BridgeConfig
 from .admin import AdminAdapter
-from .base import AdapterRoute, ClientAdapter, clean_path
+from .base import AdapterRoute, ClientAdapter, PassthroughAdapter, clean_path
 from .cloudcode import CloudCodeAdapter
 from .cordis import CordisAdapter
 from .generic import GenericAdapter
@@ -20,6 +20,14 @@ ADAPTER_CLASSES: dict[str, type[ClientAdapter]] = {
 }
 
 
+def _build_adapter(name: str, adapter: AdapterConfig) -> ClientAdapter:
+    """Встроенное имя — свой класс; любое новое из конфига — passthrough со снятием префикса."""
+    factory = ADAPTER_CLASSES.get(name)
+    if factory is not None:
+        return factory(adapter.prefixes, adapter.upstream, pool=adapter.pool)
+    return PassthroughAdapter(adapter.prefixes, adapter.upstream, pool=adapter.pool, name=name)
+
+
 class AdapterRegistry:
     """Выбирает адаптер по самому длинному совпавшему префиксу пути."""
 
@@ -28,13 +36,7 @@ class AdapterRegistry:
 
     @classmethod
     def from_config(cls, config: BridgeConfig) -> AdapterRegistry:
-        return cls(
-            [
-                ADAPTER_CLASSES[name](adapter.prefixes, adapter.upstream, pool=adapter.pool)
-                for name, adapter in config.adapters.items()
-                if name in ADAPTER_CLASSES
-            ]
-        )
+        return cls([_build_adapter(name, adapter) for name, adapter in config.adapters.items()])
 
     def get(self, name: str) -> ClientAdapter | None:
         """Получить адаптер по его имени."""
@@ -64,5 +66,6 @@ __all__ = [
     "CordisAdapter",
     "GenericAdapter",
     "OpenCodeAdapter",
+    "PassthroughAdapter",
     "clean_path",
 ]
