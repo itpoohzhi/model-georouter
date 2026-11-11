@@ -2,15 +2,113 @@
 
 from __future__ import annotations
 
+import socket
 import time
+from types import SimpleNamespace
 
 import pytest
 
+from model_georouter.adapters import AdapterRoute
+from model_georouter.bridge_server import (
+    Metrics,
+    _Handler,
+)
+from model_georouter.http_wire import ResponseHead, parse_request_head
+from model_georouter.model_router import BodyInspector
+from model_georouter.proxy_pool import ProxyEndpoint, ProxyPoolManager
 from model_georouter.retry_budget import EgressDeadline, RetryBudgetSpec
-from tests.helpers import FakeConnectProxy, FakeServer, HttpUpstream, http_request, make_config, recv_head, respond
+from tests.helpers import (
+    FakeConnectProxy,
+    FakeServer,
+    HttpUpstream,
+    http_request,
+    make_config,
+    recv_head,
+    respond,
+)
 
 PATH = "/v1/chat/completions"
 BODY = b'{"model":"claude-3-opus","messages":[{"role":"user","content":"ping"}],"stream":true}'
+REGION_BODY = b'{"error":{"type":"RegionError","message":"not available in your region"}}'
+
+
+class _RecordingProxyPoolManager(ProxyPoolManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.penalties: list[ProxyEndpoint] = []
+
+    def penalize(self, endpoint: ProxyEndpoint, seconds: float) -> None:
+        self.penalties.append(endpoint)
+        super().penalize(endpoint, seconds)
+
+
+class _ExplodingEmptyInspector:
+    size = 0
+
+    @property
+    def body(self) -> bytes:
+        raise AssertionError("empty request body must not be inspected")
+
+    def replace_body(self, _data: bytes) -> None:
+        raise AssertionError("empty request body must not be replaced")
+
+
+def _sanitize(method: str, path: str, body: bytes, model: str | None) -> tuple[bytes, list[tuple[str, str]]]:
+    handler = object.__new__(_Handler)
+    handler.model = model
+    req = parse_request_head(f"{method} / HTTP/1.1\r\nHost: h\r\nAnthropic-Beta: old, , value\r\n\r\n".encode())
+    inspector = BodyInspector(65536)
+    inspector.feed(body)
+    handler._sanitize_request_body(req, AdapterRoute("test", "up", path), inspector)
+    return inspector.body, req.headers
+
+
+def _diagnostic_metrics(body: bytes) -> dict[str, int]:
+    client, peer = socket.socketpair()
+    upstream, upstream_peer = socket.socketpair()
+    try:
+        handler = object.__new__(_Handler)
+        object.__setattr__(handler, "server", SimpleNamespace(metrics=Metrics()))
+        handler.status, handler.committed, handler.outcome, handler.bytes_sent = 0, False, "-", 0
+        snapshot = SimpleNamespace(server=SimpleNamespace(body_timeout=0.2, inactivity_timeout=0.2))
+        registry = SimpleNamespace(get=lambda _name: None)
+        classifier = SimpleNamespace(classify=lambda *_args: SimpleNamespace(is_region_error=False))
+        runtime = SimpleNamespace(registry=registry, classifier=classifier)
+        req = parse_request_head(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        route = AdapterRoute("none", "up", "/")
+        object.__setattr__(handler, "_ctx", (client, snapshot, runtime, req, route, "", None, None))
+        object.__setattr__(handler, "_relay", lambda *_args: None)
+        head = ResponseHead("HTTP/1.1", 403, "Forbidden", [("Content-Length", str(len(body)))])
+        handler._finish_upstream_response(upstream, head, body, True)
+        return handler.server.metrics.snapshot()
+    finally:
+        client.close()
+        peer.close()
+        upstream.close()
+        upstream_peer.close()
+
+
+def _transformed_head_response(method: str, body: bytes) -> bytes:
+    client, peer = socket.socketpair()
+    try:
+        handler = object.__new__(_Handler)
+        object.__setattr__(handler, "server", SimpleNamespace(metrics=Metrics()))
+        handler.status, handler.committed, handler.outcome, handler.bytes_sent = 0, False, "-", 0
+        snapshot = SimpleNamespace(server=SimpleNamespace(body_timeout=0.2))
+        req = parse_request_head(f"{method} / HTTP/1.1\r\nHost: h\r\n\r\n".encode())
+        object.__setattr__(handler, "_ctx", (client, snapshot, None, req, None, "", None, None))
+        head = ResponseHead(
+            "HTTP/1.1",
+            200,
+            "OK",
+            [("Transfer-Encoding", "chunked"), ("Content-Length", "1"), ("X-Test", "yes")],
+        )
+        handler._send_transformed_response(head, body)
+        peer.settimeout(0.2)
+        return peer.recv(65536)
+    finally:
+        client.close()
+        peer.close()
 
 
 def _dual_pool_config(upstream_port: int, de_port: int, nl_port: int, **server_overrides: object) -> dict[str, object]:
@@ -100,7 +198,12 @@ def test_egress_deadline_refuses_to_start_expired_phase() -> None:
 
 def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track, start_bridge) -> None:
     de_attempts: list[int] = []
-    de_hang = track(FakeServer(lambda _conn: (de_attempts.append(1), de_hang.stop.wait(5))))
+
+    def hang_on_connect(_conn: socket.socket) -> None:
+        de_attempts.append(1)
+        _ = de_hang.stop.wait(5)
+
+    de_hang = track(FakeServer(hang_on_connect))
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"via-nl")))
     nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_up.port)))
     bridge = start_bridge(_dual_pool_config(nl_up.port, de_hang.port, nl_proxy.port))
