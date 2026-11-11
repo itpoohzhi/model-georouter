@@ -248,20 +248,14 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         inactivity_timeout=_positive_number(section, "inactivity_timeout", d.inactivity_timeout, path),
         body_timeout=_positive_number(section, "body_timeout", d.body_timeout, path),
         body_buffer_max_bytes=_integer(section, "body_buffer_max_bytes", d.body_buffer_max_bytes, path, 1),
-        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, maximum=50),
+        pre_send_retries=_integer(section, "pre_send_retries", d.pre_send_retries, path, 0, 50),
         single_pool_max_retries=_integer(section, "single_pool_max_retries", d.single_pool_max_retries, path, 0, 0),
         geo_cache_ttl_seconds=_integer(section, "geo_cache_ttl_seconds", d.geo_cache_ttl_seconds, path, 1),
-        proxy_fail_penalty_seconds=_integer(
-            section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path, 0
-        ),
-        retry_sleep_seconds=_non_negative_number(
-            section, "retry_sleep_seconds", d.retry_sleep_seconds, path, maximum=30.0
-        ),
-        retry_backoff_factor=_positive_number(
-            section, "retry_backoff_factor", d.retry_backoff_factor, path, maximum=10.0
-        ),
+        proxy_fail_penalty_seconds=_integer(section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path),
+        retry_sleep_seconds=_non_negative_number(section, "retry_sleep_seconds", d.retry_sleep_seconds, path, 30.0),
+        retry_backoff_factor=_positive_number(section, "retry_backoff_factor", d.retry_backoff_factor, path, 10.0),
         retry_max_sleep_seconds=_non_negative_number(
-            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, maximum=60.0
+            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0
         ),
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
@@ -293,11 +287,7 @@ def _parse_adapters(
     upstreams: Mapping[str, UpstreamConfig],
     pools: Mapping[str, PoolConfig] | None = None,
 ) -> dict[str, AdapterConfig]:
-    """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя из конфига требует `upstream` и `prefixes`.
-
-    Новый адаптер обслуживается passthrough-классом: путь очищается и с него снимается
-    самый длинный совпавший префикс из `prefixes`. `pool` для нового имени опционален.
-    """
+    """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя требует `upstream` и `prefixes`."""
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
         path = f"adapters.{name}"

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-__all__ = ["EgressDeadline", "RetryBudgetSpec"]
+__all__ = ["AttemptEvent", "AttemptState", "EgressDeadline", "RetryBudgetSpec", "transition"]
 
 _F08_MAX_TOTAL_EGRESS_SECONDS = 40.0
 _F08_MAX_CONNECT_SECONDS = 3.0
@@ -118,3 +118,58 @@ class RetryBudgetSpec:
             raise ValueError("primary_first_header_timeout must not exceed 5 seconds")
         if not self.penalize_on_header_timeout:
             raise ValueError("penalize_on_header_timeout must be enabled")
+
+
+_FAILURE_EVENTS = frozenset({"penalized", "connect_error", "header_timeout", "protocol_error"})
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptState:
+    """Неизменяемое состояние попытки маршрутизации и failover (F-FSM-I1)."""
+
+    pool: str
+    fallback_pool: str = ""
+    single_proxy: bool = False
+    committed: bool = False
+    penalize_on_header_timeout: bool = True
+    status: str = "pending"
+    should_penalize: bool = False
+    next_pool: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptEvent:
+    """Неизменяемое событие перехода состояния попытки маршрутизации."""
+
+    kind: str
+    deadline_expired: bool = False
+    has_endpoint: bool = False
+
+
+def _should_penalize(state: AttemptState, event: AttemptEvent) -> bool:
+    if not event.has_endpoint:
+        return False
+    if event.kind == "protocol_error":
+        return state.single_proxy
+    if event.kind == "header_timeout":
+        return state.single_proxy or state.penalize_on_header_timeout
+    return False
+
+
+def transition(state: AttemptState, event: AttemptEvent) -> AttemptState:
+    """Чистая функция перехода `transition(state, event) -> new_state` над неизменяемым состоянием."""
+    if event.kind in ("committed", "completed"):
+        return replace(state, committed=True, status=event.kind, should_penalize=False, next_pool="")
+    if event.kind not in _FAILURE_EVENTS:
+        raise ValueError(f"unsupported attempt event: {event.kind}")
+    penalize = _should_penalize(state, event)
+    if state.single_proxy and not state.committed and not event.deadline_expired and state.fallback_pool:
+        return replace(
+            state,
+            pool=state.fallback_pool,
+            single_proxy=False,
+            status="failover",
+            should_penalize=penalize,
+            next_pool=state.fallback_pool,
+        )
+    return replace(state, status="failed", should_penalize=penalize, next_pool="")

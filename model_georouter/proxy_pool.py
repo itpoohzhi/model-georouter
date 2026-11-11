@@ -84,14 +84,14 @@ class EgressSettings:
     @classmethod
     def from_server(cls, server: ServerConfig) -> EgressSettings:
         return cls(
-            connect_timeout=server.connect_timeout,
-            total_deadline=server.total_egress_deadline,
-            retries=server.pre_send_retries,
-            penalty_seconds=server.proxy_fail_penalty_seconds,
-            retry_sleep_seconds=server.retry_sleep_seconds,
-            retry_backoff_factor=server.retry_backoff_factor,
-            retry_max_sleep_seconds=server.retry_max_sleep_seconds,
-            single_pool_max_retries=server.single_pool_max_retries,
+            server.connect_timeout,
+            server.total_egress_deadline,
+            server.pre_send_retries,
+            server.proxy_fail_penalty_seconds,
+            server.retry_sleep_seconds,
+            server.retry_backoff_factor,
+            server.retry_max_sleep_seconds,
+            server.single_pool_max_retries,
         )
 
 
@@ -189,12 +189,7 @@ def open_direct(host: str, port: int, deadline: float) -> socket.socket:
 
 
 def _read_connect_head(sock: socket.socket, endpoint: ProxyEndpoint, deadline: float) -> bytearray:
-    """Прочитать голову ответа прокси до `\\r\\n\\r\\n` включительно, не забирая ни байта сверх неё.
-
-    `MSG_PEEK` показывает, что уже пришло; без разделителя забираем подсмотренное и блокируемся
-    на следующем peek до новых данных (без spin-wait), с разделителем — ровно до его конца.
-    Начало туннельного потока за разделителем остаётся в сокете.
-    """
+    """Прочитать голову ответа прокси до `\\r\\n\\r\\n` включительно через `MSG_PEEK` без лишнего чтения."""
     head = bytearray()
     while True:
         _arm(sock, deadline)
@@ -308,11 +303,9 @@ class ProxyPoolManager:
     """Выбор прокси, штрафы и circuit breaker; состояние штрафов переживает hot-reload конфигурации."""
 
     def __init__(self, *, clock: Callable[[], float] = time.time, rng: random.Random | None = None):
-        self._clock = clock
-        self._rng = rng or random.Random()
+        self._clock, self._rng, self._lock = clock, rng or random.Random(), threading.Lock()
         self._penalties: dict[str, float] = {}
         self._endpoints: dict[str, ProxyEndpoint] = {}
-        self._lock = threading.Lock()
 
     def endpoints(self, pool: PoolConfig) -> list[ProxyEndpoint]:
         with self._lock:
@@ -334,9 +327,7 @@ class ProxyPoolManager:
             return self._penalties.get(endpoint.raw, 0.0) > self._clock()
 
     def available(self, pool: PoolConfig, exclude: Iterable[str] = ()) -> list[ProxyEndpoint]:
-        excluded = set(exclude)
-        now = self._clock()
-        endpoints = self.endpoints(pool)
+        excluded, now, endpoints = set(exclude), self._clock(), self.endpoints(pool)
         with self._lock:
             return [e for e in endpoints if self._penalties.get(e.raw, 0.0) <= now and e.raw not in excluded]
 
@@ -347,14 +338,10 @@ class ProxyPoolManager:
 
     def select(self, pool: PoolConfig, exclude: Iterable[str] = ()) -> ProxyEndpoint | None:
         """Выбрать прокси по стратегии пула; None — нет кандидатов (или пул direct)."""
-        if pool.type == "direct":
-            return None
-        candidates = self.available(pool, exclude)
+        candidates = [] if pool.type == "direct" else self.available(pool, exclude)
         if not candidates:
             return None
-        if pool.strategy == "random":
-            return self._rng.choice(candidates)
-        return candidates[0]
+        return self._rng.choice(candidates) if pool.strategy == "random" else candidates[0]
 
     def stats(self, pools: Iterable[PoolConfig]) -> dict[str, dict[str, object]]:
         result: dict[str, dict[str, object]] = {}
@@ -391,12 +378,7 @@ class ProxyPoolManager:
 
     @staticmethod
     def _backoff_pause(pool: PoolConfig, settings: EgressSettings, attempt: int, single: bool, overall: float) -> None:
-        """Экспоненциальная пауза перед повтором к той же цели (direct или единственный прокси).
-
-        Пул из нескольких прокси не спит: непробованный кандидат берётся мгновенно, а без
-        кандидатов цикл завершается — пауза перед выходом бессмысленна. После последней
-        попытки и когда пауза не укладывается в остаток общего дедлайна — тоже без сна.
-        """
+        """Экспоненциальная пауза перед повтором к той же цели (direct или единственный прокси)."""
         if attempt >= settings.retries or (pool.type != "direct" and not single):
             return
         retry_number = attempt + 1  # attempt считается с 0: после первой неудачи идёт повтор №1
@@ -476,7 +458,6 @@ class ProxyPoolManager:
                 sock.settimeout(None)
                 return sock
             if time.monotonic() >= attempt_deadline:
-                # бюджет попытки ушёл на установление туннеля: прокси не виноват, штрафа нет
                 sock.close()
                 last = EgressTimeoutError(
                     f"connect timeout of {settings.connect_timeout:g}s exceeded before TLS handshake",

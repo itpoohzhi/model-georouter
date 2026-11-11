@@ -237,7 +237,8 @@ def test_circuit_breaker_closes_after_penalty_expires():
 
 
 def test_connect_timeout_gives_egress_timeout_error(track):
-    hang = track(FakeServer(lambda conn: time.sleep(3)))  # принимает, но молчит на CONNECT
+    hang: FakeServer | None = None
+    hang = track(FakeServer(lambda conn: hang.stop.wait(3) if hang else None))  # принимает, но молчит на CONNECT
     pool = http_pool(f"http://127.0.0.1:{hang.port}")
     settings = EgressSettings(connect_timeout=0.3, total_deadline=5.0, retries=0, penalty_seconds=30)
     started = time.monotonic()
@@ -247,7 +248,8 @@ def test_connect_timeout_gives_egress_timeout_error(track):
 
 
 def test_total_egress_deadline_bounds_all_attempts(track):
-    hang = track(FakeServer(lambda conn: time.sleep(3)))
+    hang: FakeServer | None = None
+    hang = track(FakeServer(lambda conn: hang.stop.wait(3) if hang else None))
     pool = http_pool(f"http://127.0.0.1:{hang.port}", f"http://127.0.0.1:{hang.port}/x")
     settings = EgressSettings(connect_timeout=5.0, total_deadline=0.4, retries=1, penalty_seconds=30)
     started = time.monotonic()
@@ -355,15 +357,7 @@ def test_persistent_tls_failure_exhausts_retries_with_egress_error(track):  # RW
 def test_connect_failures_back_off_exponentially_up_to_cap(monkeypatch):
     pauses: list[float] = []
     monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
-    settings = EgressSettings(
-        connect_timeout=2.0,
-        total_deadline=30.0,
-        retries=3,
-        penalty_seconds=30,
-        retry_sleep_seconds=0.5,
-        retry_backoff_factor=2.0,
-        retry_max_sleep_seconds=1.5,
-    )
+    settings = EgressSettings(2.0, 30.0, 3, 30, 0.5, 2.0, 1.5)
     with pytest.raises(EgressConnectError):
         ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
     assert pauses == [0.5, 1.0, 1.5]  # после последней попытки паузы нет
@@ -372,14 +366,7 @@ def test_connect_failures_back_off_exponentially_up_to_cap(monkeypatch):
 def test_backoff_is_skipped_when_it_would_exceed_total_deadline(monkeypatch):
     pauses: list[float] = []
     monkeypatch.setattr("model_georouter.proxy_pool.time.sleep", pauses.append)
-    settings = EgressSettings(
-        connect_timeout=2.0,
-        total_deadline=1.0,
-        retries=2,
-        penalty_seconds=30,
-        retry_sleep_seconds=5.0,
-        retry_max_sleep_seconds=5.0,
-    )
+    settings = EgressSettings(2.0, 1.0, 2, 30, 5.0, 2.0, 5.0)
     with pytest.raises(EgressConnectError):
         ProxyPoolManager().connect(PoolConfig("direct", "direct"), "127.0.0.1", free_port(), settings)
     assert pauses == []
@@ -556,13 +543,25 @@ def test_open_http_connect_fragmented_no_cpu_spin(connect_peer):
 
 
 def test_open_http_connect_oversized_limit(connect_peer):
-    _, peer = connect_peer
+    counting, peer = connect_peer
     flood = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * (CONNECT_RESPONSE_LIMIT + 100)  # разделителя нет
-    # буфер socketpair меньше ответа: пишем из потока, иначе sendall блокируется до чтения клиента
-    threading.Thread(target=lambda: peer.sendall(flood), daemon=True).start()
-    with pytest.raises(EgressConnectError, match="oversized") as excinfo:
-        _connect()
-    assert excinfo.value.phase == "connect_read"
+
+    def send_flood() -> None:
+        try:
+            peer.sendall(flood)
+        except OSError:
+            pass
+
+    writer = threading.Thread(target=send_flood, daemon=True)
+    writer.start()
+    try:
+        with pytest.raises(EgressConnectError, match="oversized") as excinfo:
+            _connect()
+        assert excinfo.value.phase == "connect_read"
+    finally:
+        counting.close()
+        peer.close()
+        writer.join(1.0)
 
 
 def test_open_http_connect_preserves_trailing_tls_bytes(connect_peer):

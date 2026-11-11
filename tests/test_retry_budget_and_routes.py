@@ -100,7 +100,7 @@ def test_egress_deadline_refuses_to_start_expired_phase() -> None:
 
 def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track, start_bridge) -> None:
     de_attempts: list[int] = []
-    de_hang = track(FakeServer(lambda _conn: (de_attempts.append(1), time.sleep(5))))
+    de_hang = track(FakeServer(lambda _conn: (de_attempts.append(1), de_hang.stop.wait(5))))
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"via-nl")))
     nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_up.port)))
     bridge = start_bridge(_dual_pool_config(nl_up.port, de_hang.port, nl_proxy.port))
@@ -124,7 +124,7 @@ def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s
         de_connects.append(1)
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
         recv_head(conn)
-        time.sleep(5)
+        de_proxy.stop.wait(5)
 
     de_proxy = track(FakeServer(stalled_after_connect))
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"nl-after-header-stall")))
@@ -142,8 +142,8 @@ def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s
 
 
 def test_shared_monotonic_egress_deadline_clamps_connect_send_and_headers(track, start_bridge) -> None:
-    de_hang = track(FakeServer(lambda _conn: time.sleep(5)))
-    nl_stalled_up = track(HttpUpstream(lambda _conn, _req: time.sleep(5)))
+    de_hang = track(FakeServer(lambda _conn: de_hang.stop.wait(5)))
+    nl_stalled_up = track(HttpUpstream(lambda _conn, _req: nl_stalled_up.stop.wait(5)))
     nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_stalled_up.port)))
     bridge = start_bridge(
         _dual_pool_config(

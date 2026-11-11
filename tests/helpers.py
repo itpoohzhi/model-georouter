@@ -71,8 +71,10 @@ class FakeServer:
         self.port = self._sock.getsockname()[1]
         self._closed = threading.Event()
         self.connections: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
         self.stop = threading.Event()
-        threading.Thread(target=self._accept_loop, daemon=True).start()
+        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._accept_thread.start()
 
     def _accept_loop(self) -> None:
         while not self._closed.is_set():
@@ -83,7 +85,9 @@ class FakeServer:
             except OSError:
                 return
             self.connections.append(conn)
-            threading.Thread(target=self._run, args=(conn,), daemon=True).start()
+            worker = threading.Thread(target=self._run, args=(conn,), daemon=True)
+            self._threads.append(worker)
+            worker.start()
 
     def _run(self, conn: socket.socket) -> None:
         try:
@@ -108,6 +112,9 @@ class FakeServer:
                 conn.close()
             except OSError:
                 pass
+        self._accept_thread.join(0.5)
+        for worker in list(self._threads):
+            worker.join(0.5)
 
 
 @dataclass
@@ -418,6 +425,7 @@ class BridgeHarness:
 
     def close(self) -> None:
         self.server.stop()
+        self.thread.join(1.0)
 
     def health(self) -> dict:
         return http_request(self.port, "GET", "/health").json
