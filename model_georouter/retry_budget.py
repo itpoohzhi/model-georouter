@@ -132,6 +132,8 @@ class AttemptState:
     single_proxy: bool = False
     committed: bool = False
     penalize_on_header_timeout: bool = True
+    has_alternative: bool = True
+    penalize_without_alternative: bool = True
     status: str = "pending"
     should_penalize: bool = False
     next_pool: str = ""
@@ -152,7 +154,11 @@ def _should_penalize(state: AttemptState, event: AttemptEvent) -> bool:
     if event.kind == "protocol_error":
         return state.single_proxy
     if event.kind == "header_timeout":
-        return state.single_proxy or state.penalize_on_header_timeout
+        if state.single_proxy:
+            return True
+        if not state.has_alternative and not state.penalize_without_alternative:
+            return False
+        return state.penalize_on_header_timeout
     return False
 
 
