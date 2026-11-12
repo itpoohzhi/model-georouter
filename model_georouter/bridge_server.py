@@ -551,7 +551,15 @@ class _Handler(socketserver.BaseRequestHandler):
         srv, cfg, pool = self.server, snapshot.server, snapshot.pools[pool_name]
         b, fb, direct = srv.retry_budget, snapshot.geo_fallback_pool, _is_direct(pool)
         single = allow_fallback and bool(fb) and fb != pool_name and not direct and len(pool.proxies) == 1
-        state = AttemptState(pool_name, fb if single else "", single, self.committed, b.penalize_on_header_timeout)
+        state = AttemptState(
+            pool_name,
+            fb if single else "",
+            single,
+            self.committed,
+            b.penalize_on_header_timeout,
+            has_alternative=single or len(pool.proxies) > 1,
+            penalize_without_alternative=cfg.penalize_header_timeout_without_alternative,
+        )
         self.pool_name, self.proxy_endpoint, self._last_proxy_endpoint = pool_name, "-", None
         if not direct:
             try:
