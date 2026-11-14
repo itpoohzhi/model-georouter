@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -124,9 +125,12 @@ class EgressAdmission:
         if f08_v2_risk_ack is not None and not isinstance(f08_v2_risk_ack, str):
             raise ConfigError("server.f08_v2_risk_ack: expected string or None")
         if client_timeout_s is not None and (
-            isinstance(client_timeout_s, bool) or not isinstance(client_timeout_s, int | float)
+            isinstance(client_timeout_s, bool)
+            or not isinstance(client_timeout_s, int | float)
+            or not math.isfinite(client_timeout_s)
+            or client_timeout_s <= 0
         ):
-            raise ConfigError("server.client_timeout_s: expected number or None")
+            raise ConfigError("server.client_timeout_s: expected finite positive number or None")
         if isinstance(config, _cg.GuardedConfig):
             pools, proxy_slots, total_egress_deadline = (
                 config.bridge.pools if pools is None else pools,

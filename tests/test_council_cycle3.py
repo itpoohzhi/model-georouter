@@ -5,17 +5,24 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections.abc import Callable
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from _typeshed import ReadableBuffer
 from pathlib import Path
 
 import pytest
 
 from model_georouter import config as config_module
 from model_georouter import proxy_pool
-from model_georouter.bridge_server import OVERLOADED_503
+from model_georouter._typing import override
+from model_georouter.bridge_server import OVERLOADED_503, Metrics, SlotPool
 from model_georouter.config import default_config_path, default_log_dir, parse_config
 from model_georouter.errors import BadRequestError, EgressTimeoutError
 from model_georouter.model_router import BodyInspector
-from tests.helpers import HttpUpstream, make_config
+from tests.helpers import HttpUpstream, Req, make_config
+from tests.v3_types import ConfigData, StartBridge, Track
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,20 +53,20 @@ def _feed(body: bytes, step: int | None = None) -> BodyInspector:
         b'{"model":"a","model":true}',
     ],
 )
-def test_rw001_conflicting_duplicate_model_keys_are_rejected(body, step):
+def test_rw001_conflicting_duplicate_model_keys_are_rejected(body: bytes, step: int | None) -> None:
     with pytest.raises(BadRequestError, match="Conflicting duplicate model keys"):
-        _feed(body, step)
+        _ = _feed(body, step)
 
 
 @pytest.mark.parametrize("step", [None, 1, 3])
-def test_rw001_identical_string_duplicates_are_allowed(step):
+def test_rw001_identical_string_duplicates_are_allowed(step: int | None) -> None:
     assert _feed(b'{"model":"a","z":[1],"model":"a","model":"a"}', step).model == "a"
     assert _feed(b'{"model":"a","m":{"model":null}}', step).model == "a"
 
 
-def test_rw001_conflicting_model_gets_400_over_the_wire(track, start_bridge):
+def test_rw001_conflicting_model_gets_400_over_the_wire(track: Track, start_bridge: StartBridge) -> None:
     up = track(HttpUpstream(lambda conn, req: conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")))
-    bridge = start_bridge(make_config(up.port))
+    bridge = start_bridge(make_config(cast(int, up.port)))
     body = b'{"model":"claude-x","model":null}'
     with socket.create_connection(("127.0.0.1", bridge.port), timeout=5) as sock:
         sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
@@ -71,7 +78,7 @@ def test_rw001_conflicting_model_gets_400_over_the_wire(track, start_bridge):
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HOME", str(tmp_path))
     return tmp_path
 
@@ -79,22 +86,23 @@ def home(tmp_path, monkeypatch):
 def _touch(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     if path.name != "logs":
-        (path / "config.json").write_text("{}")
+        _ = (path / "config.json").write_text("{}")
 
 
-def test_rw002_default_is_model_georouter_when_nothing_exists(home):
+def test_rw002_default_is_model_georouter_when_nothing_exists(home: Path) -> None:
+    _ = home
     assert default_config_path() == Path("~/.config/model-georouter/config.json")
     assert default_log_dir() == "~/.config/model-georouter/logs"
 
 
-def test_rw002_legacy_is_used_when_only_legacy_exists(home):
+def test_rw002_legacy_is_used_when_only_legacy_exists(home: Path) -> None:
     _touch(home / ".config/universal-ai-bridge")
     (home / ".config/universal-ai-bridge/logs").mkdir()
     assert default_config_path() == Path("~/.config/universal-ai-bridge/config.json")
     assert default_log_dir() == "~/.config/universal-ai-bridge/logs"
 
 
-def test_rw002_new_path_wins_over_legacy(home):
+def test_rw002_new_path_wins_over_legacy(home: Path) -> None:
     for name in ("model-georouter", "universal-ai-bridge"):
         _touch(home / ".config" / name)
         (home / ".config" / name / "logs").mkdir()
@@ -102,8 +110,8 @@ def test_rw002_new_path_wins_over_legacy(home):
     assert default_log_dir() == "~/.config/model-georouter/logs"
 
 
-def test_rw002_server_config_log_dir_follows_resolution(home):
-    raw = {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
+def test_rw002_server_config_log_dir_follows_resolution(home: Path) -> None:
+    raw: ConfigData = {"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []}
     assert parse_config(raw).server.log_dir == "~/.config/model-georouter/logs"
     (home / ".config/universal-ai-bridge/logs").mkdir(parents=True)
     assert parse_config(raw).server.log_dir == "~/.config/universal-ai-bridge/logs"
@@ -112,7 +120,10 @@ def test_rw002_server_config_log_dir_follows_resolution(home):
     assert parse_config(raw).server.log_dir == "/x"
 
 
-def test_rw002_cli_default_uses_resolved_path(home, monkeypatch, capsys):
+def test_rw002_cli_default_uses_resolved_path(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _ = monkeypatch
     from model_georouter.__main__ import main
 
     _touch(home / ".config/universal-ai-bridge")
@@ -124,26 +135,31 @@ def test_rw002_cli_default_uses_resolved_path(home, monkeypatch, capsys):
 # ───────────────────────────── RW-003: ограничение потоков DNS ─────────────────────────────
 
 
-def test_rw003_dns_threads_are_capped_by_semaphore(monkeypatch):
+def test_rw003_dns_threads_are_capped_by_semaphore(monkeypatch: pytest.MonkeyPatch) -> None:
     sem = threading.BoundedSemaphore(2)
     monkeypatch.setattr(proxy_pool, "_DNS_SEMAPHORE", sem)
     release = threading.Event()
     started: list[int] = []
 
-    def blocked(*args, **kwargs):
+    def blocked(*args: object, **kwargs: object) -> list[object]:
+        _ = (args, kwargs)
         started.append(1)
-        release.wait(5)
+        _ = release.wait(5)
         return []
 
     monkeypatch.setattr(socket, "getaddrinfo", blocked)
     try:
         for _ in range(2):
             with pytest.raises(TimeoutError):
-                proxy_pool._resolve("slow-dns.invalid", 80, time.monotonic() + 0.1)
+                _ = cast(Callable[[str, int, float], object], vars(proxy_pool)["_resolve"])(
+                    "slow-dns.invalid", 80, time.monotonic() + 0.1
+                )
         threads_before = threading.active_count()
         began = time.monotonic()
         with pytest.raises(EgressTimeoutError, match="concurrency limit"):
-            proxy_pool._resolve("slow-dns.invalid", 80, time.monotonic() + 0.2)
+            _ = cast(Callable[[str, int, float], object], vars(proxy_pool)["_resolve"])(
+                "slow-dns.invalid", 80, time.monotonic() + 0.2
+            )
         assert time.monotonic() - began < 2.0
         assert len(started) == 2 and threading.active_count() == threads_before  # третий поток не создан
     finally:
@@ -159,11 +175,13 @@ def test_rw003_dns_threads_are_capped_by_semaphore(monkeypatch):
 # ───────────────────────────── RW-004: полная доставка inline 503 ─────────────────────────────
 
 
-def test_rw004_inline_503_is_fully_delivered(track, start_bridge):
-    up = track(
-        HttpUpstream(lambda conn, req: (time.sleep(1), conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")))
-    )
-    bridge = start_bridge(make_config(up.port, server={"max_connections": 1}))
+def test_rw004_inline_503_is_fully_delivered(track: Track, start_bridge: StartBridge) -> None:
+    def delayed(conn: socket.socket, _req: Req) -> None:
+        time.sleep(1)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+    up = track(HttpUpstream(delayed))
+    bridge = start_bridge(make_config(cast(int, up.port), server={"max_connections": 1}))
     holder = socket.create_connection(("127.0.0.1", bridge.port), timeout=5)
     try:
         holder.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: h\r\nContent-Length: 100\r\n\r\n")
@@ -178,52 +196,61 @@ def test_rw004_inline_503_is_fully_delivered(track, start_bridge):
         holder.close()
 
 
-def test_rw004_inline_503_uses_sendall_with_timeout(monkeypatch):
+def test_rw004_inline_503_uses_sendall_with_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ = monkeypatch
     from model_georouter.bridge_server import BridgeServer
 
-    calls: list[tuple] = []
+    calls: list[tuple[object, ...]] = []
 
-    class FakeSock:
-        def settimeout(self, value):
+    class FakeSock(socket.socket):
+        @override
+        def settimeout(self, value: float | None) -> None:
             calls.append(("settimeout", value))
 
-        def setblocking(self, flag):
+        @override
+        def setblocking(self, flag: bool) -> None:
             calls.append(("setblocking", flag))
 
-        def sendall(self, data):
+        @override
+        def sendall(self, data: ReadableBuffer, flags: int = 0) -> None:
+            _ = flags
             calls.append(("sendall", data))
 
-        def send(self, data):  # pragma: no cover
-            raise AssertionError("single send() may write partially")
-
-        def shutdown(self, how):
+        @override
+        def shutdown(self, how: int) -> None:
             calls.append(("shutdown", how))
 
-        def recv(self, size):
+        @override
+        def recv(self, size: int, flags: int = 0) -> bytes:
+            _ = (size, flags)
             return b""
 
-    class Ingress:
-        def try_acquire(self):
-            return False
-
     server = BridgeServer.__new__(BridgeServer)
-    server.ingress = Ingress()
-    server._check_reload = lambda: None
-    server.shutdown_request = lambda request: calls.append(("closed",))
-    metrics = type("M", (), {"incr": lambda self, name: None})()
-    server.metrics = metrics
-    server.process_request(FakeSock(), ("127.0.0.1", 1))
+    server.ingress = SlotPool(0)
+    monkeypatch.setattr(server, "_check_reload", lambda: None)
+
+    def shutdown_request(_request: object) -> None:
+        calls.append(("closed",))
+
+    monkeypatch.setattr(server, "shutdown_request", shutdown_request)
+    server.metrics = Metrics()
+    with FakeSock() as sock:
+        server.process_request(sock, ("127.0.0.1", 1))
     assert calls[0] == ("settimeout", 0.5) and calls[1] == ("sendall", OVERLOADED_503) and calls[-1] == ("closed",)
     assert len(OVERLOADED_503.split(b"\r\n\r\n", 1)[1]) == 20
 
 
-def test_rw004_ingress_wait_timeout_is_deprecated_but_validated():
+def test_rw004_ingress_wait_timeout_is_deprecated_but_validated() -> None:
     from model_georouter.config import ConfigError
 
     readme = (ROOT / "README.md").read_text()
     assert "ingress_wait_timeout" in readme and "ignored" in readme.lower()
-    base = {"server": {"listen": "127.0.0.1", "port": 1, "ingress_wait_timeout": 2}, "pools": {}, "rules": []}
+    base: ConfigData = {
+        "server": {"listen": "127.0.0.1", "port": 1, "ingress_wait_timeout": 2},
+        "pools": {},
+        "rules": [],
+    }
     assert parse_config(base).server.ingress_wait_timeout == 2.0
     base["server"]["ingress_wait_timeout"] = 0
     with pytest.raises(ConfigError):
-        parse_config(base)
+        _ = parse_config(base)

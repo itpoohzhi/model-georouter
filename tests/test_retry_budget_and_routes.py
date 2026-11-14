@@ -5,27 +5,41 @@ from __future__ import annotations
 import socket
 import time
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from model_georouter._typing import override
 from model_georouter.adapters import AdapterRoute
 from model_georouter.bridge_server import (
     Metrics,
-    _Handler,
+)
+from model_georouter.bridge_server import (
+    _Handler as Handler,  # pyright: ignore[reportPrivateUsage] — намеренный unit-probe обработчика
 )
 from model_georouter.http_wire import ResponseHead, parse_request_head
 from model_georouter.model_router import BodyInspector
 from model_georouter.proxy_pool import ProxyEndpoint, ProxyPoolManager
 from model_georouter.retry_budget import EgressDeadline, RetryBudgetSpec
+from tests.fake_server import FakeServer
 from tests.helpers import (
     FakeConnectProxy,
-    FakeServer,
     HttpUpstream,
+    Req,
     http_request,
     make_config,
     recv_head,
     respond,
 )
+from tests.v3_types import StartBridge, Track
+
+__all__ = [
+    "_ExplodingEmptyInspector",
+    "_RecordingProxyPoolManager",
+    "_diagnostic_metrics",
+    "_sanitize",
+    "_transformed_head_response",
+]
 
 PATH = "/v1/chat/completions"
 BODY = b'{"model":"claude-3-opus","messages":[{"role":"user","content":"ping"}],"stream":true}'
@@ -37,13 +51,14 @@ class _RecordingProxyPoolManager(ProxyPoolManager):
         super().__init__()
         self.penalties: list[ProxyEndpoint] = []
 
+    @override
     def penalize(self, endpoint: ProxyEndpoint, seconds: float) -> None:
         self.penalties.append(endpoint)
         super().penalize(endpoint, seconds)
 
 
 class _ExplodingEmptyInspector:
-    size = 0
+    size: int = 0
 
     @property
     def body(self) -> bytes:
@@ -54,12 +69,12 @@ class _ExplodingEmptyInspector:
 
 
 def _sanitize(method: str, path: str, body: bytes, model: str | None) -> tuple[bytes, list[tuple[str, str]]]:
-    handler = object.__new__(_Handler)
+    handler = object.__new__(Handler)
     handler.model = model
     req = parse_request_head(f"{method} / HTTP/1.1\r\nHost: h\r\nAnthropic-Beta: old, , value\r\n\r\n".encode())
     inspector = BodyInspector(65536)
     inspector.feed(body)
-    handler._sanitize_request_body(req, AdapterRoute("test", "up", path), inspector)
+    handler._sanitize_request_body(req, AdapterRoute("test", "up", path), inspector)  # pyright: ignore[reportPrivateUsage] — изолированный unit-probe
     return inspector.body, req.headers
 
 
@@ -67,20 +82,28 @@ def _diagnostic_metrics(body: bytes) -> dict[str, int]:
     client, peer = socket.socketpair()
     upstream, upstream_peer = socket.socketpair()
     try:
-        handler = object.__new__(_Handler)
-        object.__setattr__(handler, "server", SimpleNamespace(metrics=Metrics()))
+        handler = object.__new__(Handler)
+        metrics = Metrics()
+        object.__setattr__(handler, "server", SimpleNamespace(metrics=metrics))
         handler.status, handler.committed, handler.outcome, handler.bytes_sent = 0, False, "-", 0
         snapshot = SimpleNamespace(server=SimpleNamespace(body_timeout=0.2, inactivity_timeout=0.2))
-        registry = SimpleNamespace(get=lambda _name: None)
-        classifier = SimpleNamespace(classify=lambda *_args: SimpleNamespace(is_region_error=False))
+
+        def no_result(*_args: object) -> None:
+            return None
+
+        def classify(*_args: object) -> SimpleNamespace:
+            return SimpleNamespace(is_region_error=False)
+
+        registry = SimpleNamespace(get=no_result)
+        classifier = SimpleNamespace(classify=classify)
         runtime = SimpleNamespace(registry=registry, classifier=classifier)
         req = parse_request_head(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
         route = AdapterRoute("none", "up", "/")
         object.__setattr__(handler, "_ctx", (client, snapshot, runtime, req, route, "", None, None))
-        object.__setattr__(handler, "_relay", lambda *_args: None)
+        object.__setattr__(handler, "_relay", no_result)
         head = ResponseHead("HTTP/1.1", 403, "Forbidden", [("Content-Length", str(len(body)))])
-        handler._finish_upstream_response(upstream, head, body, True)
-        return handler.server.metrics.snapshot()
+        handler._finish_upstream_response(upstream, head, body, True)  # pyright: ignore[reportPrivateUsage] — изолированный unit-probe
+        return metrics.snapshot()
     finally:
         client.close()
         peer.close()
@@ -91,7 +114,7 @@ def _diagnostic_metrics(body: bytes) -> dict[str, int]:
 def _transformed_head_response(method: str, body: bytes) -> bytes:
     client, peer = socket.socketpair()
     try:
-        handler = object.__new__(_Handler)
+        handler = object.__new__(Handler)
         object.__setattr__(handler, "server", SimpleNamespace(metrics=Metrics()))
         handler.status, handler.committed, handler.outcome, handler.bytes_sent = 0, False, "-", 0
         snapshot = SimpleNamespace(server=SimpleNamespace(body_timeout=0.2))
@@ -103,7 +126,7 @@ def _transformed_head_response(method: str, body: bytes) -> bytes:
             "OK",
             [("Transfer-Encoding", "chunked"), ("Content-Length", "1"), ("X-Test", "yes")],
         )
-        handler._send_transformed_response(head, body)
+        handler._send_transformed_response(head, body)  # pyright: ignore[reportPrivateUsage] — изолированный unit-probe
         peer.settimeout(0.2)
         return peer.recv(65536)
     finally:
@@ -196,7 +219,7 @@ def test_egress_deadline_refuses_to_start_expired_phase() -> None:
         _ = deadline.clamp(5.0, now=140.0)
 
 
-def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track, start_bridge) -> None:
+def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track: Track, start_bridge: StartBridge) -> None:
     de_attempts: list[int] = []
 
     def hang_on_connect(_conn: socket.socket) -> None:
@@ -205,8 +228,8 @@ def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track, st
 
     de_hang = track(FakeServer(hang_on_connect))
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"via-nl")))
-    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_up.port)))
-    bridge = start_bridge(_dual_pool_config(nl_up.port, de_hang.port, nl_proxy.port))
+    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, nl_up.port))))
+    bridge = start_bridge(_dual_pool_config(cast(int, nl_up.port), cast(int, de_hang.port), cast(int, nl_proxy.port)))
 
     started = time.monotonic()
     first = http_request(bridge.port, "POST", PATH, BODY)
@@ -214,25 +237,36 @@ def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track, st
 
     assert first.status == 200 and first.body == b"via-nl"
     assert elapsed < 7.0 and len(de_attempts) == 1
-    assert bridge.health()["pools"]["route-de"]["proxies_penalized"] == 1
+    assert (
+        cast(dict[str, dict[str, dict[str, int]]], cast(object, bridge.health()))["pools"]["route-de"][
+            "proxies_penalized"
+        ]
+        == 1
+    )
     second = http_request(bridge.port, "POST", PATH, BODY)
     assert second.status == 200 and second.body == b"via-nl" and len(de_attempts) == 1
 
 
-def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s(track, start_bridge) -> None:
+def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s(
+    track: Track, start_bridge: StartBridge
+) -> None:
     de_connects: list[int] = []
 
-    def stalled_after_connect(conn) -> None:
-        recv_head(conn)
+    def stalled_after_connect(conn: socket.socket) -> None:
+        _ = recv_head(conn)
         de_connects.append(1)
         conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        recv_head(conn)
-        de_proxy.stop.wait(5)
+        _ = recv_head(conn)
+        _ = de_proxy.stop.wait(5)
 
     de_proxy = track(FakeServer(stalled_after_connect))
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"nl-after-header-stall")))
-    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_up.port)))
-    bridge = start_bridge(_dual_pool_config(nl_up.port, de_proxy.port, nl_proxy.port, headers_timeout=120.0))
+    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, nl_up.port))))
+    bridge = start_bridge(
+        _dual_pool_config(
+            cast(int, nl_up.port), cast(int, de_proxy.port), cast(int, nl_proxy.port), headers_timeout=120.0
+        )
+    )
     bridge.server.retry_budget = RetryBudgetSpec(primary_first_header_timeout=0.3)
 
     started = time.monotonic()
@@ -241,18 +275,29 @@ def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s
 
     assert resp.status == 200 and resp.body == b"nl-after-header-stall"
     assert elapsed < 7.0 and len(de_connects) == 1
-    assert bridge.health()["pools"]["route-de"]["proxies_penalized"] == 1
+    assert (
+        cast(dict[str, dict[str, dict[str, int]]], cast(object, bridge.health()))["pools"]["route-de"][
+            "proxies_penalized"
+        ]
+        == 1
+    )
 
 
-def test_shared_monotonic_egress_deadline_clamps_connect_send_and_headers(track, start_bridge) -> None:
+def test_shared_monotonic_egress_deadline_clamps_connect_send_and_headers(
+    track: Track, start_bridge: StartBridge
+) -> None:
     de_hang = track(FakeServer(lambda _conn: de_hang.stop.wait(5)))
-    nl_stalled_up = track(HttpUpstream(lambda _conn, _req: nl_stalled_up.stop.wait(5)))
-    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", nl_stalled_up.port)))
+
+    def wait_upstream(_conn: socket.socket, _req: Req) -> None:
+        _ = nl_stalled_up.stop.wait(5)
+
+    nl_stalled_up = track(HttpUpstream(wait_upstream))
+    nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, nl_stalled_up.port))))
     bridge = start_bridge(
         _dual_pool_config(
-            nl_stalled_up.port,
-            de_hang.port,
-            nl_proxy.port,
+            cast(int, nl_stalled_up.port),
+            cast(int, de_hang.port),
+            cast(int, nl_proxy.port),
             connect_timeout=0.2,
             total_egress_deadline=0.45,
             headers_timeout=30.0,

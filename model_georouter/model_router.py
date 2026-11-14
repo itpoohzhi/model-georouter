@@ -113,9 +113,6 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
-_OPENAI_EMPTY_CONTENT_IMAGE_TYPES = frozenset({"image_url", "image", "input_image", "input_audio", "file"})
-
-
 def _openai_content_is_empty(content: JsonValue) -> bool:
     """Пустой ли `content` сообщения OpenAI-формата (None/"", пустой массив, только пустые text-части)."""
     if content is None:
@@ -128,7 +125,7 @@ def _openai_content_is_empty(content: JsonValue) -> bool:
         for part in content:
             if not isinstance(part, dict):
                 return False
-            if isinstance(part.get("type"), str) and part.get("type") in _OPENAI_EMPTY_CONTENT_IMAGE_TYPES:
+            if part.get("type") not in ("text", "input_text"):
                 return False
             text = part.get("text")
             if isinstance(text, str) and text.strip():
@@ -160,9 +157,11 @@ def sanitize_openai_empty_messages(raw_body: bytes) -> bytes:
     for message in messages:
         if not isinstance(message, dict):
             continue
-        if message.get("role") == "tool" and "tool_call_id" in message:
+        if message.get("role") in ("tool", "function"):
             continue
-        if message.get("role") == "assistant" and (message.get("tool_calls") or message.get("function_call")):
+        if message.get("role") == "assistant" and (
+            "tool_calls" in message or "function_call" in message or "audio" in message
+        ):
             continue
         if not _openai_content_is_empty(message.get("content")):
             continue
