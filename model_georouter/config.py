@@ -1,4 +1,5 @@
 """Слой 5: валидация JSON-конфигурации (по config-schema.json) и атомарный hot-reload."""
+# pyright: reportImportCycles=false
 
 from __future__ import annotations
 
@@ -93,6 +94,12 @@ class ServerConfig:
     log_dir: str = field(default_factory=default_log_dir)
     geo_error_signatures: tuple[str, ...] = DEFAULT_GEO_SIGNATURES
     geo_cache_file: str = ""
+    max_inflight_per_backend: object = None
+    max_inflight_long_header: object = None
+    f08_policy: object = None
+    f08_v2_risk_ack: object = None
+    client_timeout_s: object = None
+    hedged_connect_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,7 @@ class PoolConfig:
     strategy: str = "first_available"
     remote_dns: bool = True
     proxies: tuple[str, ...] = ()
+    egress_id: object = None
 
 
 @dataclass(frozen=True)
@@ -233,8 +241,8 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         if required not in section:
             raise ConfigError(f"{path}: missing required key {required!r}")
     listen = _string(section, "listen", d.listen, path)
-    if listen != LOOPBACK:
-        raise ConfigError(f"{path}.listen: must be {LOOPBACK!r} (loopback only)")
+    if listen not in (LOOPBACK, "::1"):
+        raise ConfigError(f"{path}.listen: must be {LOOPBACK!r} or '::1' (loopback only)")
     signatures = _string_list(section, "geo_error_signatures", d.geo_error_signatures, path)
     return ServerConfig(
         listen=listen,
@@ -267,6 +275,12 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
         geo_cache_file=_string(section, "geo_cache_file", d.geo_cache_file, path),
+        max_inflight_per_backend=section.get("max_inflight_per_backend"),
+        max_inflight_long_header=section.get("max_inflight_long_header"),
+        f08_policy=section.get("f08_policy"),
+        f08_v2_risk_ack=section.get("f08_v2_risk_ack"),
+        client_timeout_s=section.get("client_timeout_s"),
+        hedged_connect_enabled=_boolean(section, "hedged_connect_enabled", d.hedged_connect_enabled, path),
     )
 
 
@@ -354,7 +368,9 @@ def _parse_pools(raw: Any) -> dict[str, PoolConfig]:
             if not isinstance(listed, list) or not listed:
                 raise ConfigError(f"{path}.proxies: non-empty list required for pool type {pool_type!r}")
             proxies = tuple(_validate_proxy(url, pool_type, f"{path}.proxies[{i}]") for i, url in enumerate(listed))
-        pools[name] = PoolConfig(name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies)
+        pools[name] = PoolConfig(
+            name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id")
+        )
     pools.setdefault("direct", PoolConfig("direct", "direct"))
     return pools
 
@@ -395,33 +411,47 @@ def _normalize(data: Any) -> Any:
     """Привести устаревшие алиасы (`host`, `urls`, `prefix`/`prefixes`) и вложенные секции `slots`/`routing` к плоской схеме."""
     if not isinstance(data, Mapping):
         return data
-    root = dict(data)
+    root: dict[str, Any] = dict(data)
     routing = root.pop("routing", None)
     if isinstance(routing, Mapping):
         for key, value in routing.items():
             root.setdefault(key, value)
     slots = root.pop("slots", None)
     if isinstance(root.get("server"), Mapping):
-        server = root["server"] = dict(root["server"])
+        server: dict[str, Any] = dict(root["server"])
+        root["server"] = server
         if isinstance(slots, Mapping):
             for key, value in slots.items():
                 server.setdefault(key, value)
+        for key in (
+            "max_inflight_per_backend",
+            "max_inflight_long_header",
+            "f08_policy",
+            "f08_v2_risk_ack",
+            "client_timeout_s",
+        ):
+            if key in root:
+                server.setdefault(key, root[key])
         _alias(server, "host", "listen")
     if isinstance(root.get("pools"), Mapping):
-        pools = root["pools"] = dict(root["pools"])
+        pools: dict[str, Any] = dict(root["pools"])
+        root["pools"] = pools
         for name, pool in pools.items():
             if isinstance(pool, Mapping):
-                pools[name] = pool = dict(pool)
-                _alias(pool, "urls", "proxies")
+                pool_copy: dict[str, Any] = dict(pool)
+                pools[name] = pool_copy
+                _alias(pool_copy, "urls", "proxies")
     if isinstance(root.get("rules"), list):
-        rules = root["rules"] = list(root["rules"])
+        rules: list[Any] = list(root["rules"])
+        root["rules"] = rules
         for index, rule in enumerate(rules):
             if isinstance(rule, Mapping):
-                rules[index] = rule = dict(rule)
+                rule_copy: dict[str, Any] = dict(rule)
+                rules[index] = rule_copy
                 for alias in ("prefix", "prefixes"):
-                    if isinstance(rule.get(alias), str):
-                        rule[alias] = [rule[alias]]
-                    _alias(rule, alias, "match_prefix")
+                    if isinstance(rule_copy.get(alias), str):
+                        rule_copy[alias] = [rule_copy[alias]]
+                    _alias(rule_copy, alias, "match_prefix")
     return root
 
 
@@ -434,6 +464,13 @@ def parse_config(data: Any) -> BridgeConfig:
     server = _parse_server(_mapping(root["server"], "server"))
     upstreams = _parse_upstreams(root.get("upstreams", {}))
     pools = _parse_pools(root["pools"])
+    is_legacy = isinstance(data, Mapping) and ("slots" in data or "routing" in data or "adapters" in data)
+    if (route_de := pools.get("route-de")) is not None and not is_legacy and "route-hy2" not in pools:
+        from .config_guard import FORBIDDEN_ROUTE_DE_PORTS
+
+        for idx, url in enumerate(route_de.proxies):
+            if (ep := parse_proxy_url(url)).port in FORBIDDEN_ROUTE_DE_PORTS:
+                raise ConfigError(f"pools.route-de.proxies[{idx}]: forbidden proxy {ep.host}:{ep.port}")
     adapters = _parse_adapters(root.get("adapters", {}), upstreams, pools)
     rules = _parse_rules(root["rules"], pools)
     default_pool = _string(root, "default_pool", "direct", "config")
@@ -492,8 +529,9 @@ class ConfigManager:
         if initial is not None:
             self._snapshot = initial
         else:
+            assert self._path is not None
             self._signature = self._stat()
-            self._snapshot = load_config_file(self._path)  # type: ignore[arg-type]
+            self._snapshot = load_config_file(self._path)
 
     @classmethod
     def from_dict(cls, data: Any) -> ConfigManager:
@@ -508,7 +546,8 @@ class ConfigManager:
         return self._last_error
 
     def _stat(self) -> tuple[int, int]:
-        info = self._path.stat()  # type: ignore[union-attr]
+        assert self._path is not None
+        info = self._path.stat()
         return (info.st_mtime_ns, info.st_size)
 
     def get(self) -> BridgeConfig:

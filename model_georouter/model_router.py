@@ -112,6 +112,65 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
+_OPENAI_EMPTY_CONTENT_IMAGE_TYPES = frozenset({"image_url", "image", "input_image", "input_audio", "file"})
+
+
+def _openai_content_is_empty(content: object) -> bool:
+    """Пустой ли `content` сообщения OpenAI-формата (None/"", пустой массив, только пустые text-части)."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        if not content:
+            return True
+        for part in content:
+            if not isinstance(part, dict):
+                return False
+            if part.get("type") in _OPENAI_EMPTY_CONTENT_IMAGE_TYPES:
+                return False
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return False
+        return True
+    return False
+
+
+def sanitize_openai_empty_messages(raw_body: bytes) -> bytes:
+    """Нормализует пустой `content` сообщений OpenAI-формата в одиночный пробел.
+
+    DSH при Retry добавляет в историю `user`-сообщение с пустым content (`source.kind=retry`),
+    Venice отвечает 400 "message content cannot be empty" — и чат ломается навсегда, потому что
+    пустое сообщение остаётся в истории. Пробел валиден, порядок сообщений и `tool_call_id`
+    не нарушаются. Без мутаций возвращает исходные байты как есть (тот же объект).
+    """
+    if not raw_body:
+        return raw_body
+    try:
+        payload = json.loads(raw_body)
+    except (ValueError, RecursionError):
+        return raw_body
+    if not isinstance(payload, dict):
+        return raw_body
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return raw_body
+    mutated = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if not _openai_content_is_empty(message.get("content")):
+            continue
+        message["content"] = " "
+        mutated = True
+    if not mutated:
+        return raw_body
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
 THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 

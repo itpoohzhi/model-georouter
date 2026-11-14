@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, replace
 from urllib.parse import urlsplit
 
-from . import SERVICE_NAME, SERVICE_NAME_ALIASES, __version__
+from . import SERVICE_NAME, SERVICE_NAME_ALIASES, __version__, config_guard, egress_admission, egress_hedge
 from .adapters import AdapterRegistry, AdapterRoute, AdminAdapter
 from .config import BridgeConfig, ConfigManager, PoolConfig, UpstreamConfig
 from .error_handler import ErrorHandler, json_response_bytes
@@ -53,6 +53,7 @@ from .model_router import (
     ensure_anthropic_thinking_drop_block,
     model_from_path,
     sanitize_google_v1beta_body,
+    sanitize_openai_empty_messages,
 )
 from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
@@ -207,6 +208,8 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         self.retry_budget: RetryBudgetSpec = RetryBudgetSpec()
         self.started_at: float = time.monotonic()
         self._threads = _WorkerThreads()
+        self.egress = egress_hedge.build_egress(self.proxy_manager, cfg.hedged_connect_enabled)
+        self.admission = egress_admission.EgressAdmission(config=config_guard.validate(config_manager.get()))
         super().__init__((cfg.listen, cfg.port), _Handler)
 
     # --- служебное ---
@@ -449,6 +452,8 @@ class _Handler(socketserver.BaseRequestHandler):
             return
         if "/v1beta/models/" in route.path:
             inspector.replace_body(sanitize_google_v1beta_body(inspector.body))
+        if route.path.endswith("/chat/completions"):
+            inspector.replace_body(sanitize_openai_empty_messages(inspector.body))
         if route.path.endswith("/v1/messages") and self.model and self.model.startswith(_CLAUDE_MODEL_PREFIXES):
             raw_body = inspector.body
             new_body, needs_beta = ensure_anthropic_thinking_drop_block(raw_body)
@@ -500,7 +505,8 @@ class _Handler(socketserver.BaseRequestHandler):
         deadline = EgressDeadline.from_timeout(cfg.total_egress_deadline)
         self._ctx = (sock, snapshot, runtime, req, route, query, upstream, inspector)
         try:
-            self._attempt(decision.pool, replay_allowed, deadline)
+            with srv.admission.admit(decision.pool, path, deadline=deadline) as ticket:
+                self._attempt(decision.pool, replay_allowed, ticket.deadline)
         except _ReplayRequested:
             srv.geo_cache.mark_blocked(route.upstream, self.model, cfg.geo_cache_ttl_seconds)
             srv.metrics.incr("replays")
@@ -578,7 +584,7 @@ class _Handler(socketserver.BaseRequestHandler):
             try:
                 up = self._connect_upstream(pool, upstream, deadline, single)
                 self._send_upstream_request(up, cfg.body_timeout, deadline)
-                hdr_wait = min(cfg.headers_timeout, b.primary_first_header_timeout) if single else cfg.headers_timeout
+                hdr_wait = min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
                 head, rest = self._read_upstream_head(up, hdr_wait, deadline)
             except (AllProxiesPenalizedError, EgressConnectError, UpstreamTimeoutError, UpstreamProtocolError) as exc:
                 state = transition(state, self._attempt_event(exc, deadline, self._last_proxy_endpoint))
@@ -655,28 +661,7 @@ class _Handler(socketserver.BaseRequestHandler):
     def _connect_upstream(
         self, pool: PoolConfig, up: UpstreamConfig, dl: EgressDeadline, single: bool = False
     ) -> socket.socket:
-        _, snapshot, *_ = self._ctx
-        srv, cfg = self.server, snapshot.server
-        budget = srv.retry_budget
-        base = EgressSettings.from_server(cfg)
-        req_connect = min(base.connect_timeout, budget.connect_timeout) if single else base.connect_timeout
-        try:
-            max_retries = budget.single_pool_max_retries if single else base.single_pool_max_retries
-            ct, td = dl.clamp(req_connect), dl.clamp(cfg.total_egress_deadline)
-            settings = replace(base, connect_timeout=ct, total_deadline=td, single_pool_max_retries=max_retries)
-        except TimeoutError:
-            raise EgressTimeoutError(f"total egress deadline of {cfg.total_egress_deadline:g}s exceeded") from None
-
-        def wrap(raw: socket.socket) -> socket.socket:
-            return srv.ssl_context.wrap_socket(raw, server_hostname=up.host)
-
-        def on_attempt(ep: ProxyEndpoint | None) -> None:
-            # Только authority: ни URL, ни userinfo не сохраняются в состоянии запроса.
-            self._last_proxy_endpoint, self.proxy_endpoint = ep, "-"
-            if ep is not None:
-                self.proxy_endpoint = f"[{ep.host}]:{ep.port}" if ":" in ep.host else f"{ep.host}:{ep.port}"
-
-        return srv.proxy_manager._connect(pool, up.host, up.port, settings, wrap if up.use_tls else None, on_attempt)
+        return self.server.egress.connect(pool, (up.host, up.port), replace(EgressSettings.from_server(self._ctx[1].server)), handler=(self, dl, EgressTimeoutError), up=up, single=single)  # fmt: skip
 
     def _send_upstream_request(self, up: socket.socket, timeout: float, dl: EgressDeadline | None = None) -> None:
         _, _, _, req, route, query, upstream, inspector = self._ctx
