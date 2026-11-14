@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import time
-from typing import Any
+from typing import cast
 
 import pytest
 
@@ -20,31 +20,36 @@ from model_georouter.config_guard import (
     validate_route_de_pool,
 )
 from model_georouter.errors import ConfigError
-from tests.helpers import FakeConnectProxy, FakeServer, HttpUpstream, http_request, make_config
+from tests.fake_server import FakeServer
+from tests.helpers import FakeConnectProxy, HttpUpstream, Req, http_request, make_config
+from tests.v3_types import ConfigData, StartBridge, Track
 
 PATH = "/v1/chat/completions"
 BODY = b'{"model":"claude-3-opus","messages":[{"role":"user","content":"ping"}]}'
 
 
-def test_chat_completions_uses_empty_message_sanitizer(track, start_bridge, monkeypatch):
+def test_chat_completions_uses_empty_message_sanitizer(
+    track: Track, start_bridge: StartBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """HTTP-путь очищает пустые сообщения до отправки upstream."""
     from model_georouter import bridge_server
+    from model_georouter.model_router import sanitize_openai_empty_messages
 
-    original = bridge_server.sanitize_openai_empty_messages
-    seen = []
-    received = []
+    original = sanitize_openai_empty_messages
+    seen: list[bytes] = []
+    received: list[dict[str, object]] = []
 
-    def sanitize(body):
+    def sanitize(body: bytes) -> bytes:
         seen.append(body)
         return original(body)
 
-    def respond(conn, req):
-        received.append(json.loads(req.body))
+    def respond(conn: socket.socket, req: Req) -> None:
+        received.append(cast(dict[str, object], json.loads(req.body)))
         conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
 
     monkeypatch.setattr(bridge_server, "sanitize_openai_empty_messages", sanitize)
     upstream = track(HttpUpstream(respond))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     body = json.dumps(
         {
             "model": "gpt-4",
@@ -69,20 +74,20 @@ def _base_config(
     *,
     listen: str = "127.0.0.1",
     port: int = 10830,
-    pools: dict[str, Any] | None = None,
-    rules: list[dict[str, Any]] | None = None,
-    upstreams: dict[str, Any] | None = None,
-    server_extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    pools: dict[str, dict[str, object]] | None = None,
+    rules: list[dict[str, object]] | None = None,
+    upstreams: dict[str, object] | None = None,
+    server_extra: dict[str, object] | None = None,
+) -> ConfigData:
     """Собирает базовый словарь конфигурации моста для проверки стартовой валидации и рантайма."""
-    server: dict[str, Any] = {
+    server: dict[str, object] = {
         "listen": listen,
         "port": port,
         "total_egress_deadline": F08_V1_TOTAL_EGRESS_DEADLINE,
     }
     if server_extra:
         server.update(server_extra)
-    cfg: dict[str, Any] = {
+    cfg: ConfigData = {
         "server": server,
         "pools": {"direct": {"type": "direct"}, **(pools or {})},
         "rules": rules or [],
@@ -92,7 +97,9 @@ def _base_config(
     return cfg
 
 
-def test_v3_green_tls_stall_over_3s_on_single_proxy_route_de_returns_502_fail_fast(track, start_bridge) -> None:
+def test_v3_green_tls_stall_over_3s_on_single_proxy_route_de_returns_502_fail_fast(
+    track: Track, start_bridge: StartBridge
+) -> None:
     """TLS stall > 3 с на единственном прокси в пуле route-de возвращает 502 fail-fast (< 3.8 с)."""
 
     def _stall_tls_handshake(conn: socket.socket) -> None:
@@ -105,12 +112,12 @@ def test_v3_green_tls_stall_over_3s_on_single_proxy_route_de_returns_502_fail_fa
         _ = stalled_tls.stop.wait(4.5)
 
     stalled_tls = track(FakeServer(_stall_tls_handshake))
-    proxy = track(FakeConnectProxy(target=("127.0.0.1", stalled_tls.port)))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, stalled_tls.port))))
     cfg = _base_config(
         port=0,
-        pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{proxy.port}"]}},
+        pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{cast(int, proxy.port)}"]}},
         rules=[{"match_prefix": ["claude-"], "pool": "route-de"}],
-        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": stalled_tls.port, "use_tls": True}},
+        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": cast(int, stalled_tls.port), "use_tls": True}},
     )
     bridge = start_bridge(cfg)
 
@@ -119,13 +126,13 @@ def test_v3_green_tls_stall_over_3s_on_single_proxy_route_de_returns_502_fail_fa
     elapsed = time.monotonic() - started
 
     assert resp.status == 502
-    assert resp.json["error"]["retryable"] is True
+    assert cast(dict[str, dict[str, object]], resp.json)["error"]["retryable"] is True
     assert elapsed < 3.8, f"ожидался fail-fast 502 при TLS stall > 3 с, фактически запрос висел {elapsed:.2f} с"
 
 
 @pytest.mark.parametrize("forbidden_port", [10820, 10810])
 def test_v3_green_route_de_rejects_forbidden_ports_10820_and_10810_on_startup(
-    forbidden_port: int, start_bridge
+    forbidden_port: int, start_bridge: StartBridge
 ) -> None:
     """Наличие :10820 или :10810 в пуле route-de отклоняется config_guard и при старте моста (D1-5)."""
     assert forbidden_port in FORBIDDEN_ROUTE_DE_PORTS
@@ -139,13 +146,13 @@ def test_v3_green_route_de_rejects_forbidden_ports_10820_and_10810_on_startup(
         }
     )
     with pytest.raises(ConfigError):
-        validate_route_de_pool(cfg_data["pools"]["route-de"])
+        _ = validate_route_de_pool(cfg_data["pools"]["route-de"])
     with pytest.raises(ConfigError):
-        validate_config(cfg_data)
+        _ = validate_config(cfg_data)
     with pytest.raises(ConfigError):
-        validate(parse_config(cfg_data))
+        _ = validate(parse_config(cfg_data))
     with pytest.raises(ConfigError):
-        start_bridge(cfg_data)
+        _ = start_bridge(cfg_data)
 
     # Выделенные порты DE (10827..10829) с валидным egress_id проходят стартовую валидацию
     valid_cfg = _base_config(
@@ -166,18 +173,18 @@ def test_v3_green_non_loopback_listen_rejected_and_ipv4_loopback_accepted() -> N
     """Не-loopback listen отклоняется; parse_config принимает 127.0.0.1 и ::1 ортогонально, config_guard требует 127.0.0.1 (D1-5)."""
     for non_loopback in ("0.0.0.0", "192.168.1.10", "10.0.0.1", "::", "localhost"):
         with pytest.raises(ConfigError):
-            validate_listen_host(non_loopback)
+            _ = validate_listen_host(non_loopback)
         with pytest.raises(ConfigError):
-            parse_config(_base_config(listen=non_loopback))
+            _ = parse_config(_base_config(listen=non_loopback))
         with pytest.raises(ConfigError):
-            ConfigManager.from_dict(_base_config(listen=non_loopback))
+            _ = ConfigManager.from_dict(_base_config(listen=non_loopback))
         with pytest.raises(ConfigError):
-            validate_config(_base_config(listen=non_loopback))
+            _ = validate_config(_base_config(listen=non_loopback))
 
     with pytest.raises(ConfigError):
-        validate_listen_host("::1")
+        _ = validate_listen_host("::1")
     with pytest.raises(ConfigError):
-        validate_config(_base_config(listen="::1"))
+        _ = validate_config(_base_config(listen="::1"))
     assert parse_config(_base_config(listen="::1")).server.listen == "::1"
     assert ConfigManager.from_dict(_base_config(listen="::1")).get().server.listen == "::1"
 

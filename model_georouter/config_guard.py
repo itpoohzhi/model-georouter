@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from .config import LOOPBACK, BridgeConfig, PoolConfig, parse_config
+from .config import FORBIDDEN_ROUTE_DE_PORTS, LOOPBACK, BridgeConfig, PoolConfig, parse_config
 from .errors import ConfigError
 from .proxy_pool import parse_proxy_url
 from .retry_budget import F08_V2_POLICY, F08_V2_RISK_ACK, validate_f08_v2
@@ -20,7 +20,6 @@ __all__ = ["ALLOWED_ROUTE_DE_BACKENDS", "ALLOWED_ROUTE_DE_PORTS", "DEFAULT_F08_P
 ROUTE_DE_POOL, DEFAULT_F08_POLICY, F08_V1_TOTAL_EGRESS_DEADLINE, _MISSING = "route-de", "v1", 40.0, object()
 ALLOWED_ROUTE_DE_PORTS: frozenset[int] = frozenset({10827, 10828, 10829})
 ALLOWED_ROUTE_DE_BACKENDS: frozenset[str] = frozenset(f"{LOOPBACK}:{p}" for p in ALLOWED_ROUTE_DE_PORTS)
-FORBIDDEN_ROUTE_DE_PORTS: frozenset[int] = frozenset({10810, 10820})
 ObjMap = Mapping[str, object]
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +95,8 @@ def _build_guarded(bridge: BridgeConfig, *, strict: bool) -> GuardedConfig:
     raw_pol, raw_ack, raw_ct = getattr(srv, "f08_policy", None), getattr(srv, "f08_v2_risk_ack", None), getattr(srv, "client_timeout_s", None)
     enforce_f08 = strict or srv.port != 0 or raw_pol is not None or raw_ack is not None or raw_ct is not None or srv.total_egress_deadline == F08_V1_TOTAL_EGRESS_DEADLINE
     pol = validate_f08_deadline(srv.total_egress_deadline, _MISSING if raw_pol is None else raw_pol, raw_ack, raw_ct) if enforce_f08 else DEFAULT_F08_POLICY
+    if not isinstance(cast(object, srv.hedged_connect_enabled), bool) or (pol == F08_V2_POLICY and srv.hedged_connect_enabled):
+        raise ConfigError("server.hedged_connect_enabled: expected boolean, must be False for v2")
     ack = raw_ack if isinstance(raw_ack, str) and pol == F08_V2_POLICY else None
     ct = float(raw_ct) if isinstance(raw_ct, int | float) and not isinstance(raw_ct, bool) and pol == F08_V2_POLICY else None
     return GuardedConfig(bridge, per_b, long_h, pol, eg_id, ack, ct)
@@ -106,6 +107,8 @@ def validate_config(data: object) -> GuardedConfig:
     if not isinstance(data, Mapping) or not isinstance(cast(ObjMap, data).get("server"), Mapping):
         raise ConfigError("config: expected mapping with 'server' object")
     root, raw_s = cast(ObjMap, data), cast(ObjMap, cast(ObjMap, data)["server"])
+    if "hedged_connect_enabled" in raw_s and not isinstance(raw_s["hedged_connect_enabled"], bool):
+        raise ConfigError("server.hedged_connect_enabled: expected boolean")
     _ = validate_listen_host(raw_s.get("listen", raw_s.get("host")))
     if isinstance(raw_p := root.get("pools"), Mapping) and ROUTE_DE_POOL in raw_p:
         if not isinstance(rde := cast(ObjMap, raw_p).get(ROUTE_DE_POOL), Mapping):

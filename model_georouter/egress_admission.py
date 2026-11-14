@@ -106,17 +106,27 @@ class _AdmitCtx:
 class EgressAdmission:
     """Менеджер квот параллельных запросов на внешний egress и long-header пути."""
 
-    def __init__(self, pools: Mapping[str, object] | None = None, *, config: _cg.GuardedConfig | BridgeConfig | None = None, proxy_slots: int = DEFAULT_PROXY_SLOTS, max_inflight_per_backend: int = DEFAULT_MAX_INFLIGHT_PER_BACKEND, max_inflight_long_header: int = DEFAULT_MAX_INFLIGHT_LONG_HEADER, f08_policy: object = _F08_UNSET, total_egress_deadline: float = _cg.F08_V1_TOTAL_EGRESS_DEADLINE, retry_budget: RetryBudgetSpec | None = None, client_timeout_s: float | None = None, f08_v2_risk_ack: str | None = None, t_pre: float = _rb.F08_V2_T_PRE, t_idle: float = _rb.F08_V2_T_IDLE, f08_v2_scope: str = _rb.F08_V2_STREAM_MARKER) -> None:  # fmt: skip
+    def __init__(self, pools: Mapping[str, object] | None = None, *, config: _cg.GuardedConfig | BridgeConfig | None = None, proxy_slots: int = DEFAULT_PROXY_SLOTS, max_inflight_per_backend: int = DEFAULT_MAX_INFLIGHT_PER_BACKEND, max_inflight_long_header: int = DEFAULT_MAX_INFLIGHT_LONG_HEADER, f08_policy: object = _F08_UNSET, total_egress_deadline: float = _cg.F08_V1_TOTAL_EGRESS_DEADLINE, retry_budget: RetryBudgetSpec | None = None, client_timeout_s: object = _F08_UNSET, f08_v2_risk_ack: object = _F08_UNSET, t_pre: float = _rb.F08_V2_T_PRE, t_idle: float = _rb.F08_V2_T_IDLE, f08_v2_scope: str = _rb.F08_V2_STREAM_MARKER) -> None:  # fmt: skip
         source = config.server if isinstance(config, BridgeConfig) else config
         if source is not None:
             if f08_policy is _F08_UNSET:
-                f08_policy = source.f08_policy or _cg.DEFAULT_F08_POLICY
-            if f08_v2_risk_ack is None:
-                f08_v2_risk_ack = cast(str | None, source.f08_v2_risk_ack)
-            if client_timeout_s is None:
-                client_timeout_s = cast(float | None, source.client_timeout_s)
+                f08_policy = _cg.DEFAULT_F08_POLICY if source.f08_policy is None else source.f08_policy
+            if f08_v2_risk_ack is _F08_UNSET:
+                f08_v2_risk_ack = source.f08_v2_risk_ack
+            if client_timeout_s is _F08_UNSET:
+                client_timeout_s = source.client_timeout_s
         if f08_policy is _F08_UNSET:
             f08_policy = _cg.DEFAULT_F08_POLICY
+        if f08_v2_risk_ack is _F08_UNSET:
+            f08_v2_risk_ack = None
+        if client_timeout_s is _F08_UNSET:
+            client_timeout_s = None
+        if f08_v2_risk_ack is not None and not isinstance(f08_v2_risk_ack, str):
+            raise ConfigError("server.f08_v2_risk_ack: expected string or None")
+        if client_timeout_s is not None and (
+            isinstance(client_timeout_s, bool) or not isinstance(client_timeout_s, int | float)
+        ):
+            raise ConfigError("server.client_timeout_s: expected number or None")
         if isinstance(config, _cg.GuardedConfig):
             pools, proxy_slots, total_egress_deadline = (
                 config.bridge.pools if pools is None else pools,

@@ -1,4 +1,3 @@
-# pyright: reportMissingImports=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnusedCallResult=false
 """Тесты модуля `model_georouter.egress_hedge` (карточка W1-A)."""
 
 from __future__ import annotations
@@ -8,6 +7,7 @@ import ssl
 import threading
 import time
 from collections.abc import Callable
+from typing import cast
 
 import pytest
 
@@ -25,6 +25,7 @@ from model_georouter.errors import AllProxiesPenalizedError, EgressConnectError,
 from model_georouter.proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from tests.fake_server import FakeServer
 from tests.helpers import FakeConnectProxy, echo_handler
+from tests.v3_types import Track
 
 
 def _route_de_pool(*urls: str) -> PoolConfig:
@@ -95,7 +96,7 @@ def test_flag_disabled_single_attempt_failure_does_not_try_second_node() -> None
         raise EgressConnectError("primary node down", phase="connect")
 
     with pytest.raises(EgressConnectError, match="primary node down"):
-        hedged_connect(pool, failing_attempt, policy=HedgePolicy(enabled=False), recorder=recorder)
+        _ = hedged_connect(pool, failing_attempt, policy=HedgePolicy(enabled=False), recorder=recorder)
     assert attempted == ["http://127.0.0.1:19001"]
     assert recorder.winners == [] and len(recorder.failures) == 1
 
@@ -158,7 +159,7 @@ def test_hedge_all_attempts_fail_or_stall_raises_within_budget() -> None:
         raise OSError("connection refused")
 
     with pytest.raises(EgressConnectError, match="OSError"):
-        hedged_connect(
+        _ = hedged_connect(
             pool, always_fail, policy=HedgePolicy(enabled=True, hedge_delay_s=0.05, budget_s=1.0), recorder=recorder
         )
     assert attempted == ["http://127.0.0.1:19001", "http://127.0.0.1:19002"]
@@ -170,18 +171,18 @@ def test_hedge_all_attempts_fail_or_stall_raises_within_budget() -> None:
 
     started = time.monotonic()
     with pytest.raises(EgressTimeoutError):
-        hedged_connect(
+        _ = hedged_connect(
             pool, stall_forever, policy=HedgePolicy(enabled=True, hedge_delay_s=0.05, budget_s=0.25), recorder=recorder
         )
     assert time.monotonic() - started < 1.0
 
 
-def test_runner_with_proxy_pool_manager_and_tls_wrap(track, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runner_with_proxy_pool_manager_and_tls_wrap(track: Track, monkeypatch: pytest.MonkeyPatch) -> None:
     """Интеграция `EgressHedgeRunner` с `ProxyPoolManager`: TLS stall на 1-м прокси переключается на 2-й прокси."""
     upstream = track(FakeServer(echo_handler))
-    p1 = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
-    p2 = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
-    pool = _route_de_pool(f"http://127.0.0.1:{p1.port}", f"http://127.0.0.1:{p2.port}")
+    p1 = track(FakeConnectProxy(target=("127.0.0.1", cast(int, upstream.port))))
+    p2 = track(FakeConnectProxy(target=("127.0.0.1", cast(int, upstream.port))))
+    pool = _route_de_pool(f"http://127.0.0.1:{cast(int, p1.port)}", f"http://127.0.0.1:{cast(int, p2.port)}")
     recorder = HedgeRecorder()
     manager = ProxyPoolManager()
     runner = EgressHedgeRunner(manager, HedgePolicy(enabled=True, hedge_delay_s=0.06, budget_s=1.5), recorder)
@@ -204,19 +205,19 @@ def test_runner_with_proxy_pool_manager_and_tls_wrap(track, monkeypatch: pytest.
         return raw
 
     settings = EgressSettings(connect_timeout=1.5, total_deadline=3.0, retries=1, penalty_seconds=30)
-    with connect_pool_hedged(runner, pool, ("127.0.0.1", upstream.port), settings, wrap=wrap_tls) as sock:
+    with connect_pool_hedged(runner, pool, ("127.0.0.1", cast(int, upstream.port)), settings, wrap=wrap_tls) as sock:
         sock.settimeout(2.0)
         sock.sendall(b"hedged-ok")
         assert sock.recv(32) == b"hedged-ok"
-    assert recorder.winners == [f"http://127.0.0.1:{p2.port}"]
-    assert recorder.failovers == [f"http://127.0.0.1:{p2.port}"]
+    assert recorder.winners == [f"http://127.0.0.1:{cast(int, p2.port)}"]
+    assert recorder.failovers == [f"http://127.0.0.1:{cast(int, p2.port)}"]
     eps = manager.endpoints(pool)
     # Проигравший падает с SSLError уже после победы 2-го узла: штраф ставится асинхронно в `_attempt`.
     wait_until = time.monotonic() + 1.0
     while not manager.is_penalized(eps[0]) and time.monotonic() < wait_until:
         time.sleep(0.01)
     assert manager.is_penalized(eps[0]) is True and manager.is_penalized(eps[1]) is False
-    assert ok_called == [f"http://127.0.0.1:{p2.port}"]
+    assert ok_called == [f"http://127.0.0.1:{cast(int, p2.port)}"]
 
 
 def test_hedge_win_does_not_penalize_slow_but_alive_loser() -> None:
@@ -277,12 +278,12 @@ def test_hedge_without_winner_penalizes_nodes_stalled_past_deadline() -> None:
     release = threading.Event()
 
     def stall(_endpoint: ProxyEndpoint | None, _deadline: float) -> socket.socket:
-        release.wait(2.0)
+        _ = release.wait(2.0)
         raise TimeoutError("stalled")
 
     try:
         with pytest.raises(EgressTimeoutError):
-            hedged_connect(
+            _ = hedged_connect(
                 pool,
                 stall,
                 policy=HedgePolicy(enabled=True, hedge_delay_s=0.05, budget_s=0.2),
@@ -297,12 +298,12 @@ def test_hedge_without_winner_penalizes_nodes_stalled_past_deadline() -> None:
 def test_policy_validation_and_empty_candidates() -> None:
     """Проверка валидации параметров `HedgePolicy` и пустого списка кандидатов."""
     with pytest.raises(ValueError, match="positive"):
-        HedgePolicy(hedge_delay_s=0.0)
+        _ = HedgePolicy(hedge_delay_s=0.0)
     with pytest.raises(ValueError, match="exceed 3s"):
-        HedgePolicy(budget_s=3.5)
+        _ = HedgePolicy(budget_s=3.5)
     recorder = HedgeRecorder()
     with pytest.raises(AllProxiesPenalizedError):
-        hedged_connect(
+        _ = hedged_connect(
             _route_de_pool("http://127.0.0.1:19001"), lambda _ep, _dl: socket.socket(), recorder=recorder, candidates=[]
         )
     assert len(recorder.failures) == 1

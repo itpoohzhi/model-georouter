@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import cast
 
 import pytest
 
@@ -24,7 +24,9 @@ from model_georouter.egress_hedge import (
 from model_georouter.errors import ConfigError
 from model_georouter.proxy_pool import ProxyEndpoint
 from model_georouter.upstream_state import SCHEMA_VERSION, UpstreamStateWriter
-from tests.helpers import FakeConnectProxy, FakeServer, http_request
+from tests.fake_server import FakeServer
+from tests.helpers import FakeConnectProxy, http_request
+from tests.v3_types import ConfigData, StartBridge, Track
 
 PATH = "/v1/chat/completions"
 BODY = b'{"model":"claude-3-opus","messages":[{"role":"user","content":"ping"}]}'
@@ -34,13 +36,13 @@ def _base_config(
     *,
     listen: str = "127.0.0.1",
     port: int = 0,
-    pools: dict[str, Any] | None = None,
-    rules: list[dict[str, Any]] | None = None,
-    upstreams: dict[str, Any] | None = None,
-    server_extra: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    pools: dict[str, dict[str, object]] | None = None,
+    rules: list[dict[str, object]] | None = None,
+    upstreams: dict[str, object] | None = None,
+    server_extra: dict[str, object] | None = None,
+) -> ConfigData:
     """Формирует конфигурацию моста для интеграционных и модульных проверок v3."""
-    cfg: dict[str, Any] = {
+    cfg: ConfigData = {
         "server": {"listen": listen, "port": port, **(server_extra or {})},
         "pools": {"direct": {"type": "direct"}, **(pools or {})},
         "rules": rules or [],
@@ -65,7 +67,9 @@ def _ok_upstream_handler(conn: socket.socket) -> None:
         return
 
 
-def test_stalled_first_route_de_entry_second_wins_under_3s(track, start_bridge, tmp_path: Path) -> None:
+def test_stalled_first_route_de_entry_second_wins_under_3s(
+    track: Track, start_bridge: StartBridge, tmp_path: Path
+) -> None:
     """Зависший первый вход route-de: второй вход побеждает за <= 3 с (unit + HTTP bridge)."""
     pool = PoolConfig(
         name=ROUTE_DE_POOL,
@@ -98,7 +102,7 @@ def test_stalled_first_route_de_entry_second_wins_under_3s(track, start_bridge, 
     outcome = recorder.outcomes[0]
     assert outcome.winner == "http://127.0.0.1:10828" and outcome.hedged is True and outcome.failover is True
     writer.record(outcome)
-    persisted = json.loads(state_file.read_text(encoding="utf-8"))
+    persisted = cast(dict[str, object], json.loads(state_file.read_text(encoding="utf-8")))
     assert persisted["schema"] == SCHEMA_VERSION
     assert persisted["active_upstream"] == "127.0.0.1:10828" and persisted["failover_count"] == 1
 
@@ -113,23 +117,23 @@ def test_stalled_first_route_de_entry_second_wins_under_3s(track, start_bridge, 
 
     stalled_proxy = track(FakeServer(_stall_connect))
     healthy_upstream = track(FakeServer(_ok_upstream_handler))
-    healthy_proxy = track(FakeConnectProxy(target=("127.0.0.1", healthy_upstream.port)))
-    proxies = [f"http://127.0.0.1:{stalled_proxy.port}", f"http://127.0.0.1:{healthy_proxy.port}"]
+    healthy_proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, healthy_upstream.port))))
+    proxies = [f"http://127.0.0.1:{cast(int, stalled_proxy.port)}", f"http://127.0.0.1:{cast(int, healthy_proxy.port)}"]
     cfg = _base_config(
         pools={ROUTE_DE_POOL: {"type": "http_connect", "proxies": proxies}},
         rules=[{"match_prefix": ["claude-"], "pool": ROUTE_DE_POOL}],
-        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": healthy_upstream.port, "use_tls": False}},
+        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": cast(int, healthy_upstream.port), "use_tls": False}},
         server_extra={"hedged_connect_enabled": True},
     )
     bridge = start_bridge(cfg)
     started = time.monotonic()
     resp = http_request(bridge.port, "POST", PATH, BODY)
     elapsed_http = time.monotonic() - started
-    assert resp.status == 200 and resp.json["ok"] is True
+    assert resp.status == 200 and cast(dict[str, object], resp.json)["ok"] is True
     assert elapsed_http <= 3.0, f"второй вход route-de должен побеждать за <= 3 с, получено {elapsed_http:.2f} с"
 
 
-def test_all_route_de_entries_stalled_returns_502_within_f08_deadline(track, start_bridge) -> None:
+def test_all_route_de_entries_stalled_returns_502_within_f08_deadline(track: Track, start_bridge: StartBridge) -> None:
     """Если все входы route-de зависли, мост возвращает 502 fail-fast строго в пределах дедлайна F-08."""
 
     def _stall_tls(conn: socket.socket) -> None:
@@ -141,14 +145,14 @@ def test_all_route_de_entries_stalled_returns_502_within_f08_deadline(track, sta
         _ = stalled_tls.stop.wait(0.8)
 
     stalled_tls = track(FakeServer(_stall_tls))
-    proxy_a = track(FakeConnectProxy(target=("127.0.0.1", stalled_tls.port)))
-    proxy_b = track(FakeConnectProxy(target=("127.0.0.1", stalled_tls.port)))
+    proxy_a = track(FakeConnectProxy(target=("127.0.0.1", cast(int, stalled_tls.port))))
+    proxy_b = track(FakeConnectProxy(target=("127.0.0.1", cast(int, stalled_tls.port))))
     f08_limit = config_guard.F08_V1_TOTAL_EGRESS_DEADLINE
-    proxies = [f"http://127.0.0.1:{proxy_a.port}", f"http://127.0.0.1:{proxy_b.port}"]
+    proxies = [f"http://127.0.0.1:{cast(int, proxy_a.port)}", f"http://127.0.0.1:{cast(int, proxy_b.port)}"]
     cfg = _base_config(
         pools={ROUTE_DE_POOL: {"type": "http_connect", "proxies": proxies}},
         rules=[{"match_prefix": ["claude-"], "pool": ROUTE_DE_POOL}],
-        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": stalled_tls.port, "use_tls": True}},
+        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": cast(int, stalled_tls.port), "use_tls": True}},
         server_extra={"hedged_connect_enabled": True, "total_egress_deadline": f08_limit},
     )
     bridge = start_bridge(cfg)
@@ -159,11 +163,11 @@ def test_all_route_de_entries_stalled_returns_502_within_f08_deadline(track, sta
         resp = http_request(bridge.port, "POST", PATH, BODY)
         elapsed = time.monotonic() - started
 
-    assert resp.status == 502 and resp.json["error"]["retryable"] is True
+    assert resp.status == 502 and cast(dict[str, dict[str, object]], resp.json)["error"]["retryable"] is True
     assert elapsed < 3.8 and elapsed < f08_limit
 
 
-def test_hedged_connect_disabled_uses_legacy_single_attempt_path(track, start_bridge) -> None:
+def test_hedged_connect_disabled_uses_legacy_single_attempt_path(track: Track, start_bridge: StartBridge) -> None:
     """При hedged_connect_enabled = False используется legacy-путь (одна попытка без параллельного hedge)."""
     pool = PoolConfig(
         name=ROUTE_DE_POOL,
@@ -190,14 +194,14 @@ def test_hedged_connect_disabled_uses_legacy_single_attempt_path(track, start_br
     assert recorder.outcomes[0].failover is False
 
     upstream = track(FakeServer(_ok_upstream_handler))
-    proxy1 = track(FakeConnectProxy(target=("127.0.0.1", upstream.port)))
+    proxy1 = track(FakeConnectProxy(target=("127.0.0.1", cast(int, upstream.port))))
     second_touched = threading.Event()
     proxy2 = track(FakeServer(lambda conn: (second_touched.set(), conn.close())))
-    proxies = [f"http://127.0.0.1:{proxy1.port}", f"http://127.0.0.1:{proxy2.port}"]
+    proxies = [f"http://127.0.0.1:{cast(int, proxy1.port)}", f"http://127.0.0.1:{cast(int, proxy2.port)}"]
     cfg = _base_config(
         pools={ROUTE_DE_POOL: {"type": "http_connect", "proxies": proxies}},
         rules=[{"match_prefix": ["claude-"], "pool": ROUTE_DE_POOL}],
-        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False}},
+        upstreams={"opencode-ai": {"host": "127.0.0.1", "port": cast(int, upstream.port), "use_tls": False}},
         server_extra={"hedged_connect_enabled": False, "single_pool_max_retries": 0},
     )
     bridge = start_bridge(cfg)
@@ -207,10 +211,10 @@ def test_hedged_connect_disabled_uses_legacy_single_attempt_path(track, start_br
 
 @pytest.mark.parametrize("forbidden_port", sorted(config_guard.FORBIDDEN_ROUTE_DE_PORTS))
 def test_forbidden_ports_in_route_de_rejected_by_config_guard_and_startup(
-    forbidden_port: int, start_bridge, tmp_path: Path
+    forbidden_port: int, start_bridge: StartBridge, tmp_path: Path
 ) -> None:
     """Порты :10820 и :10810 в пуле route-de отклоняются config_guard и при запуске моста."""
-    pool_cfg = {
+    pool_cfg: dict[str, object] = {
         "type": "http_connect",
         "egress_id": "de-dedicated",
         "proxies": [f"http://127.0.0.1:{forbidden_port}"],
@@ -235,7 +239,7 @@ def test_forbidden_ports_in_route_de_rejected_by_config_guard_and_startup(
         _ = config_guard.load_and_validate_config(cfg_path)
     assert config_guard.main(["--config", str(cfg_path)]) == 1
 
-    cred_pool = {
+    cred_pool: dict[str, object] = {
         "type": "http_connect",
         "egress_id": "de-dedicated",
         "proxies": [f"http://secret_user:secret_pass@127.0.0.1:{forbidden_port}"],

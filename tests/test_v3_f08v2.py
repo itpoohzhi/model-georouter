@@ -23,7 +23,7 @@ def _step_stream_chunk(ticket: Ticket, *, now: float) -> str:
     """Пробрасывает очередной чанк потока или возвращает/выбрасывает upstream_timeout при паузе > 150s."""
     if ticket.deadline.expired(now=now):
         raise EgressTimeoutError("upstream_timeout: stream idle timeout exceeded", phase="upstream_timeout")
-    ticket.on_chunk(now=now)
+    _ = ticket.on_chunk(now=now)
     return "chunk_ok"
 
 
@@ -44,7 +44,7 @@ def test_sliding_timer_resets_on_each_chunk_over_169s() -> None:
             assert ticket.deadline.expired(now=now) is False
             # Фазовый таймаут чтения укладывается в остаток скользящего окна
             assert ticket.deadline.clamp(10.0, now=now) == pytest.approx(10.0)
-            _step_stream_chunk(ticket, now=now)
+            _ = _step_stream_chunk(ticket, now=now)
             assert ticket.header_deadline_s == pytest.approx(150.0)
             assert ticket.deadline.remaining(now=now) == pytest.approx(150.0)
 
@@ -60,17 +60,17 @@ def test_single_pause_over_150s_fails_with_upstream_timeout() -> None:
 
     with adm.admit("de", STREAM_PATH, started_at=t0, now=t0) as ticket:
         # Первые два чанка приходят с допустимыми паузами 15s и 90s
-        _step_stream_chunk(ticket, now=t0 + 15.0)
-        _step_stream_chunk(ticket, now=t0 + 105.0)
+        _ = _step_stream_chunk(ticket, now=t0 + 15.0)
+        _ = _step_stream_chunk(ticket, now=t0 + 105.0)
 
         # Следующий чанк задерживается на 150.5s (> 150s)
         stalled_at = (t0 + 105.0) + 150.5
         assert ticket.deadline.expired(now=stalled_at) is True
         with pytest.raises(TimeoutError, match="egress deadline expired"):
-            ticket.deadline.clamp(1.0, now=stalled_at)
+            _ = ticket.deadline.clamp(1.0, now=stalled_at)
 
         with pytest.raises(EgressTimeoutError) as exc_info:
-            _step_stream_chunk(ticket, now=stalled_at)
+            _ = _step_stream_chunk(ticket, now=stalled_at)
 
         assert exc_info.value.phase == "upstream_timeout"
         assert "upstream_timeout" in str(exc_info.value)
@@ -95,7 +95,7 @@ def test_stream_generate_content_headers_after_40s_forwarded_under_v2(
         assert ticket.deadline.expired(now=t_headers) is False
         assert ticket.header_deadline_s == pytest.approx(150.0 - header_delay_s)
         # При получении заголовков/первого чанка окно сбрасывается на полные 150s
-        ticket.on_chunk(now=t_headers)
+        _ = ticket.on_chunk(now=t_headers)
         assert ticket.deadline.remaining(now=t_headers) == pytest.approx(150.0)
 
     # На не-streaming пути под v2 и на любом пути под v1 задержка > 40s вызывает EgressTimeoutError

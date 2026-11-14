@@ -1,4 +1,6 @@
 """Слой 5: валидация JSON-конфигурации (по config-schema.json) и атомарный hot-reload."""
+
+# Цикл с proxy_pool замыкается только импортом типов под TYPE_CHECKING, не в рантайме.
 # pyright: reportImportCycles=false
 
 from __future__ import annotations
@@ -8,11 +10,12 @@ import math
 import re
 import threading
 import time
+from _thread import LockType
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import cast
 
 from .errors import ConfigError
 from .logging_utils import get_logger
@@ -20,6 +23,7 @@ from .proxy_pool import parse_proxy_url
 from .retry_budget import RetryBudgetSpec
 
 __all__ = [
+    "FORBIDDEN_ROUTE_DE_PORTS",
     "AdapterConfig",
     "BridgeConfig",
     "ConfigError",
@@ -37,6 +41,7 @@ __all__ = [
 LOGGER = get_logger("model_georouter.config")
 
 LOOPBACK = "127.0.0.1"
+FORBIDDEN_ROUTE_DE_PORTS: frozenset[int] = frozenset({10810, 10820})
 POOL_TYPES = ("direct", "http_connect", "socks5")
 STRATEGIES = ("first_available", "random")
 PROXY_SCHEMES = {"http_connect": {"http"}, "socks5": {"socks5", "socks5h"}}
@@ -99,7 +104,7 @@ class ServerConfig:
     f08_policy: object = None
     f08_v2_risk_ack: object = None
     client_timeout_s: object = None
-    hedged_connect_enabled: bool = True
+    hedged_connect_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -166,13 +171,15 @@ _SERVER_DEFAULTS = ServerConfig(listen=LOOPBACK, port=10830)
 # ───────────────────────────── валидаторы ─────────────────────────────
 
 
-def _mapping(value: Any, path: str) -> Mapping[str, Any]:
+def _mapping(value: object, path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"{path}: expected object, got {type(value).__name__}")
-    return value
+    return cast(Mapping[str, object], value)
 
 
-def _integer(section: Mapping[str, Any], key: str, default: int, path: str, minimum: int = 0, maximum=None) -> int:
+def _integer(
+    section: Mapping[str, object], key: str, default: int, path: str, minimum: int = 0, maximum: int | None = None
+) -> int:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{path}.{key}: expected integer, got {type(value).__name__}")
@@ -181,7 +188,7 @@ def _integer(section: Mapping[str, Any], key: str, default: int, path: str, mini
     return value
 
 
-def _finite_number(section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None) -> float:
+def _finite_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None) -> float:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(f"{path}.{key}: expected number, got {type(value).__name__}")
@@ -197,7 +204,7 @@ def _finite_number(section: Mapping[str, Any], key: str, default: float, path: s
 
 
 def _positive_number(
-    section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None = None
+    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
 ) -> float:
     value = _finite_number(section, key, default, path, maximum)
     if value <= 0:
@@ -206,7 +213,7 @@ def _positive_number(
 
 
 def _non_negative_number(
-    section: Mapping[str, Any], key: str, default: float, path: str, maximum: float | None = None
+    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
 ) -> float:
     value = _finite_number(section, key, default, path, maximum)
     if value < 0:
@@ -214,28 +221,28 @@ def _non_negative_number(
     return value
 
 
-def _string(section: Mapping[str, Any], key: str, default: str, path: str) -> str:
+def _string(section: Mapping[str, object], key: str, default: str, path: str) -> str:
     value = section.get(key, default)
     if not isinstance(value, str):
         raise ConfigError(f"{path}.{key}: expected string, got {type(value).__name__}")
     return value
 
 
-def _boolean(section: Mapping[str, Any], key: str, default: bool, path: str) -> bool:
+def _boolean(section: Mapping[str, object], key: str, default: bool, path: str) -> bool:
     value = section.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{path}.{key}: expected boolean, got {type(value).__name__}")
     return value
 
 
-def _string_list(section: Mapping[str, Any], key: str, default: tuple[str, ...], path: str) -> tuple[str, ...]:
+def _string_list(section: Mapping[str, object], key: str, default: tuple[str, ...], path: str) -> tuple[str, ...]:
     value = section.get(key, list(default))
-    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in cast(list[object], value)):
         raise ConfigError(f"{path}.{key}: expected list of non-empty strings")
-    return tuple(value)
+    return tuple(cast(list[str], value))
 
 
-def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
+def _parse_server(section: Mapping[str, object]) -> ServerConfig:
     path, d = "server", _SERVER_DEFAULTS
     for required in ("listen", "port"):
         if required not in section:
@@ -284,18 +291,19 @@ def _parse_server(section: Mapping[str, Any]) -> ServerConfig:
     )
 
 
-def _parse_upstreams(raw: Any) -> dict[str, UpstreamConfig]:
+def _parse_upstreams(raw: object) -> dict[str, UpstreamConfig]:
     upstreams = dict(DEFAULT_UPSTREAMS)
     for name, value in _mapping(raw, "upstreams").items():
         path = f"upstreams.{name}"
         section = _mapping(value, path)
-        if not isinstance(section.get("host"), str) or not section["host"]:
+        host = section.get("host")
+        if not isinstance(host, str) or not host:
             raise ConfigError(f"{path}: missing required key 'host'")
         base_path = _string(section, "base_path", "", path)
         if base_path and not base_path.startswith("/"):
             raise ConfigError(f"{path}.base_path: must start with '/'")
         upstreams[name] = UpstreamConfig(
-            host=section["host"],
+            host=host,
             port=_integer(section, "port", 443, path, 1, 65535),
             use_tls=_boolean(section, "use_tls", True, path),
             base_path=base_path.rstrip("/"),
@@ -304,7 +312,7 @@ def _parse_upstreams(raw: Any) -> dict[str, UpstreamConfig]:
 
 
 def _parse_adapters(
-    raw: Any,
+    raw: object,
     upstreams: Mapping[str, UpstreamConfig],
     pools: Mapping[str, PoolConfig] | None = None,
 ) -> dict[str, AdapterConfig]:
@@ -337,7 +345,7 @@ def _parse_adapters(
     return adapters
 
 
-def _validate_proxy(url: Any, pool_type: str, path: str) -> str:
+def _validate_proxy(url: object, pool_type: str, path: str) -> str:
     if not isinstance(url, str) or not url:
         raise ConfigError(f"{path}: proxy URL must be a non-empty string")
     try:
@@ -349,7 +357,7 @@ def _validate_proxy(url: Any, pool_type: str, path: str) -> str:
     return url
 
 
-def _parse_pools(raw: Any) -> dict[str, PoolConfig]:
+def _parse_pools(raw: object) -> dict[str, PoolConfig]:
     pools: dict[str, PoolConfig] = {}
     for name, value in _mapping(raw, "pools").items():
         path = f"pools.{name}"
@@ -357,29 +365,32 @@ def _parse_pools(raw: Any) -> dict[str, PoolConfig]:
         if "type" not in section:
             raise ConfigError(f"{path}: missing required key 'type'")
         pool_type = section["type"]
-        if pool_type not in POOL_TYPES:
+        if not isinstance(pool_type, str) or pool_type not in POOL_TYPES:
             raise ConfigError(f"{path}.type: expected one of {list(POOL_TYPES)}, got {pool_type!r}")
         strategy = section.get("strategy", "first_available")
-        if strategy not in STRATEGIES:
+        if not isinstance(strategy, str) or strategy not in STRATEGIES:
             raise ConfigError(f"{path}.strategy: expected one of {list(STRATEGIES)}, got {strategy!r}")
         proxies: tuple[str, ...] = ()
         if pool_type != "direct":
             listed = section.get("proxies")
             if not isinstance(listed, list) or not listed:
                 raise ConfigError(f"{path}.proxies: non-empty list required for pool type {pool_type!r}")
-            proxies = tuple(_validate_proxy(url, pool_type, f"{path}.proxies[{i}]") for i, url in enumerate(listed))
+            proxies = tuple(
+                _validate_proxy(url, pool_type, f"{path}.proxies[{i}]")
+                for i, url in enumerate(cast(list[object], listed))
+            )
         pools[name] = PoolConfig(
             name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id")
         )
-    pools.setdefault("direct", PoolConfig("direct", "direct"))
+    _ = pools.setdefault("direct", PoolConfig("direct", "direct"))
     return pools
 
 
-def _parse_rules(raw: Any, pools: Mapping[str, PoolConfig]) -> tuple[RuleConfig, ...]:
+def _parse_rules(raw: object, pools: Mapping[str, PoolConfig]) -> tuple[RuleConfig, ...]:
     if not isinstance(raw, list):
         raise ConfigError(f"rules: expected array, got {type(raw).__name__}")
-    rules = []
-    for index, value in enumerate(raw):
+    rules: list[RuleConfig] = []
+    for index, value in enumerate(cast(list[object], raw)):
         path = f"rules[{index}]"
         section = _mapping(value, path)
         if "pool" not in section:
@@ -393,7 +404,7 @@ def _parse_rules(raw: Any, pools: Mapping[str, PoolConfig]) -> tuple[RuleConfig,
             if not isinstance(regex, str) or not regex:
                 raise ConfigError(f"{path}.match_regex: expected non-empty string")
             try:
-                re.compile(regex)
+                _ = re.compile(regex)
             except re.error as exc:
                 raise ConfigError(f"{path}.match_regex: invalid regular expression ({exc})") from None
         if not prefixes and regex is None:
@@ -402,27 +413,27 @@ def _parse_rules(raw: Any, pools: Mapping[str, PoolConfig]) -> tuple[RuleConfig,
     return tuple(rules)
 
 
-def _alias(section: dict[str, Any], old: str, new: str) -> None:
+def _alias(section: dict[str, object], old: str, new: str) -> None:
     if old in section and new not in section:  # канонический ключ главнее алиаса
         section[new] = section[old]
 
 
-def _normalize(data: Any) -> Any:
+def _normalize(data: object) -> object:
     """Привести устаревшие алиасы (`host`, `urls`, `prefix`/`prefixes`) и вложенные секции `slots`/`routing` к плоской схеме."""
     if not isinstance(data, Mapping):
         return data
-    root: dict[str, Any] = dict(data)
+    root = dict(_mapping(cast(object, data), "config"))
     routing = root.pop("routing", None)
     if isinstance(routing, Mapping):
-        for key, value in routing.items():
-            root.setdefault(key, value)
+        for key, value in _mapping(cast(object, routing), "routing").items():
+            _ = root.setdefault(key, value)
     slots = root.pop("slots", None)
     if isinstance(root.get("server"), Mapping):
-        server: dict[str, Any] = dict(root["server"])
+        server = dict(_mapping(root["server"], "server"))
         root["server"] = server
         if isinstance(slots, Mapping):
-            for key, value in slots.items():
-                server.setdefault(key, value)
+            for key, value in _mapping(cast(object, slots), "slots").items():
+                _ = server.setdefault(key, value)
         for key in (
             "max_inflight_per_backend",
             "max_inflight_long_header",
@@ -431,22 +442,22 @@ def _normalize(data: Any) -> Any:
             "client_timeout_s",
         ):
             if key in root:
-                server.setdefault(key, root[key])
+                _ = server.setdefault(key, root[key])
         _alias(server, "host", "listen")
     if isinstance(root.get("pools"), Mapping):
-        pools: dict[str, Any] = dict(root["pools"])
+        pools = dict(_mapping(root["pools"], "pools"))
         root["pools"] = pools
         for name, pool in pools.items():
             if isinstance(pool, Mapping):
-                pool_copy: dict[str, Any] = dict(pool)
+                pool_copy = dict(_mapping(cast(object, pool), f"pools.{name}"))
                 pools[name] = pool_copy
                 _alias(pool_copy, "urls", "proxies")
     if isinstance(root.get("rules"), list):
-        rules: list[Any] = list(root["rules"])
+        rules = list(cast(list[object], root["rules"]))
         root["rules"] = rules
         for index, rule in enumerate(rules):
             if isinstance(rule, Mapping):
-                rule_copy: dict[str, Any] = dict(rule)
+                rule_copy = dict(_mapping(cast(object, rule), f"rules[{index}]"))
                 rules[index] = rule_copy
                 for alias in ("prefix", "prefixes"):
                     if isinstance(rule_copy.get(alias), str):
@@ -455,7 +466,7 @@ def _normalize(data: Any) -> Any:
     return root
 
 
-def parse_config(data: Any) -> BridgeConfig:
+def parse_config(data: object) -> BridgeConfig:
     """Провалидировать словарь конфигурации и собрать неизменяемый снимок."""
     root = _mapping(_normalize(data), "config")
     for required in ("server", "pools", "rules"):
@@ -466,8 +477,6 @@ def parse_config(data: Any) -> BridgeConfig:
     pools = _parse_pools(root["pools"])
     is_legacy = isinstance(data, Mapping) and ("slots" in data or "routing" in data or "adapters" in data)
     if (route_de := pools.get("route-de")) is not None and not is_legacy and "route-hy2" not in pools:
-        from .config_guard import FORBIDDEN_ROUTE_DE_PORTS
-
         for idx, url in enumerate(route_de.proxies):
             if (ep := parse_proxy_url(url)).port in FORBIDDEN_ROUTE_DE_PORTS:
                 raise ConfigError(f"pools.route-de.proxies[{idx}]: forbidden proxy {ep.host}:{ep.port}")
@@ -495,7 +504,7 @@ def parse_config(data: Any) -> BridgeConfig:
 
 def load_config_file(path: str | Path) -> BridgeConfig:
     try:
-        data = json.loads(Path(path).expanduser().read_bytes())
+        data = cast(object, json.loads(Path(path).expanduser().read_bytes()))
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid JSON: {exc}") from None
     except UnicodeDecodeError as exc:
@@ -508,6 +517,13 @@ def load_config_file(path: str | Path) -> BridgeConfig:
 
 class ConfigManager:
     """Хранит текущий снимок; перечитывает файл при смене `os.stat()` и не теряет рабочий снимок при ошибке."""
+
+    _path: Path | None
+    _poll_interval: float
+    _clock: Callable[[], float]
+    _lock: LockType
+    _last_check: float
+    _snapshot: BridgeConfig
 
     def __init__(
         self,
@@ -534,7 +550,7 @@ class ConfigManager:
             self._snapshot = load_config_file(self._path)
 
     @classmethod
-    def from_dict(cls, data: Any) -> ConfigManager:
+    def from_dict(cls, data: object) -> ConfigManager:
         return cls(initial=parse_config(data))
 
     @property
@@ -554,7 +570,7 @@ class ConfigManager:
         """Текущий снимок; не чаще `poll_interval` проверяет файл на изменения."""
         if self._path is not None and self._clock() - self._last_check >= self._poll_interval:
             self._last_check = self._clock()
-            self.reload_if_changed()
+            _ = self.reload_if_changed()
         return self._snapshot
 
     def reload_if_changed(self) -> bool:

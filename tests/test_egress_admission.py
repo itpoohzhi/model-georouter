@@ -3,19 +3,160 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import time
 from contextlib import AsyncExitStack
 
+import pytest
+
 from model_georouter import egress_admission as _ea
+from model_georouter.config import BridgeConfig, ServerConfig
+from model_georouter.config_guard import validate_config
 from model_georouter.egress_admission import EgressAdmission, InflightLimitError, Ticket
 from model_georouter.errors import ConfigError, EgressTimeoutError, SlotsExhaustedError
+from model_georouter.model_router import sanitize_openai_empty_messages
 from model_georouter.retry_budget import F08_V2_RISK_ACK, EgressDeadline, RetryBudgetSpec, validate_f08_v2
 
 DE_EGRESS_ID = "de-213.165.42.220"
 DE_PORTS = ("127.0.0.1:10827", "127.0.0.1:10828", "127.0.0.1:10829")
 GENERATE_PATH = "/v1beta/models/gemini-2.5-pro:generateContent"
 STREAM_PATH = "/v1beta/models/gemini-2.5-pro:streamGenerateContent"
+
+
+def _source(**fields: object) -> BridgeConfig:
+    """Создаёт снимок с независимыми полями источника допуска."""
+    return BridgeConfig(
+        ServerConfig(
+            listen="127.0.0.1",
+            port=0,
+            proxy_slots=80,
+            total_egress_deadline=40,
+            f08_policy=fields.get("f08_policy", "v2"),
+            f08_v2_risk_ack=fields.get("f08_v2_risk_ack"),
+            client_timeout_s=fields.get("client_timeout_s"),
+        ),
+        {},
+        {},
+        {},
+        (),
+    )
+
+
+def test_explicit_none_ack_overrides_source() -> None:
+    """Явный None отменяет подтверждение риска в источнике."""
+    with pytest.raises(ConfigError):
+        _ = EgressAdmission(config=_source(f08_v2_risk_ack=F08_V2_RISK_ACK), f08_v2_risk_ack=None)
+
+
+def test_explicit_none_policy_overrides_source() -> None:
+    """Явный None политики не подменяется значением источника."""
+    with pytest.raises(ConfigError, match="f08_policy"):
+        _ = EgressAdmission(config=_source(client_timeout_s=180), f08_policy=None)
+    assert EgressAdmission(config=_source(f08_policy=None)).f08_policy == "v1"
+
+
+def test_explicit_none_timeout_overrides_source() -> None:
+    """Явный None отменяет клиентский таймаут в источнике."""
+    with pytest.raises(ConfigError):
+        _ = EgressAdmission(config=_source(client_timeout_s=180), client_timeout_s=None)
+
+
+@pytest.mark.parametrize("policy", ["", "bad", 42])
+def test_source_invalid_policy_rejected(policy: object) -> None:
+    """Некорректная политика источника не подменяется дефолтом."""
+    with pytest.raises(ConfigError):
+        _ = EgressAdmission(config=_source(f08_policy=policy))
+
+
+@pytest.mark.parametrize("timeout", ["bad", True])
+def test_source_invalid_timeout_rejected(timeout: object) -> None:
+    """Таймаут проверяется даже при действующем подтверждении риска."""
+    with pytest.raises(ConfigError, match="client_timeout_s"):
+        _ = EgressAdmission(config=_source(f08_v2_risk_ack=F08_V2_RISK_ACK, client_timeout_s=timeout))
+
+
+def test_source_invalid_ack_rejected() -> None:
+    """Число вместо подтверждения риска отклоняется и при достаточном таймауте."""
+    with pytest.raises(ConfigError, match="f08_v2_risk_ack"):
+        _ = EgressAdmission(config=_source(f08_v2_risk_ack=42, client_timeout_s=180))
+
+
+def test_hedging_omission_is_fail_safe() -> None:
+    """Пропуск ключа не включает hedging ни в снимке, ни в конфиге v2."""
+    assert ServerConfig("127.0.0.1", 0).hedged_connect_enabled is False
+    cfg: dict[str, object] = {
+        "server": {
+            "listen": "127.0.0.1",
+            "port": 0,
+            "proxy_slots": 80,
+            "total_egress_deadline": 40,
+            "f08_policy": "v2",
+            "client_timeout_s": 180,
+        },
+        "pools": {},
+        "rules": [],
+    }
+    assert validate_config(cfg).bridge.server.hedged_connect_enabled is False
+
+
+@pytest.mark.parametrize("flag", ["false", 1, None, True])
+def test_hedging_v2_rejects_unsafe_or_non_boolean_flag(flag: object) -> None:
+    """В v2 допускается только явно булев выключенный hedging."""
+    with pytest.raises(ConfigError, match="hedged_connect_enabled"):
+        _ = validate_config(
+            {
+                "server": {
+                    "listen": "127.0.0.1",
+                    "port": 0,
+                    "proxy_slots": 80,
+                    "total_egress_deadline": 40,
+                    "f08_policy": "v2",
+                    "client_timeout_s": 180,
+                    "hedged_connect_enabled": flag,
+                },
+                "pools": {},
+                "rules": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("content", ["", None])
+def test_openai_empty_user_normalized(content: object) -> None:
+    """Обычное пустое сообщение заменяется пробелом."""
+    raw = json.dumps({"messages": [{"role": "user", "content": content}]}).encode()
+    assert sanitize_openai_empty_messages(raw) == b'{"messages":[{"role":"user","content":" "}]}'
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call-test", "type": "function"}]},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call-test", "type": "function"}]},
+        {"role": "assistant", "content": None, "function_call": {"name": "example", "arguments": "{}"}},
+        {"role": "assistant", "content": "", "function_call": {"name": "example", "arguments": "{}"}},
+        {"role": "tool", "content": "", "tool_call_id": "call-test", "extra": {"keep": True}},
+        {"role": "tool", "content": None, "tool_call_id": "call-test"},
+    ],
+)
+def test_openai_tool_structure_preserved(message: dict[str, object]) -> None:
+    """Вызовы и ответы инструментов сохраняют исходные байты и структуру."""
+    raw = json.dumps({"messages": [message]}).encode()
+    assert sanitize_openai_empty_messages(raw) is raw
+
+
+def test_openai_tool_structure_preserved_beside_normalized_user() -> None:
+    """Изменение соседнего сообщения не затрагивает поля вызова и ответа инструмента."""
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call-test", "type": "function"}]},
+        {"role": "tool", "content": "", "tool_call_id": "call-test", "extra": {"keep": True}},
+        {"role": "user", "content": ""},
+    ]
+    raw = json.dumps({"messages": messages}).encode()
+    expected = json.dumps(
+        {"messages": [*messages[:2], {"role": "user", "content": " "}]}, separators=(",", ":")
+    ).encode()
+    assert sanitize_openai_empty_messages(raw) == expected
 
 
 def _make_de_pools() -> dict[str, object]:

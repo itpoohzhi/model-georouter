@@ -69,7 +69,7 @@ def test_f08_v2_rejects_modified_t_pre_t_idle_or_scope(
 ) -> None:
     """Отклоняет любые отклонения констант T_pre=19s, T_idle=150s и маркера потока."""
     with pytest.raises(ConfigError, match=match):
-        validate_f08_v2(**kwargs)
+        _ = validate_f08_v2(**kwargs)
 
 
 def test_non_streaming_paths_preserve_40s_deadline() -> None:
@@ -104,14 +104,14 @@ def test_non_streaming_paths_preserve_40s_deadline() -> None:
         assert ticket.header_deadline_s == pytest.approx(40.0)
         assert ticket.sliding_idle_s is None
         assert ticket.deadline.remaining(now=10.0) == pytest.approx(40.0)
-        ticket.on_chunk(now=35.0)
+        _ = ticket.on_chunk(now=35.0)
         assert ticket.deadline.remaining(now=35.0) == pytest.approx(15.0)
 
     # Попытка переопределить non_stream_deadline != 40s отклоняется
     with pytest.raises(ConfigError, match="non_stream_deadline"):
-        validate_f08_v2(client_timeout_s=180.0, non_stream_deadline=60.0)
+        _ = validate_f08_v2(client_timeout_s=180.0, non_stream_deadline=60.0)
     with pytest.raises(ConfigError, match="non_stream_deadline"):
-        EgressAdmission(f08_policy="v2", client_timeout_s=180.0, total_egress_deadline=60.0)
+        _ = EgressAdmission(f08_policy="v2", client_timeout_s=180.0, total_egress_deadline=60.0)
 
 
 @pytest.mark.parametrize("valid_timeout", [180.0, 180, 185.5, 300.0])
@@ -137,13 +137,13 @@ def test_client_timeout_invariant_violation_raises_config_error(
 ) -> None:
     """Отклоняет client_timeout_s, если нарушен инвариант T_pre + T_idle <= client_timeout_s - 11."""
     with pytest.raises(ConfigError, match="client_timeout_s"):
-        validate_f08_v2(client_timeout_s=invalid_timeout)
+        _ = validate_f08_v2(client_timeout_s=invalid_timeout)
 
     with pytest.raises(ConfigError, match="client_timeout_s"):
-        EgressAdmission(
+        _ = EgressAdmission(
             f08_policy="v2",
             # Неверный тип намеренно подаётся для проверки отказа runtime-валидатора.
-            client_timeout_s=invalid_timeout,  # pyright: ignore[reportArgumentType]
+            client_timeout_s=invalid_timeout,
         )
 
 
@@ -154,14 +154,14 @@ def test_client_timeout_invariant_violation_raises_config_error(
 def test_missing_client_timeout_requires_valid_risk_ack(bad_ack: object) -> None:
     """Отсутствующий client_timeout_s без точного f08_v2_risk_ack отклоняется с ConfigError."""
     with pytest.raises(ConfigError, match="f08_v2_risk_ack"):
-        validate_f08_v2(client_timeout_s=None, f08_v2_risk_ack=bad_ack)
+        _ = validate_f08_v2(client_timeout_s=None, f08_v2_risk_ack=bad_ack)
 
     with pytest.raises(ConfigError, match="f08_v2_risk_ack"):
-        EgressAdmission(
+        _ = EgressAdmission(
             f08_policy="v2",
             client_timeout_s=None,
             # Проверяем в том числе объекты, запрещённые статической сигнатурой.
-            f08_v2_risk_ack=bad_ack,  # pyright: ignore[reportArgumentType]
+            f08_v2_risk_ack=bad_ack,
         )
 
 
