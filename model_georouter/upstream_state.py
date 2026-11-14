@@ -53,7 +53,8 @@ class UpstreamSnapshot:
 def atomic_write_json(path: Path | str, payload: Mapping[str, object]) -> None:
     """Атомарно записывает JSON через временный файл в той же директории с правами `0600`."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(target.parent, 0o700)
     tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     data = (json.dumps(dict(payload), ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     try:

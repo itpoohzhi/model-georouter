@@ -188,11 +188,26 @@ class EgressHedgeRunner:
                     return srv.ssl_context.wrap_socket(raw, server_hostname=upstream.host)
                 except TimeoutError as exc:
                     raise ssl.SSLError("tls handshake timed out") if is_target else exc
+            attempts = 0
             def hook(ep: ProxyEndpoint | None) -> None:
+                nonlocal attempts
+                attempts += 1
                 hdl._last_proxy_endpoint = ep  # pyright: ignore[reportPrivateUsage]
                 hdl.proxy_endpoint = "-" if ep is None else (f"[{ep.host}]:{ep.port}" if ":" in ep.host else f"{ep.host}:{ep.port}")
             if not is_target or not self.policy.should_hedge(pool.name, len(self.manager.available(pool))):
-                return self.manager._connect(pool, upstream.host, upstream.port, eff, wrap_tls if upstream.use_tls else None, hook)  # pyright: ignore[reportPrivateUsage]
+                if not is_target:
+                    return self.manager._connect(pool, upstream.host, upstream.port, eff, wrap_tls if upstream.use_tls else None, hook)  # pyright: ignore[reportPrivateUsage]
+                try:
+                    sock = self.manager._connect(pool, upstream.host, upstream.port, eff, wrap_tls if upstream.use_tls else None, hook)  # pyright: ignore[reportPrivateUsage]
+                except AllProxiesPenalizedError as exc:
+                    _notify(self.recorder, pool=pool.name, err=exc)
+                    raise
+                except _ATTEMPT_ERRORS as exc:
+                    _notify(self.recorder, pool=pool.name, err=_normalize_err(exc, hdl._last_proxy_endpoint))  # pyright: ignore[reportPrivateUsage]
+                    raise
+                win_ep = hdl._last_proxy_endpoint  # pyright: ignore[reportPrivateUsage]
+                _notify(self.recorder, HedgeOutcome(pool.name, win_ep.label if win_ep is not None else "direct", win_ep, max(1, attempts), False, attempts > 1, False))
+                return sock
             return self.connect(pool, target, eff, wrap_tls if upstream.use_tls else None, hook)
         self.manager.ensure_available(pool)
         candidates: Sequence[ProxyEndpoint | None] = [None] if pool.type == "direct" else self.manager.available(pool)

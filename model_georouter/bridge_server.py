@@ -61,6 +61,7 @@ from .model_router import (
 from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
 from .retry_budget import AttemptEvent, AttemptState, EgressDeadline, RetryBudgetSpec, transition
+from .upstream_state import UpstreamStateWriter
 
 LOGGER = get_logger("model_georouter.server")
 _RETRY_BUDGET = RetryBudgetSpec()
@@ -216,6 +217,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
     _threads: _WorkerThreads
     egress: egress_hedge.EgressHedgeRunner
     admission: egress_admission.EgressAdmission
+    state_writer: UpstreamStateWriter | None
 
     def __init__(
         self,
@@ -224,7 +226,8 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         proxy_manager: ProxyPoolManager | None = None,
         geo_cache: GeoCache | None = None,
         ssl_context: ssl.SSLContext | None = None,
-    ):
+        state_writer: UpstreamStateWriter | None = None,
+    ) -> None:
         cfg = config_manager.get().server
         self.config_manager, self.proxy_manager = config_manager, proxy_manager or ProxyPoolManager()
         self.geo_cache = geo_cache or GeoCache(cfg.geo_cache_file or None, cfg.geo_cache_ttl_seconds)
@@ -235,7 +238,18 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         self.retry_budget: RetryBudgetSpec = RetryBudgetSpec()
         self.started_at: float = time.monotonic()
         self._threads = _WorkerThreads()
-        self.egress = egress_hedge.build_egress(self.proxy_manager, cfg.hedged_connect_enabled)
+        self.state_writer = (
+            state_writer
+            if state_writer is not None
+            else (
+                UpstreamStateWriter(config_manager.path.parent / "state" / "upstream-state.json")
+                if config_manager.path is not None
+                else None
+            )
+        )
+        self.egress = egress_hedge.build_egress(
+            self.proxy_manager, cfg.hedged_connect_enabled, recorder=self.state_writer
+        )
         self.admission = egress_admission.EgressAdmission(config=config_guard.validate(config_manager.get()))
         super().__init__((cfg.listen, cfg.port), _Handler)
 
