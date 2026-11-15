@@ -324,9 +324,14 @@ def build_upstream_request(
     default_port = 443 if upstream.use_tls else 80
     host_header = upstream.host if upstream.port == default_port else f"{upstream.host}:{upstream.port}"
     target = upstream.base_path + path + (f"?{query}" if query else "")
+    _opencode_route = upstream.base_path.startswith(("/go/v1", "/zen/v1"))
     skip = SKIPPED_REQUEST_HEADERS | HOP_BY_HOP | connection_tokens(req.headers)
+    if _opencode_route:
+        skip = skip | {"user-agent"}
     lines = [f"{req.method} {target} HTTP/1.1", f"Host: {host_header}"]
     lines.extend(f"{key}: {value}" for key, value in req.headers if key.lower() not in skip)
+    if _opencode_route:
+        lines.append("User-Agent: OpenCode")
     lines.append("Accept-Encoding: identity")
     lines.append("Connection: close")
     if body_length or req.method in BODY_METHODS:
