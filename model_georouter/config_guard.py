@@ -46,7 +46,7 @@ def validate_inflight_limits(proxy_slots: object, max_inflight_per_backend: obje
     """Проверяет `0 < max_inflight_per_backend <= proxy_slots // 2` (D2-M4) и `max_inflight_long_header > 0`."""
     limit = _int_bound(proxy_slots, "server.proxy_slots", 2) // 2
     per_b = _int_bound(min(40, limit) if max_inflight_per_backend is _MISSING else max_inflight_per_backend, "server.max_inflight_per_backend", 1, limit)
-    long_h = _int_bound(8 if max_inflight_long_header is _MISSING else max_inflight_long_header, "server.max_inflight_long_header", 1)
+    long_h = _int_bound(64 if max_inflight_long_header is _MISSING else max_inflight_long_header, "server.max_inflight_long_header", 1)
     return per_b, long_h
 def validate_f08_deadline(total_egress_deadline: object, f08_policy: object = _MISSING, f08_v2_risk_ack: object = _MISSING, client_timeout_s: object = _MISSING) -> str:
     """Проверяет дедлайн F-08 (`v1`: `total_egress_deadline == 40`, `v2`: `f08_v2_risk_ack` или `client_timeout_s`)."""
@@ -59,7 +59,7 @@ def validate_f08_deadline(total_egress_deadline: object, f08_policy: object = _M
         raise ConfigError(f"server.total_egress_deadline: must be 40 when f08_policy == 'v1', got {total_egress_deadline!r}")
     if policy == F08_V2_POLICY:
         ack = F08_V2_RISK_ACK if (f08_v2_risk_ack is _MISSING and client_timeout_s is _MISSING) else (None if f08_v2_risk_ack is _MISSING else f08_v2_risk_ack)
-        _ = validate_f08_v2(client_timeout_s=None if client_timeout_s is _MISSING else client_timeout_s, f08_v2_risk_ack=ack, non_stream_deadline=F08_V1_TOTAL_EGRESS_DEADLINE if float(total_egress_deadline) == 20.0 else total_egress_deadline)
+        _ = validate_f08_v2(client_timeout_s=None if client_timeout_s is _MISSING else client_timeout_s, f08_v2_risk_ack=ack, non_stream_deadline=F08_V1_TOTAL_EGRESS_DEADLINE if float(total_egress_deadline) in (20.0, 60.0) else total_egress_deadline)
     return policy
 def validate_route_de_pool(pool: ObjMap | PoolConfig, *, egress_id: object = _MISSING, require_allowed_ports: bool = True) -> str:
     """Проверяет пул `route-de`: непустой `egress_id` (D3-M4) и только loopback 127.0.0.1:10827..10829."""

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import TracebackType
@@ -19,6 +20,7 @@ from .retry_budget import EgressDeadline, RetryBudgetSpec
 __all__ = ["DEFAULT_MAX_INFLIGHT_LONG_HEADER", "DEFAULT_MAX_INFLIGHT_PER_BACKEND", "DEFAULT_PROXY_SLOTS", "LONG_HEADER_MARKER", "AdmissionTicket", "EgressAdmission", "InflightLimitError", "Ticket", "is_long_header_path"]  # fmt: skip
 
 DEFAULT_PROXY_SLOTS, DEFAULT_MAX_INFLIGHT_PER_BACKEND, DEFAULT_MAX_INFLIGHT_LONG_HEADER = 80, 40, 24
+DEFAULT_ADMISSION_WAIT_S = 0.0
 LONG_HEADER_MARKER = _rb.F08_V2_STREAM_MARKER
 _F08_UNSET = object()
 
@@ -107,7 +109,7 @@ class _AdmitCtx:
 class EgressAdmission:
     """Менеджер квот параллельных запросов на внешний egress и long-header пути."""
 
-    def __init__(self, pools: Mapping[str, object] | None = None, *, config: _cg.GuardedConfig | BridgeConfig | None = None, proxy_slots: int = DEFAULT_PROXY_SLOTS, max_inflight_per_backend: int = DEFAULT_MAX_INFLIGHT_PER_BACKEND, max_inflight_long_header: int = DEFAULT_MAX_INFLIGHT_LONG_HEADER, f08_policy: object = _F08_UNSET, total_egress_deadline: float = _cg.F08_V1_TOTAL_EGRESS_DEADLINE, retry_budget: RetryBudgetSpec | None = None, client_timeout_s: object = _F08_UNSET, f08_v2_risk_ack: object = _F08_UNSET, t_pre: float = _rb.F08_V2_T_PRE, t_idle: float = _rb.F08_V2_T_IDLE, f08_v2_scope: str = _rb.F08_V2_STREAM_MARKER) -> None:  # fmt: skip
+    def __init__(self, pools: Mapping[str, object] | None = None, *, config: _cg.GuardedConfig | BridgeConfig | None = None, proxy_slots: int = DEFAULT_PROXY_SLOTS, max_inflight_per_backend: int = DEFAULT_MAX_INFLIGHT_PER_BACKEND, max_inflight_long_header: int = DEFAULT_MAX_INFLIGHT_LONG_HEADER, f08_policy: object = _F08_UNSET, total_egress_deadline: float = _cg.F08_V1_TOTAL_EGRESS_DEADLINE, retry_budget: RetryBudgetSpec | None = None, client_timeout_s: object = _F08_UNSET, f08_v2_risk_ack: object = _F08_UNSET, t_pre: float = _rb.F08_V2_T_PRE, t_idle: float = _rb.F08_V2_T_IDLE, f08_v2_scope: str = _rb.F08_V2_STREAM_MARKER, admission_wait_s: object = _F08_UNSET) -> None:  # fmt: skip
         source = config.server if isinstance(config, BridgeConfig) else config
         if source is not None:
             if f08_policy is _F08_UNSET:
@@ -149,7 +151,7 @@ class EgressAdmission:
                 proxy_slots, max_inflight_per_backend, max_inflight_long_header
             )
         spec, v2_budget = (
-            retry_budget or RetryBudgetSpec(total_egress_deadline=float(total_egress_deadline)),
+            retry_budget or RetryBudgetSpec(total_egress_deadline=min(_cg.F08_V1_TOTAL_EGRESS_DEADLINE if float(total_egress_deadline) == 20.0 else float(total_egress_deadline), _cg.F08_V1_TOTAL_EGRESS_DEADLINE)),
             cast(_rb.F08V2Budget | None, None),
         )
         if f08_policy == _cg.DEFAULT_F08_POLICY and not isinstance(config, _cg.GuardedConfig):
@@ -186,6 +188,13 @@ class EgressAdmission:
             threading.Lock(),
             threading.local(),
         )
+        if admission_wait_s is _F08_UNSET:
+            cfg_server = config.bridge.server if isinstance(config, _cg.GuardedConfig) else (config.server if isinstance(config, BridgeConfig) else None)
+            admission_wait_s = getattr(cfg_server, "admission_wait_s", DEFAULT_ADMISSION_WAIT_S)
+        if isinstance(admission_wait_s, bool) or not isinstance(admission_wait_s, int | float) or not math.isfinite(admission_wait_s) or admission_wait_s < 0:  # fmt: skip
+            raise ConfigError("admission_wait_s: expected finite non-negative number")
+        self.wait_timeout, self._cond = float(admission_wait_s), threading.Condition(self._lock)
+        self.admission_wait_s = self.wait_timeout
 
     def resolve_egress_key(self, pool: str, backend: str | None = None) -> str:
         """Возвращает `pools[pool].egress_id`, либо fallback на `host:port` при отсутствии `egress_id`."""
@@ -236,15 +245,23 @@ class EgressAdmission:
         eg_deadline, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline, started_at=started_at) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline, started_at=started_at), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
         if (remaining_s := eg_deadline.remaining(now=now)) <= 0.0:
             raise EgressTimeoutError("egress deadline expired before admission", phase="admission")
-        with self._lock:
-            if (cur_egress := self._inflight_by_egress.get(egress_key, 0)) >= self.max_inflight_per_backend:
-                raise InflightLimitError(
-                    "backend", pool=pool, egress_key=egress_key, limit=self.max_inflight_per_backend
-                )
-            if long_hdr and self._inflight_long_header >= self.max_inflight_long_header:
-                raise InflightLimitError(
-                    "long_header", pool=pool, egress_key=egress_key, limit=self.max_inflight_long_header
-                )
+        with self._cond:
+            end_wait = time.monotonic() + min(self.wait_timeout, remaining_s)
+            while True:
+                cur_egress = self._inflight_by_egress.get(egress_key, 0)
+                backend_full = cur_egress >= self.max_inflight_per_backend
+                long_full = long_hdr and self._inflight_long_header >= self.max_inflight_long_header
+                if not backend_full and not long_full:
+                    break
+                if (left := end_wait - time.monotonic()) <= 0:
+                    if backend_full:
+                        raise InflightLimitError(
+                            "backend", pool=pool, egress_key=egress_key, limit=self.max_inflight_per_backend
+                        )
+                    raise InflightLimitError(
+                        "long_header", pool=pool, egress_key=egress_key, limit=self.max_inflight_long_header
+                    )
+                _ = self._cond.wait(timeout=left)
             self._inflight_by_egress[egress_key] = cur_egress + 1
             self._inflight_long_header += 1 if long_hdr else 0
         prev, ticket = getattr(self._local, "ticket", None), Ticket(pool, path, egress_key, remaining_s, eg_deadline, long_hdr, backend or "", t_pre, s_idle)  # fmt: skip
@@ -255,7 +272,7 @@ class EgressAdmission:
         """Освобождает слот в счётчиках in-flight и восстанавливает предыдущий билет."""
         self._local.ticket = prev
         if ticket is not None:
-            with self._lock:
+            with self._cond:
                 left = self._inflight_by_egress.get(ticket.egress_key, 1) - 1
                 _ = (
                     self._inflight_by_egress.pop(ticket.egress_key, None)
@@ -263,6 +280,7 @@ class EgressAdmission:
                     else self._inflight_by_egress.__setitem__(ticket.egress_key, left)
                 )
                 self._inflight_long_header = max(0, self._inflight_long_header - (1 if ticket.is_long_header else 0))
+                self._cond.notify_all()
 
     def admit(self, pool: str, path: str = "", *, backend: str | None = None, deadline: EgressDeadline | None = None, started_at: float | None = None, now: float | None = None) -> _AdmitCtx:  # fmt: skip
         """Немедленно выделяет слот или выбрасывает `InflightLimitError` (503, `inflight_limit`)."""

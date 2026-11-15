@@ -6,6 +6,7 @@ import select
 import socket
 import ssl
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .errors import FramingError
@@ -115,6 +116,7 @@ class SSERelay:
         *,
         initial: bytes = b"",
         initial_fed: bool = False,
+        on_chunk: Callable[[], object] | None = None,
     ) -> RelayResult:
         configure_socket(upstream)
         configure_socket(client)
@@ -151,6 +153,8 @@ class SSERelay:
                         consumed = framing.feed(data)
                         self._send(client, data[:consumed])
                         sent += consumed
+                        if on_chunk is not None:
+                            _ = on_chunk()
                 if time.monotonic() - last_data > self._inactivity:
                     return RelayResult(INACTIVITY_TIMEOUT, sent)
             return RelayResult(COMPLETE, sent)

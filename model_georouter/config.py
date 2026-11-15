@@ -105,6 +105,7 @@ class ServerConfig:
     f08_v2_risk_ack: object = None
     client_timeout_s: object = None
     hedged_connect_enabled: bool = False
+    admission_wait_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,7 @@ def _parse_server(section: Mapping[str, object]) -> ServerConfig:
         f08_v2_risk_ack=section.get("f08_v2_risk_ack"),
         client_timeout_s=section.get("client_timeout_s"),
         hedged_connect_enabled=_boolean(section, "hedged_connect_enabled", d.hedged_connect_enabled, path),
+        admission_wait_s=_non_negative_number(section, "admission_wait_s", d.admission_wait_s, path),
     )
 
 

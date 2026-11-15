@@ -199,6 +199,7 @@ class AttemptState:
     status: str = "pending"
     should_penalize: bool = False
     next_pool: str = ""
+    is_long_header: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +219,8 @@ def _should_penalize(state: AttemptState, event: AttemptEvent) -> bool:
     if event.kind == "header_timeout":
         if state.single_proxy:
             return True
+        if state.is_long_header:
+            return False
         if not state.has_alternative and not state.penalize_without_alternative:
             return False
         return state.penalize_on_header_timeout

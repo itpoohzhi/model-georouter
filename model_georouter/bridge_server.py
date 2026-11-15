@@ -590,7 +590,11 @@ class _Handler(socketserver.BaseRequestHandler):
             srv.metrics.incr("geo_cache_hits")
         upstream, fallback = snapshot.upstreams[route.upstream], snapshot.geo_fallback_pool
         replay_allowed = bool(fallback) and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool])
-        deadline = EgressDeadline.from_timeout(cfg.total_egress_deadline)
+        budget = srv.admission.f08_v2_budget
+        if budget is not None and egress_admission.is_long_header_path(path):
+            deadline = EgressDeadline.from_timeout(budget.t_idle)
+        else:
+            deadline = EgressDeadline.from_timeout(cfg.total_egress_deadline)
         self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
         try:
             with srv.admission.admit(decision.pool, path, deadline=deadline) as ticket:
@@ -641,7 +645,8 @@ class _Handler(socketserver.BaseRequestHandler):
         return AttemptEvent(kind=kind, deadline_expired=deadline.expired(), has_endpoint=endpoint is not None)
 
     def _attempt(self, pool_name: str, replay: bool, deadline: EgressDeadline, allow_fallback: bool = True) -> None:
-        _, snapshot, _, _, _, _, upstream, _ = self._ctx
+        _, snapshot, _, _, route, _, upstream, _ = self._ctx
+        long_header = egress_admission.is_long_header_path(route.path)
         srv, cfg, pool = self._bridge, snapshot.server, snapshot.pools[pool_name]
         b, fb, direct = srv.retry_budget, snapshot.geo_fallback_pool, _is_direct(pool)
         single = allow_fallback and bool(fb) and fb != pool_name and not direct and len(pool.proxies) == 1
@@ -653,6 +658,7 @@ class _Handler(socketserver.BaseRequestHandler):
             b.penalize_on_header_timeout,
             has_alternative=single or len(pool.proxies) > 1,
             penalize_without_alternative=cfg.penalize_header_timeout_without_alternative,
+            is_long_header=long_header,
         )
         self.pool_name, self.proxy_endpoint, self._last_proxy_endpoint = pool_name, "-", None
         if not direct:
@@ -672,8 +678,11 @@ class _Handler(socketserver.BaseRequestHandler):
             try:
                 up = self._connect_upstream(pool, upstream, deadline, single)
                 self._send_upstream_request(up, cfg.body_timeout, deadline)
-                hdr_wait = min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
-                head, rest = self._read_upstream_head(up, hdr_wait, deadline)
+                if long_header:
+                    hdr_wait = cfg.headers_timeout
+                else:
+                    hdr_wait = min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
+                head, rest = self._read_upstream_head(up, hdr_wait, None if long_header else deadline)
             except (AllProxiesPenalizedError, EgressConnectError, UpstreamTimeoutError, UpstreamProtocolError) as exc:
                 state = transition(state, self._attempt_event(exc, deadline, self._last_proxy_endpoint))
                 if self._last_proxy_endpoint is not None and state.should_penalize:
@@ -815,7 +824,7 @@ class _Handler(socketserver.BaseRequestHandler):
         return bytes(wire)
 
     def _relay(self, up: socket.socket, head: ResponseHead, framing: Framing, initial: bytes, fed: bool) -> None:
-        sock, snapshot, *_ = self._ctx
+        sock, snapshot, _runtime, _req, route, *_ = self._ctx
         cfg = snapshot.server
         self.status, self.committed = head.status, True
         try:
@@ -826,7 +835,8 @@ class _Handler(socketserver.BaseRequestHandler):
             self._bridge.metrics.incr("client_cancelled")
             return
         relay = SSERelay(inactivity_timeout=cfg.inactivity_timeout, write_timeout=cfg.body_timeout)
-        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed)
+        ticket = self._bridge.admission.current(None, route.path)
+        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed, on_chunk=ticket.on_chunk)
         self.outcome, self.bytes_sent = result.outcome, result.bytes_sent
         self._bridge.metrics.incr(f"status_{head.status}")
         self._bridge.metrics.incr(f"relay_{result.outcome}")
