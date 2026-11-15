@@ -5,11 +5,12 @@ from __future__ import annotations
 import json
 import re
 import zlib
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
-from .config import BridgeConfig, RuleConfig
+from ._typing import JsonValue
+from .config import BridgeConfig, PoolConfig, RuleConfig
 from .errors import BadRequestError, BodyTooLargeError
 from .geo_cache import GeoCache
 
@@ -38,14 +39,14 @@ _THOUGHT_BLOCK_RE = re.compile(r"<unused94>thought[\s\S]*?(?:<unused95>|$)")
 # а в повторе первые символы `\s*`, литерала и `]]>` не пересекаются — иначе суперлинейный backtracking.
 _REPETITION_LOOP_RE = re.compile(
     r"(?:(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)\s*)?\]\]>"
-    r"(?:\s*(?:(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)\s*)?\]\]>)+[\s\S]*$"
+    + r"(?:\s*(?:(?:end\.|stop\.|Let's\s+(?:stop|end)\.?)\s*)?\]\]>)+[\s\S]*$"
 )
 _REPETITION_LOOP_MIN_MARKERS = 4
 
 
-def _sanitize_model_parts(parts: list[Any]) -> list[Any] | None:
+def _sanitize_model_parts(parts: list[JsonValue]) -> list[JsonValue] | None:
     """Очищенные части `role=model` или `None`, если менять нечего."""
-    new_parts: list[Any] = []
+    new_parts: list[JsonValue] = []
     changed = False
     for part in parts:
         if not isinstance(part, dict):
@@ -85,7 +86,7 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
     if not raw_body:
         return raw_body
     try:
-        payload = json.loads(raw_body)
+        payload = cast(JsonValue, json.loads(raw_body))
     except (ValueError, RecursionError):
         return raw_body
     if not isinstance(payload, dict):
@@ -112,6 +113,68 @@ def sanitize_google_v1beta_body(raw_body: bytes) -> bytes:
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
 
 
+def _openai_content_is_empty(content: JsonValue) -> bool:
+    """Пустой ли `content` сообщения OpenAI-формата (None/"", пустой массив, только пустые text-части)."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        if not content:
+            return True
+        for part in content:
+            if not isinstance(part, dict):
+                return False
+            if part.get("type") not in ("text", "input_text"):
+                return False
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                return False
+        return True
+    return False
+
+
+def sanitize_openai_empty_messages(raw_body: bytes) -> bytes:
+    """Нормализует пустой `content` сообщений OpenAI-формата в одиночный пробел.
+
+    DSH при Retry добавляет в историю `user`-сообщение с пустым content (`source.kind=retry`),
+    Venice отвечает 400 "message content cannot be empty" — и чат ломается навсегда, потому что
+    пустое сообщение остаётся в истории. Пробел валиден, порядок сообщений и `tool_call_id`
+    не нарушаются. Без мутаций возвращает исходные байты как есть (тот же объект).
+    """
+    if not raw_body:
+        return raw_body
+    try:
+        payload = cast(JsonValue, json.loads(raw_body))
+    except (ValueError, RecursionError):
+        return raw_body
+    if not isinstance(payload, dict):
+        return raw_body
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return raw_body
+    mutated = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in ("tool", "function"):
+            continue
+        if message.get("role") == "assistant" and (
+            "tool_calls" in message or "function_call" in message or "audio" in message
+        ):
+            continue
+        if not _openai_content_is_empty(message.get("content")):
+            continue
+        message["content"] = " "
+        mutated = True
+    if not mutated:
+        return raw_body
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+
+
 THINKING_BINDING_BETA = "thinking-binding-controls-2026-08-01"
 
 
@@ -129,7 +192,7 @@ def ensure_anthropic_thinking_drop_block(raw_body: bytes) -> tuple[bytes, bool]:
     if not raw_body:
         return raw_body, False
     try:
-        payload = json.loads(raw_body)
+        payload = cast(JsonValue, json.loads(raw_body))
     except (ValueError, RecursionError):
         return raw_body, False
     if not isinstance(payload, dict):
@@ -150,7 +213,7 @@ def ensure_anthropic_thinking_drop_block(raw_body: bytes) -> tuple[bytes, bool]:
 def _decode_json_string(raw: bytes) -> str:
     if b"\\" not in raw:
         return raw.decode("utf-8", "replace")
-    return json.loads(b'"' + raw + b'"')
+    return cast(str, json.loads(b'"' + raw + b'"'))
 
 
 class BodyInspector:
@@ -161,6 +224,15 @@ class BodyInspector:
     строковым значением, любые иные (другая строка, null, число, массив, объект) — BadRequestError (иначе прокси
     и upstream могли бы выбрать разные модели). Незавершённый токен дочитывается при следующем `feed` (позиция в строке запоминается — без квадратичной деградации).
     """
+
+    _max: int
+    _buf: bytearray
+    _pos: int
+    _state: int
+    _depth: int
+    _model_seen: bool
+    _str_quote: int
+    _str_scan: int
 
     def __init__(self, max_bytes: int):
         self._max = max_bytes
@@ -334,6 +406,10 @@ class RouteDecision:
 class ModelRouter:
     """Сопоставление имени модели с пулом: явный `pool` адаптера, иначе правила по порядку, затем `default_pool`."""
 
+    _default: str
+    _fallback: str
+    _pools: Mapping[str, PoolConfig]
+
     def __init__(self, config: BridgeConfig):
         self._rules: list[tuple[RuleConfig, re.Pattern[str] | None]] = [
             (rule, re.compile(rule.match_regex) if rule.match_regex else None) for rule in config.rules
@@ -395,6 +471,9 @@ class Classification:
 
 class RegionErrorClassifier:
     """Отличает гео-блокировку 403 от auth/quota/WAF по сигнатурам в теле ответа."""
+
+    _signatures: tuple[str, ...]
+    _max_decoded: int
 
     def __init__(self, signatures: Iterable[str], max_decoded_bytes: int = 65536):
         self._signatures = tuple(s.lower() for s in signatures if s)

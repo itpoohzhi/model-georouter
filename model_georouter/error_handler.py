@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .errors import (
@@ -37,7 +38,7 @@ RETRY_AFTER_SECONDS = 5
 @dataclass(frozen=True)
 class ErrorResponse:
     status: int
-    payload: dict
+    payload: dict[str, dict[str, object]]
     headers: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -48,7 +49,7 @@ class ErrorResponse:
         return json_response_bytes(self.status, self.payload, self.headers)
 
 
-def json_response_bytes(status: int, payload: dict, headers: dict[str, str] | None = None) -> bytes:
+def json_response_bytes(status: int, payload: Mapping[str, object], headers: dict[str, str] | None = None) -> bytes:
     """Полный HTTP/1.1-ответ с JSON-телом и `Connection: close`."""
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     lines = [
@@ -72,11 +73,11 @@ class ErrorHandler:
         *,
         retryable: bool,
         headers: dict[str, str] | None = None,
-        extra: dict | None = None,
+        extra: dict[str, object] | None = None,
     ) -> ErrorResponse:
         if status == 403:  # инвариант: сбой транспорта не маскируется под отказ в доступе
             status = 502
-        error = {"type": etype, "message": mask_secrets(message), "retryable": retryable}
+        error: dict[str, object] = {"type": etype, "message": mask_secrets(message), "retryable": retryable}
         error.update(extra or {})
         return ErrorResponse(status, {"error": error}, dict(headers or {}))
 

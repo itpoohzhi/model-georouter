@@ -9,9 +9,9 @@ from .base import clean_path
 
 
 class AdminProvider(Protocol):
-    def health_payload(self) -> dict: ...
+    def health_payload(self) -> dict[str, object]: ...
 
-    def metrics_payload(self) -> dict: ...
+    def metrics_payload(self) -> dict[str, object]: ...
 
     def flush_cache(self) -> int: ...
 
@@ -24,7 +24,7 @@ ADMIN_METHODS = {
 
 
 class AdminAdapter:
-    name = "admin"
+    name: str = "admin"
 
     def matches(self, path: str) -> bool:
         try:
@@ -32,7 +32,7 @@ class AdminAdapter:
         except BadRequestError:  # некорректный путь не может быть админским
             return False
 
-    def handle(self, method: str, path: str, provider: AdminProvider) -> tuple[int, dict, dict[str, str]]:
+    def handle(self, method: str, path: str, provider: AdminProvider) -> tuple[int, dict[str, object], dict[str, str]]:
         """Вернуть (status, JSON-payload, extra headers)."""
         path = clean_path(path)
         allowed = ADMIN_METHODS[path]

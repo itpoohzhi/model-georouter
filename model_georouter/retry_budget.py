@@ -5,13 +5,18 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, replace
+from typing import TypeGuard
 
-__all__ = ["AttemptEvent", "AttemptState", "EgressDeadline", "RetryBudgetSpec", "transition"]
+from .errors import ConfigError
+
+__all__ = ["F08_V2_CLIENT_MARGIN", "F08_V2_NON_STREAM_DEADLINE", "F08_V2_POLICY", "F08_V2_RISK_ACK", "F08_V2_STREAM_MARKER", "F08_V2_T_IDLE", "F08_V2_T_PRE", "AttemptEvent", "AttemptState", "EgressDeadline", "F08V2Budget", "RetryBudgetSpec", "transition", "validate_f08_v2"]  # fmt: skip
 
 _F08_MAX_TOTAL_EGRESS_SECONDS = 40.0
 _F08_MAX_CONNECT_SECONDS = 3.0
 _F08_MAX_PRE_SEND_RETRIES = 2
 _F08_MAX_PRIMARY_HEADER_SECONDS = 5.0
+F08_V2_POLICY, F08_V2_STREAM_MARKER, F08_V2_RISK_ACK = "v2", "streamGenerateContent", "AD-003/2026-11-14"
+F08_V2_T_PRE, F08_V2_T_IDLE, F08_V2_NON_STREAM_DEADLINE, F08_V2_CLIENT_MARGIN = 19.0, 150.0, 40.0, 11.0
 
 
 def _require_finite_positive(value: float, name: str) -> None:
@@ -71,6 +76,63 @@ class EgressDeadline:
         if remaining <= 0.0:
             raise TimeoutError("egress deadline expired")
         return min(requested_timeout, remaining)
+
+    def slide(self, idle_seconds: float = F08_V2_T_IDLE, *, now: float | None = None) -> EgressDeadline:
+        """Сбросить скользящий дедлайн чтения при получении очередного чанка."""
+        return EgressDeadline.from_timeout(idle_seconds, started_at=now)
+
+
+@dataclass(frozen=True, slots=True)
+class F08V2Budget:
+    """Бюджет политики F-08v2 (AD-003, вариант B: 19s до первого байта + 150s скользящий stream)."""
+
+    t_pre: float = F08_V2_T_PRE
+    t_idle: float = F08_V2_T_IDLE
+    non_stream_deadline: float = F08_V2_NON_STREAM_DEADLINE
+    scope: str = F08_V2_STREAM_MARKER
+    client_timeout_s: float | None = None
+    f08_v2_risk_ack: str | None = None
+    T_pre: float = F08_V2_T_PRE
+    T_idle: float = F08_V2_T_IDLE
+
+    def resolve_for_path(self, path: str, *, deadline: EgressDeadline | None = None, started_at: float | None = None) -> tuple[EgressDeadline, float, float | None]:  # fmt: skip
+        """Вычислить `(deadline, t_pre, sliding_idle_s)` для HTTP-пути запроса."""
+        dl = deadline or EgressDeadline.from_timeout(self.t_idle if self.scope in path else self.non_stream_deadline, started_at=started_at)  # fmt: skip
+        return dl, self.t_pre, (self.t_idle if self.scope in path else None)
+
+
+def _is_finite_num(val: object) -> TypeGuard[int | float]:
+    return not isinstance(val, bool) and isinstance(val, int | float) and math.isfinite(val)
+
+
+def validate_f08_v2(t_pre: object = F08_V2_T_PRE, t_idle: object = F08_V2_T_IDLE, client_timeout_s: object = None, f08_v2_risk_ack: object = None, scope: object = F08_V2_STREAM_MARKER, *, T_pre: object = None, T_idle: object = None, non_stream_deadline: object = F08_V2_NON_STREAM_DEADLINE) -> F08V2Budget:  # fmt: skip
+    """Проверить инварианты политики F-08v2 (fail-closed) и вернуть подтверждённый `F08V2Budget`."""
+    pre, idle = (t_pre if T_pre is None else T_pre), (t_idle if T_idle is None else T_idle)
+    if (
+        not _is_finite_num(pre)
+        or float(pre) != F08_V2_T_PRE
+        or not _is_finite_num(idle)
+        or float(idle) != F08_V2_T_IDLE
+    ):
+        raise ConfigError(f"f08_v2: T_pre must be 19s and T_idle must be 150s, got T_pre={pre!r}, T_idle={idle!r}")
+    if not _is_finite_num(non_stream_deadline) or float(non_stream_deadline) != F08_V2_NON_STREAM_DEADLINE:
+        raise ConfigError(f"f08_v2.non_stream_deadline: must be 40s, got {non_stream_deadline!r}")
+    if not isinstance(scope, str) or scope != F08_V2_STREAM_MARKER:
+        raise ConfigError(f"f08_v2.scope: must be {F08_V2_STREAM_MARKER!r}, got {scope!r}")
+    if client_timeout_s is not None:
+        if (
+            not _is_finite_num(client_timeout_s)
+            or F08_V2_T_PRE + F08_V2_T_IDLE > float(client_timeout_s) - F08_V2_CLIENT_MARGIN
+        ):
+            raise ConfigError(
+                f"f08_v2.client_timeout_s: T_pre + T_idle must be <= client_timeout_s - 11, got {client_timeout_s!r}"
+            )
+        ct_val: float | None = float(client_timeout_s)
+    elif f08_v2_risk_ack != F08_V2_RISK_ACK:
+        raise ConfigError(f"f08_v2.f08_v2_risk_ack: must be {F08_V2_RISK_ACK!r} when client_timeout_s is None")
+    else:
+        ct_val = None
+    return F08V2Budget(F08_V2_T_PRE, F08_V2_T_IDLE, F08_V2_NON_STREAM_DEADLINE, scope, ct_val, f08_v2_risk_ack if isinstance(f08_v2_risk_ack, str) else None)  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +199,7 @@ class AttemptState:
     status: str = "pending"
     should_penalize: bool = False
     next_pool: str = ""
+    is_long_header: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +219,8 @@ def _should_penalize(state: AttemptState, event: AttemptEvent) -> bool:
     if event.kind == "header_timeout":
         if state.single_proxy:
             return True
+        if state.is_long_header:
+            return False
         if not state.has_alternative and not state.penalize_without_alternative:
             return False
         return state.penalize_on_header_timeout

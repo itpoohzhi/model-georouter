@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
-from collections.abc import Callable
-from typing import Any
+from typing import TypedDict, cast
 
 import pytest
 
 from model_georouter.adapters import (
     AdapterRegistry,
+    AdapterRoute,
     AdminAdapter,
     CloudCodeAdapter,
     CordisAdapter,
@@ -26,7 +27,47 @@ from model_georouter.model_router import (
     ensure_anthropic_thinking_drop_block,
     sanitize_google_v1beta_body,
 )
-from tests.helpers import BridgeHarness, FakeConnectProxy, HttpUpstream, http_request, make_config, respond
+from tests.helpers import FakeConnectProxy, HttpUpstream, Req, http_request, make_config, respond
+from tests.v3_types import StartBridge, Track
+
+
+class GooglePart(TypedDict):
+    text: str
+    thoughtSignature: str
+    functionCall: object
+
+
+class GoogleContent(TypedDict):
+    role: str
+    parts: list[GooglePart]
+
+
+class AdapterPayload(TypedDict):
+    contents: list[GoogleContent]
+    messages: list[dict[str, object]]
+    thinking: dict[str, object]
+    currentTier: dict[str, str]
+    paidTier: dict[str, str]
+    allowedTiers: list[dict[str, str]]
+    ineligibleTiers: list[dict[str, str]]
+    status: str
+    listen: str
+    slots: object
+    pools: dict[str, object]
+    geo_cache: dict[str, int]
+    counters: dict[str, int]
+    geo_cache_entries: int
+    error: dict[str, str]
+
+
+def _load(raw: str | bytes) -> AdapterPayload:
+    return cast(AdapterPayload, json.loads(raw))
+
+
+def _require_route(route: AdapterRoute | None) -> AdapterRoute:
+    assert route is not None
+    return route
+
 
 OPENCODE = OpenCodeAdapter(("/v1", "/go/v1"), "opencode-ai")
 CORDIS = CordisAdapter(("/zen/v1", "/zen/go/v1"), "cordis-ai")
@@ -61,7 +102,7 @@ CLOUDCODE = CloudCodeAdapter(("/cloudcode",), "cloudcode-pa", "route-de")
         ("//v1//chat/completions/", "/inference/openai/v1/chat/completions"),
     ],
 )
-def test_opencode_normalization(incoming, expected):
+def test_opencode_normalization(incoming: str, expected: str) -> None:
     route = OPENCODE.route(incoming)
     assert route is not None and route.path == expected
     assert (route.adapter, route.upstream) == ("opencode", "opencode-ai")
@@ -75,7 +116,7 @@ def test_opencode_normalization(incoming, expected):
         ("//zen//v1/./chat/completions/", "/zen/v1/chat/completions"),
     ],
 )
-def test_cordis_normalization(incoming, expected):
+def test_cordis_normalization(incoming: str, expected: str) -> None:
     route = CORDIS.route(incoming)
     assert route is not None and route.path == expected
     assert route.adapter == "cordis"
@@ -90,13 +131,13 @@ def test_cordis_normalization(incoming, expected):
         ("/messages/count_tokens", "/v1/messages/count_tokens"),
     ],
 )
-def test_generic_normalization(incoming, expected):
+def test_generic_normalization(incoming: str, expected: str) -> None:
     route = GENERIC.route(incoming)
     assert route is not None and route.path == expected
     assert route.upstream == "openrouter-ai"
 
 
-def test_adapters_reject_foreign_paths_on_segment_boundaries():
+def test_adapters_reject_foreign_paths_on_segment_boundaries() -> None:
     assert OPENCODE.route("/v10/x") is None
     assert OPENCODE.route("/zen/v1/x") is None
     assert CORDIS.route("/zen/v10") is None
@@ -107,27 +148,27 @@ def test_adapters_reject_foreign_paths_on_segment_boundaries():
 @pytest.mark.parametrize(
     "path", ["/v1/../etc/passwd", "/v1/%2e%2e/x", "/v1/%2E%2E%2fx/..", "/v1/a\\b", "v1/x", "/v1/\x00"]
 )
-def test_path_traversal_and_garbage_rejected(path):
+def test_path_traversal_and_garbage_rejected(path: str) -> None:
     with pytest.raises(BadRequestError):
-        clean_path(path)
+        _ = clean_path(path)
 
 
-def test_registry_picks_longest_prefix_across_adapters():
+def test_registry_picks_longest_prefix_across_adapters() -> None:
     registry = AdapterRegistry.from_config(
         parse_config({"server": {"listen": "127.0.0.1", "port": 1}, "pools": {}, "rules": []})
     )
-    assert registry.resolve("/v1/messages").adapter == "opencode"
-    assert registry.resolve("/go/v1/messages").adapter == "opencode"
-    assert registry.resolve("/zen/v1/messages").adapter == "cordis"
-    assert registry.resolve("/zen/go/v1/messages").adapter == "cordis"
-    assert registry.resolve("/messages").adapter == "generic"
-    assert registry.resolve("/chat/completions").path == "/v1/chat/completions"
+    assert _require_route(registry.resolve("/v1/messages")).adapter == "opencode"
+    assert _require_route(registry.resolve("/go/v1/messages")).adapter == "opencode"
+    assert _require_route(registry.resolve("/zen/v1/messages")).adapter == "cordis"
+    assert _require_route(registry.resolve("/zen/go/v1/messages")).adapter == "cordis"
+    assert _require_route(registry.resolve("/messages")).adapter == "generic"
+    assert _require_route(registry.resolve("/chat/completions")).path == "/v1/chat/completions"
     assert registry.resolve("/nothing/here") is None
     with pytest.raises(BadRequestError):
-        registry.resolve("/v1/../x")
+        _ = registry.resolve("/v1/../x")
 
 
-def test_registry_honours_configured_prefixes():
+def test_registry_honours_configured_prefixes() -> None:
     cfg = parse_config(
         {
             "server": {"listen": "127.0.0.1", "port": 1},
@@ -138,6 +179,7 @@ def test_registry_honours_configured_prefixes():
     )
     registry = AdapterRegistry.from_config(cfg)
     route = registry.resolve("/oc/chat/completions")
+    assert route is not None
     assert (route.adapter, route.upstream) == ("opencode", "cordis-ai")
     assert registry.resolve("/v1/chat/completions") is None
 
@@ -151,21 +193,23 @@ SG_CONFIG = {
 }
 
 
-def test_passthrough_adapter_strips_longest_prefix():
+def test_passthrough_adapter_strips_longest_prefix() -> None:
     adapter = PassthroughAdapter(("/sg", "/sg/kimi"), "vendor-ai", "route-sg", name="sg-kimi")
-    assert adapter.route("/sg/kimi/chat/completions").path == "/chat/completions"
-    assert adapter.route("/sg/kimi").path == "/"
-    assert adapter.route("/sg/kimi/").path == "/"
-    assert adapter.route("/sg/other").path == "/other"
+    assert _require_route(adapter.route("/sg/kimi/chat/completions")).path == "/chat/completions"
+    assert _require_route(adapter.route("/sg/kimi")).path == "/"
+    assert _require_route(adapter.route("/sg/kimi/")).path == "/"
+    assert _require_route(adapter.route("/sg/other")).path == "/other"
     assert adapter.route("/other") is None
     route = adapter.route("/sg/kimi/v1/messages")
+    assert route is not None
     assert (route.adapter, route.upstream, route.pool) == ("sg-kimi", "vendor-ai", "route-sg")
 
 
-def test_registry_builds_custom_adapters_from_config():
+def test_registry_builds_custom_adapters_from_config() -> None:
     cfg = parse_config({"server": {"listen": "127.0.0.1", "port": 1}, "rules": [], **SG_CONFIG})
     registry = AdapterRegistry.from_config(cfg)
     route = registry.resolve("/sg-vendor/chat/completions")
+    assert route is not None
     assert (route.adapter, route.upstream, route.path, route.pool) == (
         "sg-vendor",
         "vendor-ai",
@@ -178,17 +222,17 @@ def test_registry_builds_custom_adapters_from_config():
 
 
 class FakeProvider:
-    def health_payload(self):
+    def health_payload(self) -> dict[str, object]:
         return {"status": "ok"}
 
-    def metrics_payload(self):
+    def metrics_payload(self) -> dict[str, object]:
         return {"counters": {}}
 
-    def flush_cache(self):
+    def flush_cache(self) -> int:
         return 3
 
 
-def test_admin_adapter_dispatch():
+def test_admin_adapter_dispatch() -> None:
     admin = AdminAdapter()
     provider = FakeProvider()
     assert admin.matches("/health") and admin.matches("/metrics") and admin.matches("/cache/flush")
@@ -197,25 +241,28 @@ def test_admin_adapter_dispatch():
     assert admin.handle("GET", "/metrics", provider)[1] == {"counters": {}}
     assert admin.handle("POST", "/cache/flush", provider)[1] == {"flushed": 3}
     status, payload, headers = admin.handle("GET", "/cache/flush", provider)
-    assert status == 405 and headers["Allow"] == "POST" and payload["error"]["type"] == "method_not_allowed"
+    assert status == 405 and headers["Allow"] == "POST"
+    assert payload["error"] == {"type": "method_not_allowed", "message": "use POST", "retryable": False}
     assert admin.handle("POST", "/health", provider)[0] == 405
 
 
 # ───────────────────────────── через живой сервер ─────────────────────────────
 
 
-def echo_path(conn, req):
+def echo_path(conn: socket.socket, req: Req) -> None:
     respond(conn, 200, req.path.encode(), {"Content-Type": "text/plain"})
 
 
-def test_health_reports_split_slots_and_pools(track, start_bridge):
+def test_health_reports_split_slots_and_pools(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
     bridge = start_bridge(
-        make_config(upstream.port, pools={"route-de": {"type": "http_connect", "proxies": ["http://127.0.0.1:9"]}})
+        make_config(
+            cast(int, upstream.port), pools={"route-de": {"type": "http_connect", "proxies": ["http://127.0.0.1:9"]}}
+        )
     )
     response = http_request(bridge.port, "GET", "/health")
     assert response.status == 200 and response.headers["content-type"] == "application/json"
-    health = response.json
+    health = _load(response.body)
     assert health["status"] == "ok" and health["listen"].startswith("127.0.0.1:")
     assert health["slots"] == {
         "direct": {"limit": 16, "in_use": 0, "available": 16},
@@ -226,15 +273,15 @@ def test_health_reports_split_slots_and_pools(track, start_bridge):
     assert upstream.requests == []  # admin-пути не уходят в upstream
 
 
-def test_metrics_and_cache_flush_endpoints(track, start_bridge):
+def test_metrics_and_cache_flush_endpoints(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     bridge.server.geo_cache.mark_blocked("opencode-ai", "m1")
     bridge.server.geo_cache.mark_blocked("opencode-ai", "m2")
     assert http_request(bridge.port, "GET", "/cache/flush").status == 405
     flushed = http_request(bridge.port, "POST", "/cache/flush")
-    assert flushed.status == 200 and flushed.json == {"flushed": 2}
-    metrics = http_request(bridge.port, "GET", "/metrics").json
+    assert flushed.status == 200 and cast(object, flushed.json) == {"flushed": 2}
+    metrics = _load(http_request(bridge.port, "GET", "/metrics").body)
     assert metrics["counters"]["requests_total"] >= 3
     assert metrics["geo_cache_entries"] == 0
 
@@ -250,9 +297,11 @@ def test_metrics_and_cache_flush_endpoints(track, start_bridge):
         ("/chat/completions", "/v1/chat/completions"),
     ],
 )
-def test_adapters_rewrite_paths_toward_upstream(track, start_bridge, ingress, upstream_path):
+def test_adapters_rewrite_paths_toward_upstream(
+    track: Track, start_bridge: StartBridge, ingress: str, upstream_path: str
+) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     response = http_request(
         bridge.port,
         "POST",
@@ -269,25 +318,30 @@ def test_adapters_rewrite_paths_toward_upstream(track, start_bridge, ingress, up
     assert seen.headers["content-length"] == "13"
 
 
-def test_upstream_base_path_is_prepended(track, start_bridge):
+def test_upstream_base_path_is_prepended(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
     config = make_config(
-        upstream.port,
+        cast(int, upstream.port),
         upstreams={
-            "openrouter-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False, "base_path": "/api"}
+            "openrouter-ai": {
+                "host": "127.0.0.1",
+                "port": cast(int, upstream.port),
+                "use_tls": False,
+                "base_path": "/api",
+            }
         },
     )
     bridge = start_bridge(config)
-    http_request(bridge.port, "POST", "/chat/completions", b"{}")
+    _ = http_request(bridge.port, "POST", "/chat/completions", b"{}")
     assert upstream.requests[0].path == "/api/v1/chat/completions"
 
 
-def test_custom_adapter_rewrites_path_and_prepends_base_path(track, start_bridge):
+def test_custom_adapter_rewrites_path_and_prepends_base_path(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
     config = make_config(
-        upstream.port,
+        cast(int, upstream.port),
         upstreams={
-            "vendor-ai": {"host": "127.0.0.1", "port": upstream.port, "use_tls": False, "base_path": "/v1"},
+            "vendor-ai": {"host": "127.0.0.1", "port": cast(int, upstream.port), "use_tls": False, "base_path": "/v1"},
         },
         adapters={
             "sg-vendor": {"prefixes": ["/sg-vendor"], "upstream": "vendor-ai"},
@@ -299,13 +353,13 @@ def test_custom_adapter_rewrites_path_and_prepends_base_path(track, start_bridge
     assert upstream.requests[0].path == "/v1/chat/completions"
 
 
-def test_unknown_path_and_traversal_get_json_errors(track, start_bridge):
+def test_unknown_path_and_traversal_get_json_errors(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     missing = http_request(bridge.port, "GET", "/nothing")
-    assert missing.status == 404 and missing.json["error"]["type"] == "not_found"
+    assert missing.status == 404 and _load(missing.body)["error"]["type"] == "not_found"
     traversal = http_request(bridge.port, "GET", "/v1/../health")
-    assert traversal.status == 400 and traversal.json["error"]["type"] == "bad_request"
+    assert traversal.status == 400 and _load(traversal.body)["error"]["type"] == "bad_request"
     assert upstream.requests == []
 
 
@@ -322,28 +376,28 @@ def test_unknown_path_and_traversal_get_json_errors(track, start_bridge):
         "/v1/a%2Fb",
     ],
 )
-def test_clean_path_rejects_double_encoded_traversal(path):
+def test_clean_path_rejects_double_encoded_traversal(path: str) -> None:
     with pytest.raises(BadRequestError):
-        clean_path(path)
+        _ = clean_path(path)
 
 
-def test_clean_path_keeps_dots_inside_legit_segments():
+def test_clean_path_keeps_dots_inside_legit_segments() -> None:
     assert clean_path("/v1/gpt-4.1//x/") == "/v1/gpt-4.1/x"
 
 
-def test_double_encoded_traversal_gets_400_from_live_server(track, start_bridge):
+def test_double_encoded_traversal_gets_400_from_live_server(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     for path in ("/v1/%2e%2e%2fsecret", "/v1/%252e%252e/secret"):
         response = http_request(bridge.port, "GET", path)
-        assert response.status == 400 and response.json["error"]["type"] == "bad_request"
+        assert response.status == 400 and _load(response.body)["error"]["type"] == "bad_request"
     assert upstream.requests == []
 
 
 @pytest.mark.parametrize("path", ["/health", "/metrics"])
-def test_admin_head_returns_headers_without_body(track, start_bridge, path):  # RW-012
+def test_admin_head_returns_headers_without_body(track: Track, start_bridge: StartBridge, path: str) -> None:  # RW-012
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     head = http_request(bridge.port, "HEAD", path)
     get = http_request(bridge.port, "GET", path)
     assert head.status == 200 and head.body_raw == b""
@@ -352,9 +406,11 @@ def test_admin_head_returns_headers_without_body(track, start_bridge, path):  # 
     assert head.headers["connection"] == "close"
 
 
-def test_admin_head_on_post_only_endpoint_is_405_without_body(track, start_bridge):  # RW-012
+def test_admin_head_on_post_only_endpoint_is_405_without_body(
+    track: Track, start_bridge: StartBridge
+) -> None:  # RW-012
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     head = http_request(bridge.port, "HEAD", "/cache/flush")
     assert head.status == 405 and head.body_raw == b"" and head.headers["allow"] == "POST"
 
@@ -362,11 +418,13 @@ def test_admin_head_on_post_only_endpoint_is_405_without_body(track, start_bridg
 @pytest.mark.parametrize(
     "method, path, status", [("POST", "/cache/flush", 200), ("POST", "/health", 405), ("POST", "/metrics", 405)]
 )
-def test_admin_early_response_drains_request_body(track, start_bridge, method, path, status):  # RW-002
+def test_admin_early_response_drains_request_body(
+    track: Track, start_bridge: StartBridge, method: str, path: str, status: int
+) -> None:  # RW-002
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     response = http_request(bridge.port, method, path, b"x" * (8 * 1024 * 1024))
-    assert response.status == status and response.json
+    assert response.status == status and cast(object, response.json)
     assert upstream.requests == []
 
 
@@ -375,14 +433,14 @@ def test_admin_early_response_drains_request_body(track, start_bridge, method, p
 SKIP_SIG = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I="
 
 
-def _dump(payload: dict[str, Any]) -> bytes:
+def _dump(payload: object) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops() -> None:
     assert SKIP_THOUGHT_SIGNATURE_VALIDATOR == SKIP_SIG
     leaked = "<unused94>thought\nplan<unused95>Real text\nend.]]> Let's stop.]]> Let's end.]]> Let's stop.]]>"
-    payload = {
+    payload: dict[str, object] = {
         "contents": [
             {"role": "user", "parts": [{"text": "hi"}]},
             {
@@ -395,17 +453,19 @@ def test_sanitize_google_v1beta_body_injects_thought_signature_and_strips_loops(
             },
         ]
     }
-    out = json.loads(sanitize_google_v1beta_body(_dump(payload)))
+    out = _load(sanitize_google_v1beta_body(_dump(payload)))
     parts = out["contents"][1]["parts"]
     assert parts[0]["thoughtSignature"] == SKIP_SIG
     assert parts[1]["thoughtSignature"] == "existing-sig"
     assert parts[2] == {"text": "Real text"}
-    assert out["contents"][0] == payload["contents"][0]
+    assert out["contents"][0] == cast(list[object], payload["contents"])[0]
 
 
 def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part() -> None:
-    payload = {"contents": [{"role": "model", "parts": [{"text": "<unused94>thought\nonly thinking<unused95>"}]}]}
-    out = json.loads(sanitize_google_v1beta_body(_dump(payload)))
+    payload: dict[str, object] = {
+        "contents": [{"role": "model", "parts": [{"text": "<unused94>thought\nonly thinking<unused95>"}]}]
+    }
+    out = _load(sanitize_google_v1beta_body(_dump(payload)))
     assert out["contents"][0]["parts"] == [{"text": " "}]
 
 
@@ -428,7 +488,7 @@ def test_sanitize_google_v1beta_body_drops_empty_text_parts_but_keeps_one_part()
                         "parts": [
                             {
                                 "text": "Keep <x><![CDATA[a]]></x> <x><![CDATA[b]]></x> "
-                                "<x><![CDATA[c]]></x> <x><![CDATA[d]]></x>  "
+                                + "<x><![CDATA[c]]></x> <x><![CDATA[d]]></x>  "
                             }
                         ],
                     }
@@ -444,12 +504,12 @@ def test_sanitize_google_v1beta_body_returns_same_bytes_without_mutation(raw: by
     assert raw is out
 
 
-def test_google_v1beta_route_sanitizes_body_and_updates_content_length(
-    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
-) -> None:
+def test_google_v1beta_route_sanitizes_body_and_updates_content_length(track: Track, start_bridge: StartBridge) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
-    payload = {"contents": [{"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]}]}
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
+    payload: dict[str, object] = {
+        "contents": [{"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]}]
+    }
     raw = _dump(payload)
     response = http_request(
         bridge.port,
@@ -461,7 +521,7 @@ def test_google_v1beta_route_sanitizes_body_and_updates_content_length(
     assert response.status == 200
     seen = upstream.requests[0]
     assert seen.path.startswith("/inference/go/google/v1beta/models/gemini-4-argon-contributor:streamGenerateContent")
-    sent = json.loads(seen.body)
+    sent = _load(seen.body)
     assert sent["contents"][0]["parts"][0]["thoughtSignature"] == SKIP_SIG
     assert seen.body != raw
     assert seen.headers["content-length"] == str(len(seen.body))
@@ -479,7 +539,7 @@ def test_sanitize_google_v1beta_body_strips_loop_after_long_whitespace_prefix_qu
     text = "Answer" + " " * 20000 + "end.]]> Let's stop.]]> stop.]]> end.]]>"
     raw = _dump({"contents": [{"role": "model", "parts": [{"text": text}]}]})
     started = time.perf_counter()
-    out = json.loads(sanitize_google_v1beta_body(raw))
+    out = _load(sanitize_google_v1beta_body(raw))
     assert time.perf_counter() - started < 0.2
     assert out["contents"][0]["parts"] == [{"text": "Answer"}]
 
@@ -495,7 +555,7 @@ def test_sanitize_google_v1beta_body_strips_loop_after_long_whitespace_prefix_qu
 )
 def test_sanitize_google_v1beta_body_strips_loop_with_bare_marker(text: str) -> None:
     raw = _dump({"contents": [{"role": "model", "parts": [{"text": text}]}]})
-    out = json.loads(sanitize_google_v1beta_body(raw))
+    out = _load(sanitize_google_v1beta_body(raw))
     assert out["contents"][0]["parts"] == [{"text": "Answer"}]
 
 
@@ -506,41 +566,40 @@ def test_sanitize_google_v1beta_body_survives_unpaired_surrogate() -> None:
     )
     out = sanitize_google_v1beta_body(raw)
     assert out is not raw
-    parsed = json.loads(out)
+    parsed = _load(out)
     assert parsed["contents"][0]["parts"][0]["thoughtSignature"] == SKIP_SIG
     assert parsed["contents"][1]["parts"][0]["text"] == "\ud800"
 
 
 def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_attempts(
-    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
+    track: Track, start_bridge: StartBridge
 ) -> None:
     region_body = b'{"error":{"type":"RegionError","message":"not available in your region"}}'
 
-    def region_blocked(conn: Any, req: Any) -> None:
+    def region_blocked(conn: socket.socket, _req: Req) -> None:
         respond(conn, 403, region_body, {"Content-Type": "application/json"})
 
-    def ok(conn: Any, req: Any) -> None:
+    def ok(conn: socket.socket, _req: Req) -> None:
         respond(conn, 200, b"served-via-proxy", {"Content-Type": "text/plain"})
 
     direct_up = track(HttpUpstream(region_blocked))
     proxied_up = track(HttpUpstream(ok))
-    proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
+    proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, proxied_up.port))))
     bridge = start_bridge(
         make_config(
-            direct_up.port,
-            pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{proxy.port}"]}},
+            cast(int, direct_up.port),
+            pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{cast(int, proxy.port)}"]}},
             geo_fallback_pool="route-de",
             server={"geo_error_signatures": ["RegionError"]},
         )
     )
-    raw = _dump(
-        {
-            "contents": [
-                {"role": "user", "parts": [{"text": "Привет, мир"}]},
-                {"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]},
-            ]
-        }
-    )
+    payload: dict[str, object] = {
+        "contents": [
+            {"role": "user", "parts": [{"text": "Привет, мир"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "bash", "args": {}}}]},
+        ]
+    }
+    raw = _dump(payload)
     response = http_request(
         bridge.port,
         "POST",
@@ -553,7 +612,7 @@ def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_
     first, second = direct_up.requests[0], proxied_up.requests[0]
     assert first.body == second.body != raw
     assert "Привет, мир" in first.body.decode("utf-8")
-    assert json.loads(first.body)["contents"][1]["parts"][0]["thoughtSignature"] == SKIP_SIG
+    assert _load(first.body)["contents"][1]["parts"][0]["thoughtSignature"] == SKIP_SIG
     assert first.headers["content-length"] == second.headers["content-length"] == str(len(first.body))
 
 
@@ -562,7 +621,7 @@ def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_
 
 @pytest.mark.parametrize("thinking_type", ["adaptive", "enabled"])
 def test_ensure_anthropic_thinking_drop_block_injects_binding(thinking_type: str) -> None:
-    payload = {
+    payload: dict[str, object] = {
         "model": "claude-haiku-5-5",
         "thinking": {"type": thinking_type, "display": "summarized"},
         "messages": [{"role": "user", "content": "hi"}],
@@ -570,7 +629,7 @@ def test_ensure_anthropic_thinking_drop_block_injects_binding(thinking_type: str
     raw = _dump(payload)
     out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
     assert needs_beta is True and out is not raw
-    sent = json.loads(out)
+    sent = _load(out)
     assert sent["thinking"] == {
         "type": thinking_type,
         "display": "summarized",
@@ -607,17 +666,17 @@ def test_ensure_anthropic_thinking_drop_block_survives_unpaired_surrogate() -> N
     raw = b'{"thinking":{"type":"adaptive"},"messages":[{"role":"user","content":"\\ud800"}]}'
     out, needs_beta = ensure_anthropic_thinking_drop_block(raw)
     assert needs_beta is True and out is not raw
-    parsed = json.loads(out)
+    parsed = _load(out)
     assert parsed["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
     assert parsed["messages"][0]["content"] == "\ud800"
 
 
 def test_anthropic_messages_route_injects_drop_block_and_merges_beta_header(
-    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]
+    track: Track, start_bridge: StartBridge
 ) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
-    payload = {
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
+    payload: dict[str, object] = {
         "model": "claude-haiku-5-5",
         "max_tokens": 16,
         "thinking": {"type": "adaptive", "display": "summarized"},
@@ -638,7 +697,7 @@ def test_anthropic_messages_route_injects_drop_block_and_merges_beta_header(
     assert response.status == 200
     seen = upstream.requests[0]
     assert seen.path == "/inference/go/anthropic/v1/messages"
-    sent = json.loads(seen.body)
+    sent = _load(seen.body)
     assert sent["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "drop_block"}
     betas = [token.strip() for token in seen.headers["anthropic-beta"].split(",")]
     assert betas == ["interleaved-thinking-2025-05-14", THINKING_BINDING_BETA]
@@ -656,10 +715,10 @@ def test_anthropic_messages_route_injects_drop_block_and_merges_beta_header(
     ],
 )
 def test_anthropic_messages_route_leaves_other_requests_untouched(
-    track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness], payload: dict[str, Any]
+    track: Track, start_bridge: StartBridge, payload: dict[str, object]
 ) -> None:
     upstream = track(HttpUpstream(echo_path))
-    bridge = start_bridge(make_config(upstream.port))
+    bridge = start_bridge(make_config(cast(int, upstream.port)))
     raw = _dump(payload)
     response = http_request(bridge.port, "POST", "/go/v1/messages", raw, {"Content-Type": "application/json"})
     assert response.status == 200
@@ -668,7 +727,7 @@ def test_anthropic_messages_route_leaves_other_requests_untouched(
     assert "anthropic-beta" not in seen.headers
 
 
-def test_cloudcode_normalization():
+def test_cloudcode_normalization() -> None:
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
     assert route.adapter == "cloudcode"
@@ -687,12 +746,12 @@ def test_cloudcode_normalization():
     assert CLOUDCODE.route("/other/endpoint") is None
 
 
-def test_cloudcode_wants_transform():
+def test_cloudcode_wants_transform() -> None:
     route_assist = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route_assist is not None
-    head_200 = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
-    head_403 = ResponseHead("HTTP/1.1", 403, "Forbidden", (("Content-Type", "application/json"),))
-    head_500 = ResponseHead("HTTP/1.1", 500, "Internal Server Error", (("Content-Type", "application/json"),))
+    head_200 = ResponseHead("HTTP/1.1", 200, "OK", [("Content-Type", "application/json")])
+    head_403 = ResponseHead("HTTP/1.1", 403, "Forbidden", [("Content-Type", "application/json")])
+    head_500 = ResponseHead("HTTP/1.1", 500, "Internal Server Error", [("Content-Type", "application/json")])
 
     assert CLOUDCODE.wants_transform(route_assist, head_200) is True
     assert CLOUDCODE.wants_transform(route_assist, head_403) is False
@@ -703,20 +762,20 @@ def test_cloudcode_wants_transform():
     assert CLOUDCODE.wants_transform(route_other, head_200) is False
 
 
-def test_cloudcode_transform_response_strips_unsupported_location():
+def test_cloudcode_transform_response_strips_unsupported_location() -> None:
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
     head = ResponseHead(
         "HTTP/1.1",
         200,
         "OK",
-        (
+        [
             ("Content-Type", "application/json"),
             ("Content-Length", "999"),
             ("Transfer-Encoding", "chunked"),
-        ),
+        ],
     )
-    original = {
+    original: dict[str, object] = {
         "currentTier": {"id": "standard-tier"},
         "paidTier": {"id": "g1-ultra-tier"},
         "allowedTiers": [{"tierId": "standard-tier"}],
@@ -725,7 +784,7 @@ def test_cloudcode_transform_response_strips_unsupported_location():
     body = json.dumps(original).encode("utf-8")
     new_head, new_body = CLOUDCODE.transform_response(route, head, body)
 
-    transformed = json.loads(new_body)
+    transformed = _load(new_body)
     assert transformed["currentTier"] == {"id": "standard-tier"}
     assert transformed["paidTier"] == {"id": "g1-ultra-tier"}
     assert transformed["allowedTiers"] == [{"tierId": "standard-tier"}]
@@ -734,11 +793,11 @@ def test_cloudcode_transform_response_strips_unsupported_location():
     assert new_head.get("transfer-encoding") is None
 
 
-def test_cloudcode_transform_response_preserves_other_reasons():
+def test_cloudcode_transform_response_preserves_other_reasons() -> None:
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
-    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
-    original = {
+    head = ResponseHead("HTTP/1.1", 200, "OK", [("Content-Type", "application/json")])
+    original: dict[str, object] = {
         "currentTier": {"id": "standard-tier"},
         "ineligibleTiers": [{"reasonCode": "PAYMENT_REQUIRED", "tierId": "premium-tier"}],
     }
@@ -748,17 +807,17 @@ def test_cloudcode_transform_response_preserves_other_reasons():
     assert new_head == head
 
 
-def test_cloudcode_transform_response_fail_safe_on_invalid_json():
+def test_cloudcode_transform_response_fail_safe_on_invalid_json() -> None:
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
-    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
+    head = ResponseHead("HTTP/1.1", 200, "OK", [("Content-Type", "application/json")])
     invalid_body = b"not a valid json {{"
     new_head, new_body = CLOUDCODE.transform_response(route, head, invalid_body)
     assert new_body == invalid_body
     assert new_head == head
 
 
-def test_cloudcode_transform_response_handles_gzip():
+def test_cloudcode_transform_response_handles_gzip() -> None:
     import gzip
 
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
@@ -767,40 +826,40 @@ def test_cloudcode_transform_response_handles_gzip():
         "HTTP/1.1",
         200,
         "OK",
-        (
+        [
             ("Content-Type", "application/json"),
             ("Content-Encoding", "gzip"),
-        ),
+        ],
     )
-    original = {
+    original: dict[str, object] = {
         "currentTier": {"id": "standard-tier"},
         "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
     }
     compressed = gzip.compress(json.dumps(original).encode("utf-8"))
     new_head, new_body = CLOUDCODE.transform_response(route, head, compressed)
 
-    transformed = json.loads(new_body)
+    transformed = _load(new_body)
     assert transformed["ineligibleTiers"] == []
     assert new_head.get("content-encoding") is None
     assert new_head.get("content-length") == str(len(new_body))
 
 
-def test_cloudcode_bridge_end_to_end(track: Callable[[Any], Any], start_bridge: Callable[..., BridgeHarness]):
-    google_payload = {
+def test_cloudcode_bridge_end_to_end(track: Track, start_bridge: StartBridge) -> None:
+    google_payload: dict[str, object] = {
         "currentTier": {"id": "standard-tier"},
         "paidTier": {"id": "g1-ultra-tier"},
         "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
     }
     encoded = json.dumps(google_payload).encode("utf-8")
 
-    def upstream_handler(conn: Any, req: Any):
+    def upstream_handler(conn: socket.socket, req: Req) -> None:
         assert req.path == "/v1internal:loadCodeAssist"
         respond(conn, 200, encoded, {"Content-Type": "application/json"})
 
     up = track(HttpUpstream(upstream_handler))
     cfg = make_config(
-        up.port,
-        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": up.port, "use_tls": False}},
+        cast(int, up.port),
+        upstreams={"cloudcode-pa": {"host": "127.0.0.1", "port": cast(int, up.port), "use_tls": False}},
         adapters={"cloudcode": {"prefixes": ["/cloudcode"], "upstream": "cloudcode-pa"}},
     )
     bridge = start_bridge(cfg)
@@ -813,19 +872,19 @@ def test_cloudcode_bridge_end_to_end(track: Callable[[Any], Any], start_bridge: 
         {"Content-Type": "application/json"},
     )
     assert response.status == 200
-    data = json.loads(response.body)
+    data = _load(response.body)
     assert data["currentTier"] == {"id": "standard-tier"}
     assert data["paidTier"] == {"id": "g1-ultra-tier"}
     assert data["ineligibleTiers"] == []
     assert response.headers["content-length"] == str(len(response.body))
 
 
-def test_cloudcode_transform_response_requires_tier():
+def test_cloudcode_transform_response_requires_tier() -> None:
     """Без currentTier и без paidTier ineligibleTiers НЕ удаляются (RW-002)."""
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
-    head = ResponseHead("HTTP/1.1", 200, "OK", (("Content-Type", "application/json"),))
-    original = {
+    head = ResponseHead("HTTP/1.1", 200, "OK", [("Content-Type", "application/json")])
+    original: dict[str, object] = {
         "ineligibleTiers": [{"reasonCode": "UNSUPPORTED_LOCATION", "tierId": "free-tier"}],
     }
     body = json.dumps(original).encode("utf-8")
@@ -834,7 +893,7 @@ def test_cloudcode_transform_response_requires_tier():
     assert new_head == head
 
 
-def test_cloudcode_transform_response_handles_corrupt_gzip():
+def test_cloudcode_transform_response_handles_corrupt_gzip() -> None:
     """Повреждённый gzip-поток (zlib.error / BadGzipFile) возвращает исходный ответ без исключения (RW-003)."""
     route = CLOUDCODE.route("/cloudcode/v1internal:loadCodeAssist")
     assert route is not None
@@ -842,10 +901,10 @@ def test_cloudcode_transform_response_handles_corrupt_gzip():
         "HTTP/1.1",
         200,
         "OK",
-        (
+        [
             ("Content-Type", "application/json"),
             ("Content-Encoding", "gzip"),
-        ),
+        ],
     )
     # Валидный заголовок gzip, но повреждённый deflate-поток
     corrupt_gzip = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xff\xff\x00\x00"
