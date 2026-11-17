@@ -4,12 +4,28 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TypeGuard
 
 from .errors import ConfigError
+from .transport_failover import (
+    MAX_RETRY_RATIO,
+    MAX_TOTAL_ATTEMPTS,
+    NO_RETRY_HEADER,
+    STATELESS_GENERATION_ENDPOINTS,
+    BreakerState,
+    RetryReservation,
+    RouteCandidate,
+    RouteCircuitBreaker,
+    TokenBucketRetryBudget,
+    evaluate_replay,
+    panic_open_candidates,
+    run_failover,
+    select_next_route,
+)
 
-__all__ = ["F08_V2_CLIENT_MARGIN", "F08_V2_NON_STREAM_DEADLINE", "F08_V2_POLICY", "F08_V2_RISK_ACK", "F08_V2_STREAM_MARKER", "F08_V2_T_IDLE", "F08_V2_T_PRE", "AttemptEvent", "AttemptState", "EgressDeadline", "F08V2Budget", "RetryBudgetSpec", "transition", "validate_f08_v2"]  # fmt: skip
+__all__ = ["BRIDGE_OWNER", "F08_V2_CLIENT_MARGIN", "F08_V2_NON_STREAM_DEADLINE", "F08_V2_POLICY", "F08_V2_RISK_ACK", "F08_V2_STREAM_MARKER", "F08_V2_T_IDLE", "F08_V2_T_PRE", "GEOROUTER_OWNER", "MAX_RETRY_RATIO", "MAX_TOTAL_ATTEMPTS", "NO_OWNER", "NO_RETRY_HEADER", "STATELESS_GENERATION_ENDPOINTS", "AttemptEvent", "AttemptState", "BreakerState", "EgressDeadline", "F08V2Budget", "RetryBudgetSpec", "RetryReservation", "RouteCandidate", "RouteCircuitBreaker", "TokenBucketRetryBudget", "bridge_replay_allowed", "consume_live_retry", "effective_attempt_cap", "evaluate_replay", "evaluate_replay_for_endpoint", "no_retry_requested", "normalize_endpoint", "panic_open_candidates", "parse_control_headers", "resolve_retry_owner", "run_failover", "select_next_route", "transition", "validate_f08_v2"]
 
 _F08_MAX_TOTAL_EGRESS_SECONDS = 40.0
 _F08_MAX_CONNECT_SECONDS = 3.0
@@ -20,18 +36,14 @@ F08_V2_T_PRE, F08_V2_T_IDLE, F08_V2_NON_STREAM_DEADLINE, F08_V2_CLIENT_MARGIN = 
 
 
 def _require_finite_positive(value: float, name: str) -> None:
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be finite and positive")
-
+    if not math.isfinite(value) or value <= 0: raise ValueError(f"{name} must be finite and positive")  # fmt: skip
 
 def _require_finite_non_negative(value: float, name: str) -> None:
-    if not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be finite and non-negative")
+    if not math.isfinite(value) or value < 0: raise ValueError(f"{name} must be finite and non-negative")  # fmt: skip
 
 
 def _require_non_negative_integer(value: object, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0: raise ValueError(f"{name} must be a non-negative integer")  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,20 +73,16 @@ class EgressDeadline:
     def remaining(self, *, now: float | None = None) -> float:
         """Вернуть неотрицательный остаток общего бюджета в секундах."""
         current = time.monotonic() if now is None else now
-        if not math.isfinite(current):
-            raise ValueError("now must be finite")
+        if not math.isfinite(current): raise ValueError("now must be finite")
         return max(0.0, self.absolute_deadline - current)
-
     def expired(self, *, now: float | None = None) -> bool:
         """Проверить, исчерпан ли общий egress-бюджет."""
         return self.remaining(now=now) <= 0.0
-
     def clamp(self, requested_timeout: float, *, now: float | None = None) -> float:
         """Ограничить таймаут фазы остатком общего дедлайна."""
         _require_finite_positive(requested_timeout, "requested_timeout")
         remaining = self.remaining(now=now)
-        if remaining <= 0.0:
-            raise TimeoutError("egress deadline expired")
+        if remaining <= 0.0: raise TimeoutError("egress deadline expired")
         return min(requested_timeout, remaining)
 
     def slide(self, idle_seconds: float = F08_V2_T_IDLE, *, now: float | None = None) -> EgressDeadline:
@@ -244,3 +252,49 @@ def transition(state: AttemptState, event: AttemptEvent) -> AttemptState:
             next_pool=state.fallback_pool,
         )
     return replace(state, status="failed", should_penalize=penalize, next_pool="")
+
+
+# --- Фасад W3-политики (`transport_failover`) для bridge / geo-router ---
+
+BRIDGE_OWNER, GEOROUTER_OWNER, NO_OWNER = "BRIDGE_OWNER", "GEOROUTER_OWNER", "NONE"
+_OWNER_BY_LABEL = {"cli-agent-bridge": BRIDGE_OWNER, "model-georouter": GEOROUTER_OWNER}
+
+def parse_control_headers(headers: Mapping[str, object]) -> dict[str, str]:
+    """Разобрать управляющие заголовки запроса ОДИН раз на запрос (lower-case, strip)."""
+    return {str(key).strip().lower(): str(value).strip() for key, value in headers.items()}
+def no_retry_requested(control: Mapping[str, str]) -> bool:
+    """Доверенный `X-Georouter-No-Retry` может запрещать повторы, но не разрешать их."""
+    return control.get(NO_RETRY_HEADER.lower(), "").lower() in {"1", "true", "yes"}
+def resolve_retry_owner(control: Mapping[str, str], declared: str = "") -> str:
+    """Владелец retry; расхождение поля и заголовка трактуется как `NO_OWNER` (fail-closed)."""
+    field, published = declared.strip().upper(), _OWNER_BY_LABEL.get(control.get("x-failover-owner", ""), "")
+    if field and published and field != published: return NO_OWNER
+    if no_retry_requested(control): return BRIDGE_OWNER
+    resolved = published or field
+    return resolved if resolved in (BRIDGE_OWNER, GEOROUTER_OWNER) else NO_OWNER
+def effective_attempt_cap(control: Mapping[str, str], owner: str, configured: int = MAX_TOTAL_ATTEMPTS) -> int:
+    """Число физических попыток; клиентские заголовки никогда не увеличивают бюджет."""
+    if owner != GEOROUTER_OWNER or no_retry_requested(control): return 1
+    return max(1, min(MAX_TOTAL_ATTEMPTS, configured))
+def normalize_endpoint(path: str) -> str:
+    """F-113: stateless-проверка идёт по нормализованному path без query-string."""
+    return path.split("?", 1)[0].strip() or "/"
+def is_stateless_endpoint(path: str) -> bool:
+    """F-113: stateless-эндпоинт определяется по нормализованному path."""
+    return normalize_endpoint(path) in STATELESS_GENERATION_ENDPOINTS
+def evaluate_replay_for_endpoint(facts: Mapping[str, object]) -> dict[str, object]:
+    """Replay-контракт W3, но с F-113-нормализацией endpoint перед проверкой."""
+    return evaluate_replay({**facts, "endpoint": normalize_endpoint(str(facts.get("endpoint") or "/"))})
+def consume_live_retry(headers: Mapping[str, object], budget: TokenBucketRetryBudget, *, enabled: bool, declared: str = "", configured: int = MAX_TOTAL_ATTEMPTS) -> bool:  # fmt: skip
+    """F-004/F-112: primary не блокируется пустым bucket; replay требует потреблённого токена."""
+    if not enabled: return False
+    control = parse_control_headers(headers)
+    cap = effective_attempt_cap(control, resolve_retry_owner(control, declared), configured)
+    reservation = budget.reserve_upfront(max(1, cap), cap) if cap > 1 else None
+    if reservation is None or not reservation.consume_one(): return False
+    _ = reservation.release_unused()
+    return True
+def bridge_replay_allowed(headers: Mapping[str, object]) -> bool:
+    """Фасад geo-replay: заголовки клиента могут только запретить replay, но не разрешить его."""
+    control = parse_control_headers(headers)
+    return not no_retry_requested(control) and resolve_retry_owner(control) != BRIDGE_OWNER
