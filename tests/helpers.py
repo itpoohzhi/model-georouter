@@ -342,9 +342,15 @@ def make_config(
     upstream_port: int,
     pools: dict[str, Any] | None = None,
     rules: list[dict[str, Any]] | None = None,
+    failover: bool = False,
     **extra: Any,
 ) -> dict[str, Any]:
-    """Конфигурация моста для тестов: все три upstream указывают на один фейковый порт без TLS."""
+    """Конфигурация моста для тестов: все три upstream указывают на один фейковый порт без TLS.
+
+    ``failover=True`` включает replay-бюджет: без явного sizing'а
+    ``FailoverConfig.capacity = rps_peak * sla_p99_seconds == 0``, поэтому bucket
+    обрезает все токены в ноль и replay/geo-fallback просто не срабатывает.
+    """
     server = {
         "listen": LOCALHOST,
         "port": 0,
@@ -367,6 +373,11 @@ def make_config(
         "rules": rules or [],
     }
     config.update(extra)
+    if failover:
+        failover_section = dict(config.get("failover") or {})
+        failover_section.setdefault("rps_peak", 10.0)
+        failover_section.setdefault("sla_p99_seconds", 1.0)
+        config["failover"] = failover_section
     return config
 
 
@@ -379,6 +390,16 @@ class BridgeHarness:
     def close(self) -> None:
         self.server.stop()
         self.thread.join(1.0)
+
+    def prime_replay_tokens(self, count: int = 5) -> None:
+        """Насыпать replay-токены в bucket, как будто primary уже принимал запросы.
+
+        Bucket пустой на старте, поэтому тесты штатного replay/geo-fallback обязаны
+        сначала накопить токены (по умолчанию 5 admit'ов → 1 токен при ratio=0.20).
+        """
+        budget = self.server.config_manager.retry_budget
+        for _ in range(count):
+            budget.mint_on_admitted_primary()
 
     def health(self) -> dict[str, Any]:
         return http_request(self.port, "GET", "/health").json

@@ -591,8 +591,10 @@ def test_google_v1beta_replay_sends_normalized_body_with_correct_length_on_both_
             pools={"route-de": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{cast(int, proxy.port)}"]}},
             geo_fallback_pool="route-de",
             server={"geo_error_signatures": ["RegionError"]},
+            failover=True,
         )
     )
+    bridge.prime_replay_tokens()
     payload: dict[str, object] = {
         "contents": [
             {"role": "user", "parts": [{"text": "Привет, мир"}]},

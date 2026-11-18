@@ -211,7 +211,8 @@ def test_region_403_is_replayed_once_via_fallback_and_cached(track, start_bridge
     direct_up = track(HttpUpstream(region_blocked))
     proxied_up = track(HttpUpstream(ok_responder(b"served-via-proxy")))
     proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
-    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de"))
+    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de", failover=True))
+    bridge.prime_replay_tokens(10)  # два независимых replay: первый запрос и запрос другой модели
     payload = body_for("gpt-5", "x" * 1000)
 
     first = http_request(bridge.port, "POST", PATH, payload)
@@ -241,7 +242,8 @@ def test_replay_happens_exactly_once_even_if_fallback_also_says_region_error(tra
     direct_up = track(HttpUpstream(region_blocked))
     proxied_up = track(HttpUpstream(region_blocked))
     proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
-    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de"))
+    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de", failover=True))
+    bridge.prime_replay_tokens()
     response = http_request(bridge.port, "POST", PATH, body_for("gpt-5"))
     assert response.status == 403 and response.body == REGION_BODY  # ответ fallback-а отдаётся как есть
     assert len(direct_up.requests) == 1 and len(proxied_up.requests) == 1  # третьего запроса нет
@@ -295,7 +297,8 @@ def test_region_403_with_chunked_body_is_detected(track, start_bridge):
     direct_up = track(HttpUpstream(region_chunked))
     proxied_up = track(HttpUpstream(ok_responder(b"proxy-ok")))
     proxy = track(FakeConnectProxy(target=("127.0.0.1", proxied_up.port)))
-    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de"))
+    bridge = start_bridge(make_config(direct_up.port, pools=proxy_pools(proxy.port), geo_fallback_pool="route-de", failover=True))
+    bridge.prime_replay_tokens()
     assert http_request(bridge.port, "POST", PATH, body_for("m")).body == b"proxy-ok"
 
 
@@ -375,8 +378,10 @@ def test_region_403_with_dead_fallback_returns_502_not_403(track, start_bridge):
             direct_up.port,
             pools={"route-de": {"type": "http_connect", "proxies": [dead]}},
             geo_fallback_pool="route-de",
+            failover=True,
         )
     )
+    bridge.prime_replay_tokens()
     response = http_request(bridge.port, "POST", PATH, body_for("gpt-5"))
     assert response.status == 502 and response.json["error"]["retryable"] is True
     assert bridge.server.geo_cache.is_blocked("opencode-ai", "gpt-5")  # блокировка всё равно запомнена

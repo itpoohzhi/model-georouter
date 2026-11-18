@@ -255,8 +255,11 @@ def test_bridge_single_proxy_failover_on_penalized_and_header_timeout(track, sta
     p_pool = {"type": "http_connect", "proxies": [f"http://127.0.0.1:{bad_proxy.port}"]}
     fb_pool = {"type": "http_connect", "proxies": [f"http://127.0.0.1:{good_proxy.port}"]}
     pools, rules = {"primary": p_pool, "route-de": fb_pool}, [{"match_prefix": ["m"], "pool": "primary"}]
-    cfg = make_config(good_up.port, headers_timeout=0.1, pools=pools, rules=rules, geo_fallback_pool="route-de")
+    cfg = make_config(
+        good_up.port, headers_timeout=0.1, pools=pools, rules=rules, geo_fallback_pool="route-de", failover=True
+    )
     bridge = start_bridge(cfg)
+    bridge.prime_replay_tokens(10)  # два replay: по одному на запрос
     resp1 = http_request(bridge.port, "POST", "/v1/chat/completions", b'{"model":"m"}')
     assert resp1.status == 200 and resp1.body == b"fallback-ok"
     ep = bridge.server.proxy_manager.endpoints(bridge.server.config_manager.get().pools["primary"])[0]

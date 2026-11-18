@@ -4,9 +4,24 @@ import logging
 
 import pytest
 
+from model_georouter import bridge_server
 from tests.helpers import BridgeHarness
 
 LOGGER = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_breakers():
+    """Breakers — module-global по паре (upstream, pool); чистим их между тестами.
+
+    Иначе накопленные отказы одного теста открывают breaker для следующего,
+    и replay/geo-fallback молча перестаёт срабатывать.
+    """
+    with bridge_server._BREAKER_LOCK:
+        bridge_server._BREAKERS.clear()
+    yield
+    with bridge_server._BREAKER_LOCK:
+        bridge_server._BREAKERS.clear()
 
 
 @pytest.fixture
