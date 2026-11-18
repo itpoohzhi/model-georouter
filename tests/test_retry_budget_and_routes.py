@@ -86,6 +86,8 @@ def _diagnostic_metrics(body: bytes) -> dict[str, int]:
         metrics = Metrics()
         object.__setattr__(handler, "server", SimpleNamespace(metrics=metrics))
         handler.status, handler.committed, handler.outcome, handler.bytes_sent = 0, False, "-", 0
+        object.__setattr__(handler, "pool_name", "direct")
+        object.__setattr__(handler, "retry_allowed", False)
         snapshot = SimpleNamespace(server=SimpleNamespace(body_timeout=0.2, inactivity_timeout=0.2))
 
         def no_result(*_args: object) -> None:
@@ -151,6 +153,7 @@ def _dual_pool_config(upstream_port: int, de_port: int, nl_port: int, **server_o
         rules=[{"match_prefix": ["claude-"], "pool": "route-de"}],
         geo_fallback_pool="route-nl",
         server=server,
+        failover=True,
     )
 
 
@@ -230,6 +233,7 @@ def test_single_pool_connect_stall_fails_over_to_geo_fallback_under_7s(track: Tr
     nl_up = track(HttpUpstream(lambda conn, _req: respond(conn, 200, b"via-nl")))
     nl_proxy = track(FakeConnectProxy(target=("127.0.0.1", cast(int, nl_up.port))))
     bridge = start_bridge(_dual_pool_config(cast(int, nl_up.port), cast(int, de_hang.port), cast(int, nl_proxy.port)))
+    bridge.prime_replay_tokens(10)  # два replay: по одному на запрос
 
     started = time.monotonic()
     first = http_request(bridge.port, "POST", PATH, BODY)
@@ -268,6 +272,7 @@ def test_single_pool_post_connect_header_stall_penalizes_and_fails_over_under_7s
         )
     )
     bridge.server.retry_budget = RetryBudgetSpec(primary_first_header_timeout=0.3)
+    bridge.prime_replay_tokens()
 
     started = time.monotonic()
     resp = http_request(bridge.port, "POST", PATH, BODY)
@@ -303,6 +308,7 @@ def test_shared_monotonic_egress_deadline_clamps_connect_send_and_headers(
             headers_timeout=30.0,
         )
     )
+    bridge.prime_replay_tokens()
 
     started = time.monotonic()
     resp = http_request(bridge.port, "POST", PATH, BODY)

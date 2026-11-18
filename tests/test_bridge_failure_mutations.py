@@ -294,6 +294,7 @@ def test_direct_region_403_replays_once_to_fallback(track, start_bridge) -> None
             direct.port,
             pools={"route-nl": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{fallback_proxy.port}"]}},
             geo_fallback_pool="route-nl",
+            failover=True,
         )
     )
     bridge.prime_replay_tokens()
@@ -321,6 +322,7 @@ def test_successful_primary_neither_spends_retry_token_nor_skips_minting(track, 
             primary.port,
             pools={"route-nl": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{fallback_proxy.port}"]}},
             geo_fallback_pool="route-nl",
+            failover=True,
         )
     )
     bridge.prime_replay_tokens()
@@ -344,6 +346,7 @@ def test_open_breaker_sends_new_requests_to_fallback_instead_of_dead_primary(tra
             direct.port,
             pools={"route-nl": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{fallback_proxy.port}"]}},
             geo_fallback_pool="route-nl",
+            failover=True,
         )
     )
     route = bridge.server.runtime_for(bridge.server.config_manager.get()).registry.resolve(PATH)
@@ -401,6 +404,7 @@ def _precommit_config(direct_port: int, fallback_port: int, **server: object) ->
         direct_port,
         pools={"route-nl": {"type": "http_connect", "proxies": [f"http://127.0.0.1:{fallback_port}"]}},
         geo_fallback_pool="route-nl",
+        failover=True,
         server={"headers_timeout": 0.1, "total_egress_deadline": 2.0, "connect_timeout": 0.5, **server},
     )
 
