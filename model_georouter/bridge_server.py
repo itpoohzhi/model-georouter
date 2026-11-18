@@ -60,11 +60,21 @@ from .model_router import (
 )
 from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
-from .retry_budget import AttemptEvent, AttemptState, EgressDeadline, RetryBudgetSpec, transition
+from .retry_budget import (
+    GEOROUTER_OWNER,
+    AttemptEvent,
+    AttemptState,
+    EgressDeadline,
+    RetryBudgetSpec,
+    RouteCircuitBreaker,
+    bridge_replay_allowed,
+    consume_live_retry,
+    evaluate_replay_for_endpoint,
+    transition,
+)
 from .upstream_state import UpstreamStateWriter
 
 LOGGER = get_logger("model_georouter.server")
-_RETRY_BUDGET = RetryBudgetSpec()
 
 DIAGNOSTIC_BODY_LIMIT = 16384
 DRAIN_MAX_SECONDS = 2.0
@@ -74,6 +84,7 @@ OVERLOADED_503 = (
     b"Connection: close\r\nContent-Length: 20\r\n\r\nService Unavailable\n"
 )
 SKIPPED_REQUEST_HEADERS = frozenset({"host", "accept-encoding", "content-length", "expect"})
+_REPLAY_FLAGS = {"header_timeout": "timed_out", "protocol_error": "protocol_error"}
 
 
 # ───────────────────────────── слоты и метрики ─────────────────────────────
@@ -90,8 +101,7 @@ class SlotPool:
         self._limit, self._in_use, self._lock = limit, 0, threading.Lock()
 
     def resize(self, limit: int) -> None:
-        with self._lock:
-            self._limit = limit
+        with self._lock: self._limit = limit
 
     def try_acquire(self) -> bool:
         with self._lock:
@@ -101,8 +111,7 @@ class SlotPool:
             return True
 
     def release(self) -> None:
-        with self._lock:
-            self._in_use = max(0, self._in_use - 1)
+        with self._lock: self._in_use = max(0, self._in_use - 1)
 
     def stats(self) -> dict[str, int]:
         with self._lock:
@@ -115,8 +124,7 @@ class SlotLease:
 
     def release(self) -> None:
         pool, self._pool = self._pool, None
-        if pool is not None:
-            pool.release()
+        if pool is not None: pool.release()
 
 
 class SplitSlots:
@@ -148,8 +156,7 @@ class Metrics:
             self._counters[name] = self._counters.get(name, 0) + amount
 
     def snapshot(self) -> dict[str, int]:
-        with self._lock:
-            return dict(self._counters)
+        with self._lock: return dict(self._counters)
 
 
 class BoundedCollector:
@@ -168,10 +175,8 @@ class BoundedCollector:
 
     def add(self, chunk: bytes) -> None:
         room = self._limit - len(self.data)
-        if room > 0:
-            self.data += chunk[:room]
-        if len(chunk) > max(room, 0):
-            self.truncated = True
+        if room > 0: self.data += chunk[:room]
+        if len(chunk) > max(room, 0): self.truncated = True
 
 
 @dataclass(frozen=True)
@@ -257,8 +262,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
 
     @property
     def ssl_context(self) -> ssl.SSLContext:
-        if self._ssl_context is None:
-            self._ssl_context = ssl.create_default_context()
+        if self._ssl_context is None: self._ssl_context = ssl.create_default_context()
         return self._ssl_context
 
     def runtime_for(self, snapshot: BridgeConfig) -> _Runtime:
@@ -286,11 +290,9 @@ class BridgeServer(socketserver.ThreadingTCPServer):
             self.metrics.incr("status_503")
             self.metrics.incr("rejected_503")
             try:
-                request.settimeout(0.5)
-                request.sendall(OVERLOADED_503)
-                request.shutdown(socket.SHUT_WR)
+                request.settimeout(0.5); request.sendall(OVERLOADED_503); request.shutdown(socket.SHUT_WR)
                 request.setblocking(False)  # дренаж без ожидания: accept-цикл не должен простаивать
-                _ = request.recv(65536)  # вычитать пришедшее без ожидания: закрытие с непрочитанным даёт RST
+                _ = request.recv(65536)  # вычитать пришедшее: закрытие с непрочитанным даёт RST
             except OSError:
                 pass
             self.shutdown_request(request)
@@ -302,13 +304,9 @@ class BridgeServer(socketserver.ThreadingTCPServer):
             raise
 
     @override
-    def process_request_thread(
-        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
-    ) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.ingress.release()
+    def process_request_thread(self, request: socket.socket | tuple[bytes, socket.socket], client_address: object) -> None:  # fmt: skip
+        try: super().process_request_thread(request, client_address)
+        finally: self.ingress.release()
 
     def start_background(self) -> threading.Thread:
         thread = threading.Thread(target=self.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
@@ -316,37 +314,23 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         self._threads.append(thread)
         return thread
 
-    def stop(self) -> None:
-        self.shutdown()
-        self.server_close()
+    def stop(self) -> None: self.shutdown(); self.server_close()
 
     # --- AdminProvider ---
 
     def health_payload(self) -> dict[str, object]:
         snapshot = self.config_manager.get()
         host, port = self.server_address[:2]
-        return {
-            "status": "ok",
-            "service": SERVICE_NAME,
-            "service_aliases": list(SERVICE_NAME_ALIASES),
-            "version": __version__,
-            "listen": f"{host}:{port}",
-            "slots": self.slots.stats(),
-            "pools": self.proxy_manager.stats(snapshot.pools.values()),
-            "geo_cache": {"entries": len(self.geo_cache)},
-            "config_error": self.config_manager.last_error,
-        }
+        return {"status": "ok", "service": SERVICE_NAME, "service_aliases": list(SERVICE_NAME_ALIASES),
+                "version": __version__, "listen": f"{host}:{port}", "slots": self.slots.stats(),
+                "pools": self.proxy_manager.stats(snapshot.pools.values()),
+                "geo_cache": {"entries": len(self.geo_cache)}, "config_error": self.config_manager.last_error}
 
     def metrics_payload(self) -> dict[str, object]:
-        return {
-            "counters": self.metrics.snapshot(),
-            "slots": self.slots.stats(),
-            "geo_cache_entries": len(self.geo_cache),
-            "uptime_seconds": round(time.monotonic() - self.started_at, 3),
-        }
+        return {"counters": self.metrics.snapshot(), "slots": self.slots.stats(),
+                "geo_cache_entries": len(self.geo_cache), "uptime_seconds": round(time.monotonic() - self.started_at, 3)}
 
-    def flush_cache(self) -> int:
-        return self.geo_cache.flush()
+    def flush_cache(self) -> int: return self.geo_cache.flush()
 
 
 # ───────────────────────────── обработчик соединения ─────────────────────────────
@@ -354,6 +338,17 @@ class BridgeServer(socketserver.ThreadingTCPServer):
 
 def _is_direct(pool: PoolConfig) -> bool:
     return pool.type == "direct"
+
+
+_BREAKERS: dict[str, RouteCircuitBreaker] = {}
+_BREAKER_LOCK = threading.Lock()
+
+
+def _breaker(route_id: str, pool: str = "") -> RouteCircuitBreaker:
+    """F-003: живой breaker на пару (upstream, pool); пустой pool — legacy-ключ route_id."""
+    key = f"{pool}:{route_id}" if pool else route_id
+    with _BREAKER_LOCK:
+        return _BREAKERS.setdefault(key, RouteCircuitBreaker(key))
 
 
 _CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
@@ -410,10 +405,11 @@ class _Handler(socketserver.BaseRequestHandler):
             | None
         ) = None
         self.committed, self.body_done, self.replayed = False, False, False
+        self.retry_allowed: bool = True
         self.started, self.status, self.bytes_sent = time.monotonic(), 0, 0
         self.method, self.path, self.pool_name, self.proxy_endpoint, self.outcome = "-", "-", "-", "-", "-"
         self.model: str | None = None
-        self._last_proxy_endpoint = None
+        self._attempt_ok: bool = False
         super().__init__(request, client_address, server)
 
     @property
@@ -456,14 +452,7 @@ class _Handler(socketserver.BaseRequestHandler):
         except OSError:
             pass
 
-    def _respond_json(
-        self,
-        sock: socket.socket,
-        status: int,
-        payload: dict[str, object],
-        headers: dict[str, str] | None = None,
-        head_only: bool = False,
-    ) -> None:
+    def _respond_json(self, sock: socket.socket, status: int, payload: dict[str, object], headers: dict[str, str] | None = None, head_only: bool = False) -> None:  # fmt: skip
         self.status = status
         self.outcome = "local"
         self._bridge.metrics.incr(f"status_{status}")
@@ -491,10 +480,8 @@ class _Handler(socketserver.BaseRequestHandler):
         self.status = response.status
         self.outcome = "error:" + str(response.payload["error"]["type"])
         srv.metrics.incr(f"status_{response.status}")
-        if response.status == 503:
-            srv.metrics.incr("rejected_503")
-        elif response.status == 413:
-            srv.metrics.incr("rejected_413")
+        if response.status == 503: srv.metrics.incr("rejected_503")
+        elif response.status == 413: srv.metrics.incr("rejected_413")
         self._send_bytes(sock, response.to_bytes())
         if not self.body_done:
             self._drain(sock)
@@ -526,15 +513,8 @@ class _Handler(socketserver.BaseRequestHandler):
     def _log_request(self) -> None:
         LOGGER.info(
             "request method=%s path=%s model=%s pool=%s proxy=%s status=%s outcome=%s bytes=%d replayed=%s dur_ms=%d",
-            self.method,
-            self.path,
-            self.model or "-",
-            self.pool_name,
-            self.proxy_endpoint,
-            self.status or "-",
-            self.outcome,
-            self.bytes_sent,
-            self.replayed,
+            self.method, self.path, self.model or "-", self.pool_name, self.proxy_endpoint,
+            self.status or "-", self.outcome, self.bytes_sent, self.replayed,
             int((time.monotonic() - self.started) * 1000),
         )
 
@@ -575,6 +555,7 @@ class _Handler(socketserver.BaseRequestHandler):
             target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         path, _, query = target.partition("?")
         self.method, self.path = req.method, path
+        self.retry_allowed = bridge_replay_allowed(dict(req.headers))
         srv.metrics.incr("requests_total")
         self.body_done = req.get("content-length") in (None, "0") and req.get("transfer-encoding") is None
         runtime = srv.runtime_for(snapshot)
@@ -594,21 +575,22 @@ class _Handler(socketserver.BaseRequestHandler):
         if decision.source == "geo_cache":
             srv.metrics.incr("geo_cache_hits")
         upstream, fallback = snapshot.upstreams[route.upstream], snapshot.geo_fallback_pool
-        replay_allowed = bool(fallback) and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool])
+        now_tick = int(time.monotonic())
+        replay_pool = fallback if (fallback and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool]) and self.retry_allowed and snapshot.failover.enabled) else ""  # fmt: skip
+        probe = decision.pool if _breaker(route.upstream, decision.pool).try_acquire(now_tick) else ""
+        pool_name, replay_pool = (decision.pool, replay_pool) if probe or not replay_pool else (replay_pool, "")
         budget = srv.admission.f08_v2_budget
-        if budget is not None and egress_admission.is_long_header_path(path):
-            deadline = EgressDeadline.from_timeout(budget.t_idle)
-        else:
-            deadline = EgressDeadline.from_timeout(cfg.total_egress_deadline)
+        deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and egress_admission.is_long_header_path(path) else cfg.total_egress_deadline)  # fmt: skip
         self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
         try:
-            with srv.admission.admit(decision.pool, path, deadline=deadline) as ticket:
-                self._attempt(decision.pool, replay_allowed, ticket.deadline)
+            with srv.admission.admit(pool_name, path, deadline=deadline) as ticket:
+                _ = srv.config_manager.retry_budget.mint_on_admitted_primary()
+                self._attempt(pool_name, replay_pool, ticket.deadline, probe=probe)
         except _ReplayRequested:
             srv.geo_cache.mark_blocked(route.upstream, self.model, cfg.geo_cache_ttl_seconds)
             srv.metrics.incr("replays")
             self.replayed = True
-            self._attempt(fallback, False, deadline, False)
+            self._attempt(fallback, "", deadline, False, fallback if _breaker(route.upstream, fallback).try_acquire(now_tick) else "")  # fmt: skip
 
     def _read_request_body(
         self, sock: socket.socket, req: RequestHead, rest: bytes, limit: int, timeout: float
@@ -649,58 +631,57 @@ class _Handler(socketserver.BaseRequestHandler):
             kind = "penalized" if isinstance(exc, AllProxiesPenalizedError) else "connect_error"
         return AttemptEvent(kind=kind, deadline_expired=deadline.expired(), has_endpoint=endpoint is not None)
 
-    def _attempt(self, pool_name: str, replay: bool, deadline: EgressDeadline, allow_fallback: bool = True) -> None:
+    def _attempt(self, pool_name: str, replay: str, deadline: EgressDeadline, allow_fallback: bool = True, probe: str = "") -> None:  # fmt: skip
         _, snapshot, _, _, route, _, upstream, _ = self._ctx
         long_header = egress_admission.is_long_header_path(route.path)
         srv, cfg, pool = self._bridge, snapshot.server, snapshot.pools[pool_name]
         b, fb, direct = srv.retry_budget, snapshot.geo_fallback_pool, _is_direct(pool)
-        single = allow_fallback and bool(fb) and fb != pool_name and not direct and len(pool.proxies) == 1
+        single = allow_fallback and self.retry_allowed and snapshot.failover.enabled and bool(fb) and fb != pool_name and not direct and len(pool.proxies) == 1  # fmt: skip
         state = AttemptState(
-            pool_name,
-            fb if single else "",
-            single,
-            self.committed,
-            b.penalize_on_header_timeout,
-            has_alternative=single or len(pool.proxies) > 1,
-            penalize_without_alternative=cfg.penalize_header_timeout_without_alternative,
-            is_long_header=long_header,
-        )
+            pool_name, fb if single else "", single, self.committed, b.penalize_on_header_timeout,
+            has_alternative=single or len(pool.proxies) > 1, is_long_header=long_header,
+            penalize_without_alternative=cfg.penalize_header_timeout_without_alternative)
         self.pool_name, self.proxy_endpoint, self._last_proxy_endpoint = pool_name, "-", None
-        if not direct:
-            try:
-                srv.proxy_manager.ensure_available(pool)  # circuit breaker: до слота, за доли миллисекунды
-            except AllProxiesPenalizedError as exc:
-                state = transition(state, self._attempt_event(exc, deadline, None))
-                if state.next_pool:
-                    return self._attempt(state.next_pool, False, deadline, False)
-                raise
-        slot_kind = "direct" if direct else "proxy"
-        lease = srv.slots.acquire(slot_kind, cfg.direct_slots if direct else cfg.proxy_slots)
-        if lease is None:
-            raise SlotsExhaustedError(slot_kind)
         up: socket.socket | None = None
+        lease: SlotLease | None = None
+        self._attempt_ok = False
         try:
+            if not direct:
+                try:
+                    srv.proxy_manager.ensure_available(pool)  # circuit breaker: до слота, за доли миллисекунды
+                except AllProxiesPenalizedError as exc:
+                    event = self._attempt_event(exc, deadline, None)
+                    _breaker(route.upstream, pool_name).record_failure(int(time.monotonic()))
+                    state = transition(state, event)
+                    if state.next_pool and self._live_replay_allowed(0, False, event.kind):
+                        return self._attempt(state.next_pool, "", deadline, False)
+                    raise
+            slot_kind = "direct" if direct else "proxy"
+            lease = srv.slots.acquire(slot_kind, cfg.direct_slots if direct else cfg.proxy_slots)
+            if lease is None:
+                raise SlotsExhaustedError(slot_kind)
             try:
                 up = self._connect_upstream(pool, upstream, deadline, single)
                 self._send_upstream_request(up, cfg.body_timeout, deadline)
-                if long_header:
-                    hdr_wait = cfg.headers_timeout
-                else:
-                    hdr_wait = min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
+                hdr_wait = cfg.headers_timeout if long_header else min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
                 head, rest = self._read_upstream_head(up, hdr_wait, None if long_header else deadline)
             except (AllProxiesPenalizedError, EgressConnectError, UpstreamTimeoutError, UpstreamProtocolError) as exc:
-                state = transition(state, self._attempt_event(exc, deadline, self._last_proxy_endpoint))
+                event = self._attempt_event(exc, deadline, self._last_proxy_endpoint)
+                _breaker(route.upstream, pool_name).record_failure(int(time.monotonic()))
+                state = transition(state, event)
                 if self._last_proxy_endpoint is not None and state.should_penalize:
                     srv.proxy_manager.penalize(self._last_proxy_endpoint, cfg.proxy_fail_penalty_seconds)
-                if not state.next_pool:
-                    raise
+                if state.next_pool and self._live_replay_allowed(0, False, event.kind):
+                    return self._attempt(state.next_pool, "", deadline, False)
+                if replay and self._live_replay_allowed(0, False, self._attempt_event(exc, deadline, None).kind):
+                    raise _ReplayRequested
+                raise
             else:
                 self._finish_upstream_response(up, head, rest, replay)
         finally:
             close_quietly(up)
-            lease.release()
-        if state.next_pool:
-            self._attempt(state.next_pool, False, deadline, False)
+            if lease is not None: lease.release()
+            if probe: _breaker(route.upstream, probe).release_probe(self._attempt_ok, int(time.monotonic()))  # fmt: skip
 
     @staticmethod
     def _read_buffered_body(up: socket.socket, framing: Framing, rest: bytes, timeout: float) -> None:
@@ -736,33 +717,51 @@ class _Handler(socketserver.BaseRequestHandler):
             self.outcome = "client_cancelled"
             srv.metrics.incr("client_cancelled")
 
-    def _finish_upstream_response(self, up: socket.socket, head: ResponseHead, rest: bytes, replay: bool) -> None:
+    def _live_replay_allowed(self, status: int, region: bool, kind: str = "") -> bool:
+        """F-005: fences, breaker и retry-токен до коммита; `effort` пиннится константой (тело шлётся байт-в-байт)."""
+        _, snapshot, _, req, route, _, _, _ = self._ctx
+        if not (self.retry_allowed and snapshot.failover.enabled and (region or kind or 500 <= status < 600)):
+            return False
+        facts: dict[str, object] = {"endpoint": self.path, "status_code": status, "downstream_committed": False,
+            "tool_side_effects": False, "canonical_model_id": self.model, "effort": "bridge-pinned",
+            "retry_owner": GEOROUTER_OWNER, "control_headers": dict(req.headers)}
+        if kind: facts[_REPLAY_FLAGS.get(kind, "connect_error")] = True  # fmt: skip
+        if not evaluate_replay_for_endpoint(facts)["replay_allowed"]: return False
+        if not _breaker(route.upstream, self.pool_name).allows(int(time.monotonic())): return False
+        return consume_live_retry(dict(req.headers), self._bridge.config_manager.retry_budget, enabled=True,
+                                  declared=GEOROUTER_OWNER if snapshot.geo_fallback_pool else "",
+                                  configured=snapshot.failover.max_total_attempts)
+
+    def _finish_upstream_response(self, up: socket.socket, head: ResponseHead, rest: bytes, replay: str) -> None:
         _, snapshot, runtime, req, route, *_ = self._ctx
         srv, cfg = self._bridge, snapshot.server
         adapter = runtime.registry.get(route.adapter)
+        ok, status = 200 <= head.status < 300, head.status
+        self._attempt_ok, breaker = ok, _breaker(route.upstream, self.pool_name)
+        if ok: breaker.record_success()
+        else: breaker.record_failure(int(time.monotonic()), client_validation=400 <= status < 500 and status not in (403, 429))  # fmt: skip
         if adapter and adapter.wants_transform(route, head):
             body = bytearray()
-            framing = framing_for_response(req.method, head.status, head.headers, body.extend)
+            framing = framing_for_response(req.method, status, head.headers, body.extend)
             self._read_buffered_body(up, framing, rest, cfg.body_timeout)
             return self._send_transformed_response(*adapter.transform_response(route, head, bytes(body)))
-        framing = framing_for_response(req.method, head.status, head.headers)
-        initial, initial_fed = rest, False
-        if head.status == 403 and replay:
+        framing = framing_for_response(req.method, status, head.headers)
+        initial, initial_fed, region = rest, False, False
+        if head.status == 403:
             collector = BoundedCollector(DIAGNOSTIC_BODY_LIMIT)
             framing = framing_for_response(req.method, head.status, head.headers, collector.add)
             initial, initial_fed = self._read_diagnostic(up, framing, collector, rest, cfg.body_timeout), True
             result = runtime.classifier.classify(403, bytes(collector.data), head.get("content-encoding"))
             srv.metrics.incr("classified_403_region" if result.is_region_error else "classified_403_plain")
-            if result.is_region_error:
-                raise _ReplayRequested
+            region = result.is_region_error
             if collector.truncated or (collector.full and not framing.complete):
                 srv.metrics.incr("classified_403_truncated")
                 LOGGER.warning("403 body exceeds %d bytes: signatures beyond it are not checked", DIAGNOSTIC_BODY_LIMIT)
+        if replay and not ok and self._live_replay_allowed(head.status, region):
+            raise _ReplayRequested
         self._relay(up, head, framing, initial, initial_fed)
 
-    def _connect_upstream(
-        self, pool: PoolConfig, up: UpstreamConfig, dl: EgressDeadline, single: bool = False
-    ) -> socket.socket:
+    def _connect_upstream(self, pool: PoolConfig, up: UpstreamConfig, dl: EgressDeadline, single: bool = False) -> socket.socket:  # fmt: skip
         return self._bridge.egress.connect(pool, (up.host, up.port), replace(EgressSettings.from_server(self._ctx[1].server)), handler=(self, dl, EgressTimeoutError), up=up, single=single)  # fmt: skip
 
     def _send_upstream_request(self, up: socket.socket, timeout: float, dl: EgressDeadline | None = None) -> None:

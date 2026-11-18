@@ -20,22 +20,12 @@ from typing import cast
 from .errors import ConfigError
 from .logging_utils import get_logger
 from .proxy_pool import parse_proxy_url
-from .retry_budget import RetryBudgetSpec
+from .retry_budget import MAX_RETRY_RATIO, MAX_TOTAL_ATTEMPTS, RetryBudgetSpec, TokenBucketRetryBudget
 
 __all__ = [
-    "FORBIDDEN_ROUTE_DE_PORTS",
-    "AdapterConfig",
-    "BridgeConfig",
-    "ConfigError",
-    "ConfigManager",
-    "PoolConfig",
-    "RuleConfig",
-    "ServerConfig",
-    "UpstreamConfig",
-    "default_config_path",
-    "default_log_dir",
-    "load_config_file",
-    "parse_config",
+    "FORBIDDEN_ROUTE_DE_PORTS", "AdapterConfig", "BridgeConfig", "ConfigError", "ConfigManager", "FailoverConfig",
+    "PoolConfig", "RuleConfig", "ServerConfig", "UpstreamConfig", "default_config_path", "default_log_dir",
+    "load_config_file", "parse_config",
 ]
 
 LOGGER = get_logger("model_georouter.config")
@@ -141,6 +131,24 @@ class RuleConfig:
     description: str = ""
 
 
+@dataclass(frozen=True)
+class FailoverConfig:
+    """Failover-бюджет: `capacity = rps_peak * sla_p99_seconds`; без sizing — disabled (fail-closed)."""
+    max_total_attempts: int = MAX_TOTAL_ATTEMPTS
+    retry_ratio: float = MAX_RETRY_RATIO
+    rps_peak: float | None = None
+    sla_p99_seconds: float | None = None
+
+    @property
+    def capacity(self) -> float:
+        """Ёмкость token-bucket за окно SLA; `0.0` без полного sizing."""
+        return 0.0 if self.rps_peak is None or self.sla_p99_seconds is None else self.rps_peak * self.sla_p99_seconds
+    @property
+    def enabled(self) -> bool:
+        """Failover активен только при полном sizing и положительной ёмкости."""
+        return self.capacity > 0.0
+
+
 @dataclass(frozen=True, eq=False)
 class BridgeConfig:
     """Неизменяемый снимок конфигурации; активный запрос держит ссылку на «свой» снимок."""
@@ -152,6 +160,7 @@ class BridgeConfig:
     rules: tuple[RuleConfig, ...]
     default_pool: str = "direct"
     geo_fallback_pool: str = ""
+    failover: FailoverConfig = field(default_factory=FailoverConfig)
 
 
 DEFAULT_UPSTREAMS = {
@@ -176,19 +185,13 @@ def _mapping(value: object, path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"{path}: expected object, got {type(value).__name__}")
     return cast(Mapping[str, object], value)
-
-
-def _integer(
-    section: Mapping[str, object], key: str, default: int, path: str, minimum: int = 0, maximum: int | None = None
-) -> int:
+def _integer(section: Mapping[str, object], key: str, default: int, path: str, minimum: int = 0, maximum: int | None = None) -> int:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{path}.{key}: expected integer, got {type(value).__name__}")
     if value < minimum or (maximum is not None and value > maximum):
         raise ConfigError(f"{path}.{key}: {value} is out of range")
     return value
-
-
 def _finite_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None) -> float:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -202,45 +205,59 @@ def _finite_number(section: Mapping[str, object], key: str, default: float, path
     if not math.isfinite(number):
         raise ConfigError(f"{path}.{key}: must be finite")
     return number
-
-
-def _positive_number(
-    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
-) -> float:
-    value = _finite_number(section, key, default, path, maximum)
-    if value <= 0:
+def _positive_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None) -> float:
+    if (value := _finite_number(section, key, default, path, maximum)) <= 0:
         raise ConfigError(f"{path}.{key}: must be positive")
     return value
-
-
-def _non_negative_number(
-    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
-) -> float:
-    value = _finite_number(section, key, default, path, maximum)
-    if value < 0:
+def _non_negative_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None) -> float:
+    if (value := _finite_number(section, key, default, path, maximum)) < 0:
         raise ConfigError(f"{path}.{key}: must be non-negative")
     return value
-
-
 def _string(section: Mapping[str, object], key: str, default: str, path: str) -> str:
     value = section.get(key, default)
     if not isinstance(value, str):
         raise ConfigError(f"{path}.{key}: expected string, got {type(value).__name__}")
     return value
-
-
 def _boolean(section: Mapping[str, object], key: str, default: bool, path: str) -> bool:
     value = section.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{path}.{key}: expected boolean, got {type(value).__name__}")
     return value
-
-
 def _string_list(section: Mapping[str, object], key: str, default: tuple[str, ...], path: str) -> tuple[str, ...]:
     value = section.get(key, list(default))
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in cast(list[object], value)):
         raise ConfigError(f"{path}.{key}: expected list of non-empty strings")
     return tuple(cast(list[str], value))
+def _pick(section: Mapping[str, object], *names: str) -> object:
+    """Первое присутствующее значение по списку синонимов ключа."""
+    return next((section[name] for name in names if name in section), None)
+def _size(value: object) -> float | None:
+    """Положительное конечное число sizing-параметра, иначе `None` (fail-closed)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+def _parse_failover(root: Mapping[str, object]) -> FailoverConfig:
+    """Жёсткие потолки attempts/ratio → `ConfigError`; неполный sizing лишь выключает failover."""
+    merged: dict[str, object] = dict(root)
+    for key in ("server", "failover", "retry_budget"):
+        if isinstance(section := root.get(key), Mapping):
+            merged.update(cast(Mapping[str, object], section))
+    attempts = _pick(merged, "max_total_attempts", "A_max")
+    attempts = MAX_TOTAL_ATTEMPTS if attempts is None else attempts
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= MAX_TOTAL_ATTEMPTS:
+        raise ConfigError(f"failover.max_total_attempts: expected integer in [1, {MAX_TOTAL_ATTEMPTS}], got {attempts!r}")
+    raw_ratio = _pick(merged, "retry_ratio", "retry_budget_pct")
+    raw_ratio = MAX_RETRY_RATIO if raw_ratio is None else raw_ratio
+    if isinstance(raw_ratio, bool) or not isinstance(raw_ratio, int | float) or not math.isfinite(float(raw_ratio)):
+        raise ConfigError(f"failover.retry_ratio: expected finite number, got {raw_ratio!r}")
+    percent = "retry_budget_pct" in merged and "retry_ratio" not in merged
+    ratio = float(raw_ratio) / 100.0 if percent else float(raw_ratio)
+    if not 0.0 <= ratio <= MAX_RETRY_RATIO:
+        raise ConfigError(f"failover.retry_ratio: must be within [0, {MAX_RETRY_RATIO}], got {raw_ratio!r}")
+    rps, sla = _size(_pick(merged, "rps_peak", "RPS_peak")), _size(_pick(merged, "sla_p99_seconds", "SLA_p99_s", "sla_p99_s"))
+    complete = rps is not None and sla is not None
+    return FailoverConfig(attempts, ratio, rps if complete else None, sla if complete else None)
 
 
 def _parse_server(section: Mapping[str, object]) -> ServerConfig:
@@ -252,6 +269,7 @@ def _parse_server(section: Mapping[str, object]) -> ServerConfig:
     if listen not in (LOOPBACK, "::1"):
         raise ConfigError(f"{path}.listen: must be {LOOPBACK!r} or '::1' (loopback only)")
     signatures = _string_list(section, "geo_error_signatures", d.geo_error_signatures, path)
+    penalize = _boolean(section, "penalize_header_timeout_without_alternative", d.penalize_header_timeout_without_alternative, path)
     return ServerConfig(
         listen=listen,
         port=_integer(section, "port", d.port, path, 0, 65535),
@@ -269,17 +287,10 @@ def _parse_server(section: Mapping[str, object]) -> ServerConfig:
         single_pool_max_retries=_integer(section, "single_pool_max_retries", d.single_pool_max_retries, path, 0, 0),
         geo_cache_ttl_seconds=_integer(section, "geo_cache_ttl_seconds", d.geo_cache_ttl_seconds, path, 1),
         proxy_fail_penalty_seconds=_integer(section, "proxy_fail_penalty_seconds", d.proxy_fail_penalty_seconds, path),
-        penalize_header_timeout_without_alternative=_boolean(
-            section,
-            "penalize_header_timeout_without_alternative",
-            d.penalize_header_timeout_without_alternative,
-            path,
-        ),
+        penalize_header_timeout_without_alternative=penalize,
         retry_sleep_seconds=_non_negative_number(section, "retry_sleep_seconds", d.retry_sleep_seconds, path, 30.0),
         retry_backoff_factor=_positive_number(section, "retry_backoff_factor", d.retry_backoff_factor, path, 10.0),
-        retry_max_sleep_seconds=_non_negative_number(
-            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0
-        ),
+        retry_max_sleep_seconds=_non_negative_number(section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0),
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
         geo_cache_file=_string(section, "geo_cache_file", d.geo_cache_file, path),
@@ -304,20 +315,11 @@ def _parse_upstreams(raw: object) -> dict[str, UpstreamConfig]:
         base_path = _string(section, "base_path", "", path)
         if base_path and not base_path.startswith("/"):
             raise ConfigError(f"{path}.base_path: must start with '/'")
-        upstreams[name] = UpstreamConfig(
-            host=host,
-            port=_integer(section, "port", 443, path, 1, 65535),
-            use_tls=_boolean(section, "use_tls", True, path),
-            base_path=base_path.rstrip("/"),
-        )
+        upstreams[name] = UpstreamConfig(host, _integer(section, "port", 443, path, 1, 65535), _boolean(section, "use_tls", True, path), base_path.rstrip("/"))
     return upstreams
 
 
-def _parse_adapters(
-    raw: object,
-    upstreams: Mapping[str, UpstreamConfig],
-    pools: Mapping[str, PoolConfig] | None = None,
-) -> dict[str, AdapterConfig]:
+def _parse_adapters(raw: object, upstreams: Mapping[str, UpstreamConfig], pools: Mapping[str, PoolConfig] | None = None) -> dict[str, AdapterConfig]:
     """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя требует `upstream` и `prefixes`."""
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
@@ -377,13 +379,8 @@ def _parse_pools(raw: object) -> dict[str, PoolConfig]:
             listed = section.get("proxies")
             if not isinstance(listed, list) or not listed:
                 raise ConfigError(f"{path}.proxies: non-empty list required for pool type {pool_type!r}")
-            proxies = tuple(
-                _validate_proxy(url, pool_type, f"{path}.proxies[{i}]")
-                for i, url in enumerate(cast(list[object], listed))
-            )
-        pools[name] = PoolConfig(
-            name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id")
-        )
+            proxies = tuple(_validate_proxy(url, pool_type, f"{path}.proxies[{i}]") for i, url in enumerate(cast(list[object], listed)))
+        pools[name] = PoolConfig(name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id"))
     _ = pools.setdefault("direct", PoolConfig("direct", "direct"))
     return pools
 
@@ -436,13 +433,7 @@ def _normalize(data: object) -> object:
         if isinstance(slots, Mapping):
             for key, value in _mapping(cast(object, slots), "slots").items():
                 _ = server.setdefault(key, value)
-        for key in (
-            "max_inflight_per_backend",
-            "max_inflight_long_header",
-            "f08_policy",
-            "f08_v2_risk_ack",
-            "client_timeout_s",
-        ):
+        for key in ("max_inflight_per_backend", "max_inflight_long_header", "f08_policy", "f08_v2_risk_ack", "client_timeout_s"):
             if key in root:
                 _ = server.setdefault(key, root[key])
         _alias(server, "host", "listen")
@@ -501,6 +492,7 @@ def parse_config(data: object) -> BridgeConfig:
         rules=rules,
         default_pool=default_pool,
         geo_fallback_pool=fallback,
+        failover=_parse_failover(root),
     )
 
 
@@ -526,6 +518,7 @@ class ConfigManager:
     _lock: LockType
     _last_check: float
     _snapshot: BridgeConfig
+    _budget: TokenBucketRetryBudget
 
     def __init__(
         self,
@@ -550,6 +543,7 @@ class ConfigManager:
             assert self._path is not None
             self._signature = self._stat()
             self._snapshot = load_config_file(self._path)
+        self._budget = TokenBucketRetryBudget(self._snapshot.failover.retry_ratio, self._snapshot.failover.capacity)
 
     @classmethod
     def from_dict(cls, data: object) -> ConfigManager:
@@ -562,6 +556,11 @@ class ConfigManager:
     @property
     def last_error(self) -> str | None:
         return self._last_error
+
+    @property
+    def retry_budget(self) -> TokenBucketRetryBudget:
+        """Failover-бюджет снимка; reload только ужимает его, токены не минтит."""
+        return self._budget
 
     def _stat(self) -> tuple[int, int]:
         assert self._path is not None
@@ -596,6 +595,7 @@ class ConfigManager:
                 LOGGER.error("config reload rejected, keeping previous snapshot: %s", exc)
                 return False
             self._snapshot = snapshot
+            self._budget.reload_config(retry_ratio=snapshot.failover.retry_ratio, capacity=snapshot.failover.capacity)
             self._last_error = None
             LOGGER.info("config reloaded from %s", self._path)
             return True
