@@ -905,3 +905,63 @@ def test_request_log_records_actual_proxy_endpoint(track, start_bridge, caplog, 
         assert len(rejected.connects) == 1 and len(proxy.connects) == 1
         assert f"proxy=127.0.0.1:{rejected.port}" not in line
     print(line)
+
+
+def test_f08v2_openai_stream_body_activates_long_header_admission_via_socket(track, start_bridge):
+    """Сквозной socket-тест: под f08_policy=v2 запрос с stream=true на /go/v1/chat/completions берёт long_header слот и отдаёт SSE, а stream=false не берёт."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_headers(conn, req):
+        entered.set()
+        release.wait(5)
+        sse_body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+        respond(conn, 200, sse_body, headers={"Content-Type": "text/event-stream"})
+
+    upstream = track(HttpUpstream(slow_headers))
+    bridge = start_bridge(
+        make_config(
+            upstream.port,
+            server={
+                "f08_policy": "v2",
+                "f08_v2_risk_ack": "AD-003/2026-11-14",
+                "total_egress_deadline": 40.0,
+                "headers_timeout": 10.0,
+                "inactivity_timeout": 10.0,
+            },
+        )
+    )
+
+    # 1. stream: true -> занимает long_header слот во время ожидания заголовков и отдаёт SSE 200 OK
+    results: list = []
+    stream_body = json.dumps({"model": "deepseek-v4.1-flash", "stream": True, "messages": []}).encode()
+    t = threading.Thread(
+        target=lambda: results.append(http_request(bridge.port, "POST", "/go/v1/chat/completions", stream_body)),
+        daemon=True,
+    )
+    t.start()
+    assert entered.wait(3)
+    assert wait_for(lambda: bridge.server.admission.inflight_long_header == 1)
+    release.set()
+    t.join(5)
+    assert len(results) == 1 and results[0].status == 200
+    assert b'"content":"ok"' in results[0].body
+    assert wait_for(lambda: bridge.server.admission.inflight_long_header == 0)
+
+    # 2. stream: false -> НЕ занимает long_header слот (остаётся 0)
+    entered.clear()
+    release.clear()
+    results2: list = []
+    non_stream_body = json.dumps({"model": "deepseek-v4.1-flash", "stream": False, "messages": []}).encode()
+    t2 = threading.Thread(
+        target=lambda: results2.append(http_request(bridge.port, "POST", "/go/v1/chat/completions", non_stream_body)),
+        daemon=True,
+    )
+    t2.start()
+    assert entered.wait(3)
+    assert bridge.server.admission.inflight_long_header == 0
+    release.set()
+    t2.join(5)
+    assert len(results2) == 1 and results2[0].status == 200
+    assert wait_for(bridge.slots_idle)
+

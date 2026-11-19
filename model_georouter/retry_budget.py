@@ -103,10 +103,11 @@ class F08V2Budget:
     T_pre: float = F08_V2_T_PRE
     T_idle: float = F08_V2_T_IDLE
 
-    def resolve_for_path(self, path: str, *, deadline: EgressDeadline | None = None, started_at: float | None = None) -> tuple[EgressDeadline, float, float | None]:  # fmt: skip
-        """Вычислить `(deadline, t_pre, sliding_idle_s)` для HTTP-пути запроса."""
-        dl = deadline or EgressDeadline.from_timeout(self.t_idle if self.scope in path else self.non_stream_deadline, started_at=started_at)  # fmt: skip
-        return dl, self.t_pre, (self.t_idle if self.scope in path else None)
+    def resolve_for_path(self, path: str, *, deadline: EgressDeadline | None = None, started_at: float | None = None, is_stream: bool = False) -> tuple[EgressDeadline, float, float | None]:  # fmt: skip
+        """Вычислить `(deadline, t_pre, sliding_idle_s)` для HTTP-пути и признака потока запроса."""
+        streaming = self.scope in path or is_stream
+        dl = deadline or EgressDeadline.from_timeout(self.t_idle if streaming else self.non_stream_deadline, started_at=started_at)  # fmt: skip
+        return dl, self.t_pre, (self.t_idle if streaming else None)
 
 
 def _is_finite_num(val: object) -> TypeGuard[int | float]:
