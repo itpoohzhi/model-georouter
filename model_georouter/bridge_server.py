@@ -580,10 +580,11 @@ class _Handler(socketserver.BaseRequestHandler):
         probe = decision.pool if _breaker(route.upstream, decision.pool).try_acquire(now_tick) else ""
         pool_name, replay_pool = (decision.pool, replay_pool) if probe or not replay_pool else (replay_pool, "")
         budget = srv.admission.f08_v2_budget
-        deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and egress_admission.is_long_header_path(path) else cfg.total_egress_deadline)  # fmt: skip
+        long_hdr = egress_admission.is_streaming_request(path, stream_body=inspector.stream and budget is not None)
+        deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and long_hdr else cfg.total_egress_deadline)  # fmt: skip
         self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
         try:
-            with srv.admission.admit(pool_name, path, deadline=deadline) as ticket:
+            with srv.admission.admit(pool_name, path, deadline=deadline, is_stream=inspector.stream) as ticket:
                 _ = srv.config_manager.retry_budget.mint_on_admitted_primary()
                 self._attempt(pool_name, replay_pool, ticket.deadline, probe=probe)
         except _ReplayRequested:
@@ -632,8 +633,8 @@ class _Handler(socketserver.BaseRequestHandler):
         return AttemptEvent(kind=kind, deadline_expired=deadline.expired(), has_endpoint=endpoint is not None)
 
     def _attempt(self, pool_name: str, replay: str, deadline: EgressDeadline, allow_fallback: bool = True, probe: str = "") -> None:  # fmt: skip
-        _, snapshot, _, _, route, _, upstream, _ = self._ctx
-        long_header = egress_admission.is_long_header_path(route.path)
+        _, snapshot, _, _, route, _, upstream, inspector = self._ctx
+        long_header = egress_admission.is_streaming_request(route.path, stream_body=inspector.stream and self._bridge.admission.f08_v2_budget is not None)
         srv, cfg, pool = self._bridge, snapshot.server, snapshot.pools[pool_name]
         b, fb, direct = srv.retry_budget, snapshot.geo_fallback_pool, _is_direct(pool)
         single = allow_fallback and self.retry_allowed and snapshot.failover.enabled and bool(fb) and fb != pool_name and not direct and len(pool.proxies) == 1  # fmt: skip

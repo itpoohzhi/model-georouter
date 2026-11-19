@@ -241,15 +241,20 @@ class BodyInspector:
         self._state = _START
         self._key: str | None = None
         self._depth = 0
-        self._model: str | None = None
+        self._model = None
         self._model_seen = False
         self._model_first: str | None = None
+        self._stream: bool = False
         self._str_quote = -1
         self._str_scan = -1
 
     @property
     def model(self) -> str | None:
         return self._model
+
+    @property
+    def stream(self) -> bool:
+        return self._stream
 
     @property
     def size(self) -> int:
@@ -363,6 +368,12 @@ class BodyInspector:
                         return
                     if self._key == "model":
                         self._note_model(None)
+                    elif self._key == "stream":
+                        raw_scalar = bytes(buf[pos : match.start()])
+                        if raw_scalar == b"true":
+                            self._stream = True
+                        elif raw_scalar == b"false":
+                            self._stream = False
                     self._pos, self._state = match.start(), _AFTER_VALUE
             elif state == _SKIP:
                 match = _CONTAINER_SPECIAL.search(buf, pos)

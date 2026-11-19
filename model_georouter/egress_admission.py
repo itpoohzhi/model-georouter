@@ -17,11 +17,12 @@ from .errors import ConfigError, EgressTimeoutError, SlotsExhaustedError
 from .proxy_pool import parse_proxy_url
 from .retry_budget import EgressDeadline, RetryBudgetSpec
 
-__all__ = ["DEFAULT_MAX_INFLIGHT_LONG_HEADER", "DEFAULT_MAX_INFLIGHT_PER_BACKEND", "DEFAULT_PROXY_SLOTS", "LONG_HEADER_MARKER", "AdmissionTicket", "EgressAdmission", "InflightLimitError", "Ticket", "is_long_header_path"]  # fmt: skip
+__all__ = ["DEFAULT_MAX_INFLIGHT_LONG_HEADER", "DEFAULT_MAX_INFLIGHT_PER_BACKEND", "DEFAULT_PROXY_SLOTS", "LONG_HEADER_MARKER", "AdmissionTicket", "EgressAdmission", "InflightLimitError", "Ticket", "is_long_header_path", "is_streaming_request"]  # fmt: skip
 
 DEFAULT_PROXY_SLOTS, DEFAULT_MAX_INFLIGHT_PER_BACKEND, DEFAULT_MAX_INFLIGHT_LONG_HEADER = 80, 40, 24
 DEFAULT_ADMISSION_WAIT_S = 0.0
 LONG_HEADER_MARKER = _rb.F08_V2_STREAM_MARKER
+_STREAMING_BODY_SUFFIXES = ("/chat/completions", "/messages", "/responses")
 _F08_UNSET = object()
 
 
@@ -71,6 +72,13 @@ def is_long_header_path(path: str) -> bool:
     return LONG_HEADER_MARKER in path
 
 
+def is_streaming_request(path: str, *, stream_body: bool = False) -> bool:
+    """Определяет streaming-запросы: `streamGenerateContent` или `"stream": true` на OpenAI/Anthropic путях."""
+    if is_long_header_path(path):
+        return True
+    return bool(stream_body) and any(path.endswith(suffix) for suffix in _STREAMING_BODY_SUFFIXES)
+
+
 def _normalize_host_port(raw: str) -> str:
     return f"{parse_proxy_url(t).host}:{parse_proxy_url(t).port}" if "://" in (t := raw.strip()) else t
 
@@ -79,10 +87,10 @@ def _normalize_host_port(raw: str) -> str:
 class _AdmitCtx:
     """Двурежимный (sync + async) контекстный менеджер допуска запроса."""
 
-    def __init__(self, adm: EgressAdmission, pool: str, path: str, backend: str | None, deadline: EgressDeadline | None, started_at: float | None, now: float | None) -> None:  # fmt: skip
+    def __init__(self, adm: EgressAdmission, pool: str, path: str, backend: str | None, deadline: EgressDeadline | None, started_at: float | None, now: float | None, is_stream: bool = False) -> None:  # fmt: skip
         self._adm, self._args, self._prev, self._ticket = (
             adm,
-            (pool, path, backend, deadline, started_at, now),
+            (pool, path, backend, deadline, started_at, now, is_stream),
             None,
             cast(Ticket | None, None),
         )
@@ -232,17 +240,18 @@ class EgressAdmission:
         with self._lock:
             return self._inflight_long_header
 
-    def current(self, deadline: EgressDeadline | None = None, path: str = "") -> Ticket:
+    def current(self, deadline: EgressDeadline | None = None, path: str = "", *, is_stream: bool = False) -> Ticket:
         """Возвращает активный билет текущего потока или расчётный билет по `deadline`."""
         if isinstance(t := getattr(self._local, "ticket", None), Ticket):
             return t
-        dl, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
-        return Ticket("", path, "", max(0.0, dl.remaining()), dl, is_long_header_path(path), "", t_pre, s_idle)
+        long_hdr = is_streaming_request(path, stream_body=is_stream and self.f08_v2_budget is not None)
+        dl, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline, is_stream=long_hdr) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
+        return Ticket("", path, "", max(0.0, dl.remaining()), dl, long_hdr, "", t_pre, s_idle)
 
-    def enter_slot(self, pool: str, path: str, backend: str | None, deadline: EgressDeadline | None, started_at: float | None, now: float | None) -> tuple[object, Ticket]:  # fmt: skip
+    def enter_slot(self, pool: str, path: str, backend: str | None, deadline: EgressDeadline | None, started_at: float | None, now: float | None, is_stream: bool = False) -> tuple[object, Ticket]:  # fmt: skip
         """Занимает слот в счётчиках in-flight и сохраняет активный билет в TLS потока."""
-        egress_key, long_hdr = self.resolve_egress_key(pool, backend=backend), is_long_header_path(path)
-        eg_deadline, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline, started_at=started_at) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline, started_at=started_at), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
+        egress_key, long_hdr = self.resolve_egress_key(pool, backend=backend), is_streaming_request(path, stream_body=is_stream and self.f08_v2_budget is not None)
+        eg_deadline, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline, started_at=started_at, is_stream=long_hdr) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline, started_at=started_at), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
         if (remaining_s := eg_deadline.remaining(now=now)) <= 0.0:
             raise EgressTimeoutError("egress deadline expired before admission", phase="admission")
         with self._cond:
@@ -282,6 +291,6 @@ class EgressAdmission:
                 self._inflight_long_header = max(0, self._inflight_long_header - (1 if ticket.is_long_header else 0))
                 self._cond.notify_all()
 
-    def admit(self, pool: str, path: str = "", *, backend: str | None = None, deadline: EgressDeadline | None = None, started_at: float | None = None, now: float | None = None) -> _AdmitCtx:  # fmt: skip
+    def admit(self, pool: str, path: str = "", *, backend: str | None = None, deadline: EgressDeadline | None = None, started_at: float | None = None, now: float | None = None, is_stream: bool = False) -> _AdmitCtx:  # fmt: skip
         """Немедленно выделяет слот или выбрасывает `InflightLimitError` (503, `inflight_limit`)."""
-        return _AdmitCtx(self, pool, path, backend, deadline, started_at, now)
+        return _AdmitCtx(self, pool, path, backend, deadline, started_at, now, is_stream)

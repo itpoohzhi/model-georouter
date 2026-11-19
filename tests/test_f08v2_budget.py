@@ -184,3 +184,46 @@ def test_missing_client_timeout_accepted_with_exact_risk_ack() -> None:
     assert adm.f08_policy == "v2"
     assert adm.f08_v2_budget is not None
     assert adm.f08_v2_budget.f08_v2_risk_ack == "AD-003/2026-11-14"
+
+
+def test_body_inspector_extracts_top_level_stream_flag() -> None:
+    """BodyInspector извлекает верхнеуровневый булев флаг `stream` без ложных срабатываний на вложенных объектах."""
+    from model_georouter.model_router import BodyInspector
+
+    ins_true = BodyInspector(4096)
+    for chunk in (b'{"model":"deepseek-v4.1-flash",', b' "stream": tr', b'ue, "messages":[]}'):
+        ins_true.feed(chunk)
+    assert ins_true.model == "deepseek-v4.1-flash"
+    assert ins_true.stream is True
+
+    ins_false = BodyInspector(4096)
+    ins_false.feed(b'{"model":"deepseek-v4.1-flash","stream":false}')
+    assert ins_false.stream is False
+
+    ins_nested = BodyInspector(4096)
+    ins_nested.feed(b'{"model":"deepseek-v4.1-flash","messages":[{"role":"user","stream":true}]}')
+    assert ins_nested.stream is False
+
+
+@pytest.mark.parametrize("path", ["/go/v1/chat/completions", "/go/v1/messages"])
+def test_openai_and_anthropic_streaming_requests_get_f08v2_sliding_budget(path: str) -> None:
+    """Streaming-запросы (`stream: true`) на OpenAI/Anthropic путях получают скользящий 150s бюджет F-08v2, а non-stream сохраняет 40s."""
+    adm = EgressAdmission(
+        {"de": {"egress_id": "eg-de", "proxies": ["http://127.0.0.1:8080"]}},
+        f08_policy="v2",
+        client_timeout_s=180.0,
+    )
+    with adm.admit("de", path, started_at=100.0, now=100.0, is_stream=True) as ticket:
+        assert ticket.is_long_header is True
+        assert ticket.sliding_idle_s == pytest.approx(150.0)
+        assert ticket.deadline.remaining(now=100.0) == pytest.approx(150.0)
+        assert adm.inflight_long_header == 1
+        _ = ticket.on_chunk(now=145.0)
+        assert ticket.deadline.remaining(now=145.0) == pytest.approx(150.0)
+    assert adm.inflight_long_header == 0
+
+    with adm.admit("de", path, started_at=200.0, now=200.0, is_stream=False) as non_stream_ticket:
+        assert non_stream_ticket.is_long_header is False
+        assert non_stream_ticket.sliding_idle_s is None
+        assert non_stream_ticket.deadline.remaining(now=200.0) == pytest.approx(40.0)
+
