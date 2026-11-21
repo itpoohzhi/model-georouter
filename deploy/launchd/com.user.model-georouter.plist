@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.model-georouter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/work/src/model-georouter/.venv/bin/python</string>
+    <string>-m</string>
+    <string>model_georouter</string>
+    <string>--config</string>
+    <string>__HOME__/.config/model-georouter/config.json</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>__HOME__/work/src/model-georouter</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__/work/src/model-georouter</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.config/model-georouter/logs/bridge.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.config/model-georouter/logs/bridge.stderr.log</string>
+</dict>
+</plist>
