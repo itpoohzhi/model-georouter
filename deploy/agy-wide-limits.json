@@ -1,0 +1,32 @@
+{
+  "server": {
+    "listen": "127.0.0.1",
+    "port": 10830,
+    "direct_slots": 128,
+    "proxy_slots": 320,
+    "max_connections": 512,
+    "max_inflight_per_backend": 160,
+    "max_inflight_long_header": 160,
+    "admission_wait_s": 0.0,
+    "f08_policy": "v2",
+    "f08_v2_risk_ack": "AD-003/2026-11-14",
+    "hedged_connect_enabled": false,
+    "ingress_wait_timeout": 5.0,
+    "connect_timeout": 3.0,
+    "total_egress_deadline": 40,
+    "headers_timeout": 180,
+    "inactivity_timeout": 300.0,
+    "body_timeout": 180.0,
+    "body_buffer_max_bytes": 268435456,
+    "pre_send_retries": 2,
+    "single_pool_max_retries": 0,
+    "geo_cache_ttl_seconds": 86400,
+    "proxy_fail_penalty_seconds": 30,
+    "penalize_on_header_timeout": true,
+    "penalize_header_timeout_without_alternative": false,
+    "retry_sleep_seconds": 0.5,
+    "retry_backoff_factor": 2.0,
+    "retry_max_sleep_seconds": 3.0,
+    "geo_cache_file": "~/.config/model-georouter/geo_cache.json"
+  }
+}
