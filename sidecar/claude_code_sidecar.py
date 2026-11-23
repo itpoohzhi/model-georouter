@@ -111,6 +111,34 @@ def _positive_seconds(section: Mapping[str, Any], name: str, default: float) -> 
     return float(value)
 
 
+def _validate_config(config: SidecarConfig, port: int = DEFAULT_PORT) -> None:
+    try:
+        absolute_claude_bin = isinstance(config.claude_bin, str) and Path(config.claude_bin).expanduser().is_absolute()
+    except RuntimeError:
+        absolute_claude_bin = False
+    if not absolute_claude_bin:
+        raise SidecarConfigError("claude_bin must be an absolute or expandable tilde path")
+
+    if (
+        not isinstance(config.claude_bin_pinned_version, str)
+        or re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._-]*", config.claude_bin_pinned_version) is None
+    ):
+        raise SidecarConfigError(
+            "claude_bin_pinned_version must be non-empty and contain only ASCII letters, digits, '.', '_' or '-'"
+        )
+
+    if not (
+        config.sidecar_keepalive_seconds
+        < config.sidecar_non_stream_timeout_seconds
+        < config.sidecar_header_timeout_seconds
+        < config.sidecar_idle_timeout_seconds
+        <= config.sidecar_max_execution_timeout_seconds
+    ):
+        raise SidecarConfigError("invalid sidecar timeout chain")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise SidecarConfigError("port must be between 1 and 65535")
+
+
 def load_config(path: str | os.PathLike[str]) -> SidecarConfig:
     try:
         with Path(path).expanduser().open(encoding="utf-8") as config_file:
@@ -123,17 +151,10 @@ def load_config(path: str | os.PathLike[str]) -> SidecarConfig:
     if not isinstance(section, dict):
         raise SidecarConfigError("cloudcode_claude_code must be an object")
 
-    claude_bin = section.get("claude_bin", SidecarConfig.claude_bin)
-    if not isinstance(claude_bin, str) or not Path(claude_bin).expanduser().is_absolute():
-        raise SidecarConfigError("claude_bin must be an absolute or expandable tilde path")
-    pinned_version = section.get("claude_bin_pinned_version", SidecarConfig.claude_bin_pinned_version)
-    if not isinstance(pinned_version, str) or not pinned_version:
-        raise SidecarConfigError("claude_bin_pinned_version must be non-empty")
-
     config = SidecarConfig(
         model_mapping=_parse_model_mapping(section.get("model_mapping", {})),
-        claude_bin=claude_bin,
-        claude_bin_pinned_version=pinned_version,
+        claude_bin=section.get("claude_bin", SidecarConfig.claude_bin),
+        claude_bin_pinned_version=section.get("claude_bin_pinned_version", SidecarConfig.claude_bin_pinned_version),
         sidecar_keepalive_seconds=_positive_seconds(section, "sidecar_keepalive_seconds", 39.0),
         sidecar_non_stream_timeout_seconds=_positive_seconds(section, "sidecar_non_stream_timeout_seconds", 40.0),
         sidecar_header_timeout_seconds=_positive_seconds(section, "sidecar_header_timeout_seconds", 45.0),
@@ -142,14 +163,7 @@ def load_config(path: str | os.PathLike[str]) -> SidecarConfig:
             section, "sidecar_max_execution_timeout_seconds", 300.0
         ),
     )
-    if not (
-        config.sidecar_keepalive_seconds
-        < config.sidecar_non_stream_timeout_seconds
-        < config.sidecar_header_timeout_seconds
-        < config.sidecar_idle_timeout_seconds
-        <= config.sidecar_max_execution_timeout_seconds
-    ):
-        raise SidecarConfigError("invalid sidecar timeout chain")
+    _validate_config(config)
     return config
 
 
@@ -422,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             config = replace(config, claude_bin=args.claude_bin)
         if args.claude_bin_pinned_version is not None:
             config = replace(config, claude_bin_pinned_version=args.claude_bin_pinned_version)
+        _validate_config(config, args.port)
         verify_pinned_version(config)
     except (SidecarConfigError, PinnedVersionError) as exc:
         LOGGER.error("startup refused: %s", exc)
