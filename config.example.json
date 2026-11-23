@@ -39,7 +39,13 @@
     }
   },
   "upstreams": {
-    "vendor-ai": { "host": "api.vendor.example", "base_path": "/v1" }
+    "vendor-ai": { "host": "api.vendor.example", "base_path": "/v1" },
+    "cloudcode-claude-sidecar": {
+      "host": "127.0.0.1",
+      "port": 10835,
+      "use_tls": false,
+      "base_path": ""
+    }
   },
   "adapters": {
     "sg-vendor": {
@@ -53,6 +59,29 @@
     { "match_prefix": ["claude-", "gpt-"], "pool": "route-de", "description": "модели с гео-ограничениями" },
     { "match_regex": "^gemini-.*-preview$", "pool": "route-hy2" }
   ],
+  "cloudcode_claude_code": {
+    "enabled": false,
+    "sidecar_upstream": "cloudcode-claude-sidecar",
+    "intercept_models": [],
+    "model_mapping": {},
+    "catalog_model_map": {},
+    "google_fallback_models": [],
+    "intercept_paths": [
+      "/v1internal:fetchAvailableModels",
+      "/v1internal:streamGenerateContent",
+      "/v1internal:generateContent",
+      "/v1internal:countTokens"
+    ],
+    "pre_commit_fallback": true,
+    "sidecar_keepalive_seconds": 39,
+    "sidecar_non_stream_timeout_seconds": 40,
+    "sidecar_header_timeout_seconds": 45,
+    "sidecar_idle_timeout_seconds": 120,
+    "sidecar_max_execution_timeout_seconds": 300,
+    "claude_bin": "~/.local/bin/claude",
+    "claude_bin_pinned_version": "2.1.322",
+    "max_concurrent_generations": 1
+  },
   "default_pool": "direct",
   "geo_fallback_pool": "route-de"
 }
