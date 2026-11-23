@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import secrets
 import select
 import socket
 import socketserver
@@ -85,6 +87,16 @@ OVERLOADED_503 = (
 )
 SKIPPED_REQUEST_HEADERS = frozenset({"host", "accept-encoding", "content-length", "expect"})
 _REPLAY_FLAGS = {"header_timeout": "timed_out", "protocol_error": "protocol_error"}
+_REQ_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _resolve_request_id(raw: str | None) -> str:
+    """Провалидировать X-Request-Id по строгому allowlist или сгенерировать новый correlation ID."""
+    if raw is not None:
+        cleaned = raw.strip(" \t")
+        if cleaned and _REQ_ID_RE.fullmatch(cleaned):
+            return cleaned
+    return f"req_{secrets.token_hex(8)}"
 
 
 # ───────────────────────────── слоты и метрики ─────────────────────────────
@@ -408,6 +420,8 @@ class _Handler(socketserver.BaseRequestHandler):
         self.retry_allowed: bool = True
         self.started, self.status, self.bytes_sent = time.monotonic(), 0, 0
         self.method, self.path, self.pool_name, self.proxy_endpoint, self.outcome = "-", "-", "-", "-", "-"
+        self.req_id: str = "-"
+        self._ttft: float | None = None
         self.model: str | None = None
         self._attempt_ok: bool = False
         super().__init__(request, client_address, server)
@@ -510,11 +524,27 @@ class _Handler(socketserver.BaseRequestHandler):
                 break
             total += len(data)
 
+    def _mark_ttft(self) -> None:
+        """Зафиксировать момент отправки первого байта upstream-ответа клиенту (однократно)."""
+        if getattr(self, "_ttft", None) is None:
+            self._ttft = time.monotonic()
+
     def _log_request(self) -> None:
+        ttft_ms: int | str = int((self._ttft - self.started) * 1000) if self._ttft is not None else "-"
         LOGGER.info(
-            "request method=%s path=%s model=%s pool=%s proxy=%s status=%s outcome=%s bytes=%d replayed=%s dur_ms=%d",
-            self.method, self.path, self.model or "-", self.pool_name, self.proxy_endpoint,
-            self.status or "-", self.outcome, self.bytes_sent, self.replayed,
+            "request method=%s path=%s model=%s pool=%s proxy=%s status=%s outcome=%s "
+            "bytes=%d replayed=%s req_id=%s ttft_ms=%s dur_ms=%d",
+            self.method,
+            self.path,
+            self.model or "-",
+            self.pool_name,
+            self.proxy_endpoint,
+            self.status or "-",
+            self.outcome,
+            self.bytes_sent,
+            self.replayed,
+            self.req_id or "-",
+            ttft_ms,
             int((time.monotonic() - self.started) * 1000),
         )
 
@@ -555,6 +585,7 @@ class _Handler(socketserver.BaseRequestHandler):
             target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         path, _, query = target.partition("?")
         self.method, self.path = req.method, path
+        self.req_id = _resolve_request_id(req.get("x-request-id"))
         self.retry_allowed = bridge_replay_allowed(dict(req.headers))
         srv.metrics.incr("requests_total")
         self.body_done = req.get("content-length") in (None, "0") and req.get("transfer-encoding") is None
@@ -711,6 +742,7 @@ class _Handler(socketserver.BaseRequestHandler):
         try:
             sock.settimeout(cfg.body_timeout)
             sock.sendall(build_client_head(final_head))
+            self._mark_ttft()
             if req.method != "HEAD" and new_body:
                 sock.sendall(new_body)
             self.outcome, self.bytes_sent = "complete", len(new_body)
@@ -835,13 +867,20 @@ class _Handler(socketserver.BaseRequestHandler):
         try:
             sock.settimeout(cfg.body_timeout)
             sock.sendall(build_client_head(head))
+            if initial:
+                self._mark_ttft()
         except OSError:
             self.outcome = "client_cancelled"
             self._bridge.metrics.incr("client_cancelled")
             return
         relay = SSERelay(inactivity_timeout=cfg.inactivity_timeout, write_timeout=cfg.body_timeout)
         ticket = self._bridge.admission.current(None, route.path)
-        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed, on_chunk=ticket.on_chunk)
+
+        def _on_chunk() -> object:
+            self._mark_ttft()
+            return ticket.on_chunk()
+
+        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed, on_chunk=_on_chunk)
         self.outcome, self.bytes_sent = result.outcome, result.bytes_sent
         self._bridge.metrics.incr(f"status_{head.status}")
         self._bridge.metrics.incr(f"relay_{result.outcome}")
