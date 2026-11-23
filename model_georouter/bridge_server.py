@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from . import SERVICE_NAME, SERVICE_NAME_ALIASES, __version__, config_guard, egress_admission, egress_hedge
 from ._typing import override
 from .adapters import AdapterRegistry, AdapterRoute, AdminAdapter
+from .claude_code_routing import CatalogTicketStore, ClaudeCodeRouting
 from .config import BridgeConfig, ConfigManager, PoolConfig, UpstreamConfig
 from .error_handler import ErrorHandler, json_response_bytes
 from .errors import (
@@ -223,6 +224,7 @@ class BridgeServer(socketserver.ThreadingTCPServer):
     egress: egress_hedge.EgressHedgeRunner
     admission: egress_admission.EgressAdmission
     state_writer: UpstreamStateWriter | None
+    _catalog_tickets: CatalogTicketStore
 
     def __init__(
         self,
@@ -242,6 +244,8 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         self._runtime: tuple[BridgeConfig, _Runtime] | None = None
         self.retry_budget: RetryBudgetSpec = RetryBudgetSpec()
         self.started_at: float = time.monotonic()
+        self._catalog_clock = time.monotonic
+        self._catalog_tickets = CatalogTicketStore(lambda: self._catalog_clock())
         self._threads = _WorkerThreads()
         self.state_writer = (
             state_writer
@@ -385,7 +389,7 @@ def build_upstream_request(
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
 
 
-class _Handler(socketserver.BaseRequestHandler):
+class _Handler(ClaudeCodeRouting, socketserver.BaseRequestHandler):
     _last_proxy_endpoint: ProxyEndpoint | None = None
     committed: bool
     body_done: bool
@@ -570,11 +574,17 @@ class _Handler(socketserver.BaseRequestHandler):
             raise NotFoundError(f"no adapter serves path {path}")
         inspector = self._read_request_body(sock, req, rest, cfg.body_buffer_max_bytes, cfg.body_timeout)
         self.model = inspector.model or model_from_path(path)
+        if (catalog_ticket := self._catalog_callback_ticket(req, snapshot)) is not None:
+            self._serve_catalog_callback(sock, route, catalog_ticket)
+            return
         self._sanitize_request_body(req, route, inspector)
         decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache, default_pool=route.pool or None)
         if decision.source == "geo_cache":
             srv.metrics.incr("geo_cache_hits")
         upstream, fallback = snapshot.upstreams[route.upstream], snapshot.geo_fallback_pool
+        self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
+        if self._sidecar_matches(snapshot, route, inspector) and self._attempt_claude_sidecar(decision.pool):
+            return
         now_tick = int(time.monotonic())
         replay_pool = fallback if (fallback and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool]) and self.retry_allowed and snapshot.failover.enabled) else ""  # fmt: skip
         probe = decision.pool if _breaker(route.upstream, decision.pool).try_acquire(now_tick) else ""
@@ -582,7 +592,6 @@ class _Handler(socketserver.BaseRequestHandler):
         budget = srv.admission.f08_v2_budget
         long_hdr = egress_admission.is_streaming_request(path, stream_body=inspector.stream and budget is not None)
         deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and long_hdr else cfg.total_egress_deadline)  # fmt: skip
-        self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
         try:
             with srv.admission.admit(pool_name, path, deadline=deadline, is_stream=inspector.stream) as ticket:
                 _ = srv.config_manager.retry_budget.mint_on_admitted_primary()
