@@ -87,7 +87,13 @@ class CatalogTicketStore:
 
     def exists(self, token: str) -> bool:
         with self._lock:
-            return token in self._tickets
+            grant = self._tickets.get(token)
+            if grant is None:
+                return False
+            if grant.expires_at <= self._clock():
+                self._tickets.pop(token, None)
+                return False
+            return True
 
     def consume(self, token: str) -> _CatalogGrant | None:
         """Атомарно изъять ticket: повтор и параллельный callback никогда не получают контекст."""
@@ -186,6 +192,7 @@ class ClaudeCodeRouting:
             if key.lower() not in _SIDECAR_STRIPPED_HEADERS and not key.lower().startswith(_INTERNAL_HEADER_PREFIX)
         ]
         headers.append(("X-Model-Georouter-Request-Id", secrets.token_hex(16)))
+        ticket: str | None = None
         if route.path == _CATALOG_ROUTE_PATH:
             callback_req = RequestHead(
                 req.method,
@@ -218,6 +225,8 @@ class ClaudeCodeRouting:
                     srv.metrics.incr("claude_sidecar_fallbacks")
                     if route.path == _CATALOG_ROUTE_PATH:
                         srv.metrics.incr("claude_sidecar_catalog_fallbacks")
+                    if ticket is not None:
+                        srv._catalog_tickets.consume(ticket)
                     return False
                 raise
             if self._sidecar_status_requires_fallback(head, snapshot, route, inspector):
@@ -225,6 +234,8 @@ class ClaudeCodeRouting:
                 srv.metrics.incr("claude_sidecar_fallbacks")
                 if route.path == _CATALOG_ROUTE_PATH:
                     srv.metrics.incr("claude_sidecar_catalog_fallbacks")
+                if ticket is not None:
+                    srv._catalog_tickets.consume(ticket)
                 return False
             framing = framing_for_response(req.method, head.status, head.headers)
             self._relay(up, head, framing, rest, False)

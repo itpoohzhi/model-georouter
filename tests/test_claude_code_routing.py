@@ -5,10 +5,12 @@ import socket
 import struct
 import time
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
 from model_georouter.bridge_server import _Handler
+from model_georouter.claude_code_routing import CatalogTicketStore
 from tests.helpers import (
     BridgeHarness,
     HttpUpstream,
@@ -53,6 +55,11 @@ def _config(google_port: int, sidecar_port: int, *, enabled: bool = True) -> dic
 
 def _google_ok(conn: socket.socket, _req: Req) -> None:
     respond(conn, 200, b"google", {"Content-Type": "text/plain"})
+
+
+def _issue_catalog_ticket(store: CatalogTicketStore) -> str:
+    grant = cast(Any, object())
+    return store.issue(grant, grant, grant, grant, "", grant, grant, "direct")
 
 
 def _launch(
@@ -172,6 +179,25 @@ def test_gemini_route_is_unaffected_when_sidecar_enabled(track: Track, start_bri
     assert bridge.server.geo_cache.is_blocked("cloudcode-pa", STANDARD) is False
 
 
+def test_expired_catalog_ticket_is_invalid_for_exists_and_consume() -> None:
+    now = [0.0]
+    store = CatalogTicketStore(lambda: now[0])
+    token = _issue_catalog_ticket(store)
+
+    assert store.exists(token)
+    now[0] = 10.0
+    assert not store.exists(token)
+    assert store.consume(token) is None
+
+
+def test_catalog_ticket_cannot_be_consumed_twice() -> None:
+    store = CatalogTicketStore(lambda: 0.0)
+    token = _issue_catalog_ticket(store)
+
+    assert store.consume(token) is not None
+    assert store.consume(token) is None
+
+
 def test_catalog_callback_success_single_use_and_google_header_stripping(
     track: Track, start_bridge: StartBridge, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -233,6 +259,36 @@ def test_catalog_callback_expiry_fails_closed_then_parent_fails_open(track: Trac
 
     assert callback_statuses == [403]
     assert response.status == 200 and response.body == b"google"
+    assert len(google.requests) == 1 and google.requests[0].body == b'{"original":true}'
+
+
+@pytest.mark.parametrize("mode", ["status", "transport"])
+def test_catalog_precommit_fallback_revokes_ticket(track: Track, start_bridge: StartBridge, mode: str) -> None:
+    callbacks: list[tuple[str, str]] = []
+
+    def fail_before_commit(conn: socket.socket, req: Req) -> None:
+        callbacks.append(
+            (
+                req.headers["x-model-georouter-catalog-callback-path"],
+                req.headers["x-model-georouter-catalog-ticket"],
+            )
+        )
+        if mode == "status":
+            respond(conn, 503, b"sidecar error")
+
+    google, _sidecar, bridge = _launch(track, start_bridge, fail_before_commit)
+    response = http_request(bridge.port, "POST", CATALOG_PATH, b'{"original":true}', {"Authorization": AUTH})
+    callback_path, ticket = callbacks[0]
+    late_callback = http_request(
+        bridge.port,
+        "POST",
+        callback_path,
+        b"{}",
+        {"X-Model-Georouter-Catalog-Ticket": ticket},
+    )
+
+    assert response.status == 200 and response.body == b"google"
+    assert late_callback.status == 403
     assert len(google.requests) == 1 and google.requests[0].body == b'{"original":true}'
 
 
