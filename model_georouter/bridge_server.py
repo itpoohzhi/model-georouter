@@ -867,14 +867,20 @@ class _Handler(socketserver.BaseRequestHandler):
         try:
             sock.settimeout(cfg.body_timeout)
             sock.sendall(build_client_head(head))
-            self._mark_ttft()
+            if initial:
+                self._mark_ttft()
         except OSError:
             self.outcome = "client_cancelled"
             self._bridge.metrics.incr("client_cancelled")
             return
         relay = SSERelay(inactivity_timeout=cfg.inactivity_timeout, write_timeout=cfg.body_timeout)
         ticket = self._bridge.admission.current(None, route.path)
-        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed, on_chunk=ticket.on_chunk)
+
+        def _on_chunk() -> object:
+            self._mark_ttft()
+            return ticket.on_chunk()
+
+        result = relay.relay(up, sock, framing, initial=initial, initial_fed=fed, on_chunk=_on_chunk)
         self.outcome, self.bytes_sent = result.outcome, result.bytes_sent
         self._bridge.metrics.incr(f"status_{head.status}")
         self._bridge.metrics.incr(f"relay_{result.outcome}")

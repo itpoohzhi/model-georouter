@@ -7,6 +7,7 @@ import logging
 import re
 import socket
 import threading
+import time
 
 import pytest
 
@@ -204,6 +205,43 @@ def test_e2e_ttft_recorded_for_streaming_response(track, start_bridge, caplog) -
     assert match.group("req_id") == "req_sse_1"
     assert match.group("ttft_ms").isdigit()
     assert 0 <= int(match.group("ttft_ms")) <= int(match.group("dur_ms"))
+
+
+def test_e2e_ttft_marks_first_body_chunk_not_head(track, start_bridge, caplog) -> None:
+    """Метка ttft ставится на первый непустой чанк тела, а не на заголовок ответа."""
+    release = threading.Event()
+
+    def streaming(conn, req):
+        send_sse_head(conn)
+        release.wait(timeout=5.0)
+        conn.sendall(chunk(b"data: first\n\n"))
+        conn.sendall(b"0\r\n\r\n")
+
+    up = track(HttpUpstream(streaming))
+    bridge = start_bridge(make_config(up.port))
+    with caplog.at_level(logging.INFO, logger="model_georouter.server"):
+        sock = open_request(bridge.port, "POST", PATH, _body_for(stream=True), {"X-Request-Id": "req_sse_delay"})
+        try:
+            head_raw = read_until(sock, b"\r\n\r\n")
+            time.sleep(0.2)
+            release.set()
+            tail = read_all(sock)
+        finally:
+            release.set()
+            sock.close()
+        resp = parse_response(head_raw + tail)
+        assert resp.status == 200
+        assert b"data: first" in resp.body
+        assert wait_for(lambda: len(_request_log_lines(caplog, "request method=POST")) == 1)
+    line = _request_log_lines(caplog, "request method=POST")[0]
+    match = REQUEST_TAIL_RE.search(line)
+    assert match is not None, line
+    assert match.group("req_id") == "req_sse_delay"
+    assert match.group("ttft_ms").isdigit()
+    ttft_ms = int(match.group("ttft_ms"))
+    dur_ms = int(match.group("dur_ms"))
+    assert ttft_ms >= 150
+    assert ttft_ms <= dur_ms
 
 
 def test_e2e_ttft_dash_when_no_upstream_response(track, start_bridge, caplog) -> None:
