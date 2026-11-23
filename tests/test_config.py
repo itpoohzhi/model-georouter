@@ -320,3 +320,237 @@ def test_invalid_initial_file_raises(tmp_path):
     path.write_text(json.dumps({"server": {}}))
     with pytest.raises(ConfigError):
         ConfigManager(path)
+
+
+# ───────────────────────────── cloudcode_claude_code ─────────────────────────────
+
+
+def valid_claude_code_section(**overrides) -> dict:
+    section = {
+        "enabled": True,
+        "sidecar_upstream": "cloudcode-claude-sidecar",
+        "intercept_models": ["synthetic-claude", "google-claude"],
+        "model_mapping": {
+            "synthetic-claude": "claude-sonnet-5-5[1m]",
+            "google-claude": "google-claude",
+        },
+        "google_fallback_models": ["google-claude"],
+        "intercept_paths": [
+            "/v1internal:fetchAvailableModels",
+            "/v1internal:streamGenerateContent",
+            "/v1internal:generateContent",
+            "/v1internal:countTokens",
+        ],
+        "pre_commit_fallback": True,
+        "sidecar_header_timeout_seconds": 45,
+        "sidecar_keepalive_seconds": 39,
+        "sidecar_non_stream_timeout_seconds": 40,
+        "sidecar_idle_timeout_seconds": 120,
+        "sidecar_max_execution_timeout_seconds": 300,
+        "claude_bin": "~/.local/bin/claude",
+        "claude_bin_pinned_version": "2.1.322",
+        "max_concurrent_generations": 1,
+        "catalog_model_map": {
+            "synthetic-claude": {
+                "donor_template_file": "fixtures/model-details.json",
+                "donor_id": "google-claude",
+                "display_name": "Claude Sonnet 5.5",
+                "quota_text": "subscription",
+            }
+        },
+    }
+    section.update(overrides)
+    return section
+
+
+def config_with_claude_code(section=None, *, upstream=None, pools=None) -> dict:
+    return minimal(
+        upstreams={
+            "cloudcode-claude-sidecar": upstream
+            or {"host": "127.0.0.1", "port": 10835, "use_tls": False, "base_path": ""}
+        },
+        pools=pools or {},
+        cloudcode_claude_code=valid_claude_code_section() if section is None else section,
+    )
+
+
+@pytest.mark.parametrize("section", [None, {}])
+def test_cloudcode_claude_code_absent_or_empty_uses_off_defaults(section):
+    data = minimal() if section is None else minimal(cloudcode_claude_code=section)
+    cfg = parse_config(data).cloudcode_claude_code
+    assert cfg.enabled is False
+    assert cfg.sidecar_upstream == "cloudcode-claude-sidecar"
+    assert cfg.intercept_models == ()
+    assert dict(cfg.model_mapping) == {}
+    assert cfg.google_fallback_models == ()
+    assert cfg.intercept_paths == (
+        "/v1internal:fetchAvailableModels",
+        "/v1internal:streamGenerateContent",
+        "/v1internal:generateContent",
+        "/v1internal:countTokens",
+    )
+    assert cfg.pre_commit_fallback is True
+    assert (
+        cfg.sidecar_keepalive_seconds,
+        cfg.sidecar_non_stream_timeout_seconds,
+        cfg.sidecar_header_timeout_seconds,
+        cfg.sidecar_idle_timeout_seconds,
+        cfg.sidecar_max_execution_timeout_seconds,
+    ) == (39, 40, 45, 120, 300)
+    assert cfg.claude_bin == "~/.local/bin/claude"
+    assert cfg.claude_bin_pinned_version == "2.1.322"
+    assert cfg.max_concurrent_generations == 1
+    assert dict(cfg.catalog_model_map) == {}
+
+
+def test_cloudcode_claude_code_full_valid_section():
+    cfg = parse_config(config_with_claude_code())
+    section = cfg.cloudcode_claude_code
+    assert section.enabled is True
+    assert section.intercept_models == ("synthetic-claude", "google-claude")
+    assert dict(section.model_mapping) == {
+        "synthetic-claude": "claude-sonnet-5-5[1m]",
+        "google-claude": "google-claude",
+    }
+    assert section.google_fallback_models == ("google-claude",)
+    assert section.pre_commit_fallback is True
+    catalog = section.catalog_model_map["synthetic-claude"]
+    assert catalog.donor_template_file == "fixtures/model-details.json"
+    assert catalog.donor_id == "google-claude"
+    assert catalog.display_name == "Claude Sonnet 5.5"
+    assert catalog.quota_text == "subscription"
+
+
+def test_cloudcode_claude_code_snapshot_is_deeply_immutable():
+    section = parse_config(config_with_claude_code()).cloudcode_claude_code
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        section.enabled = False  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        section.model_mapping["other"] = "other"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        section.catalog_model_map["other"] = None  # type: ignore[index]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        section.catalog_model_map["synthetic-claude"].donor_id = "other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "mutate, fragment",
+    [
+        (lambda s: s["model_mapping"].pop("synthetic-claude"), "missing exact mapping"),
+        (lambda s: s["model_mapping"].update({"synthetic-claude": ""}), "claude_model_id"),
+        (lambda s: s["model_mapping"].update({"synthetic-claude": "claude sonnet"}), "whitespace"),
+        (lambda s: s["model_mapping"].update({"synthetic-claude": "-claude-sonnet"}), "leading '-'"),
+    ],
+)
+def test_cloudcode_claude_code_rejects_invalid_exact_model_mapping(mutate, fragment):
+    section = valid_claude_code_section()
+    mutate(section)
+    with pytest.raises(ConfigError, match=fragment):
+        parse_config(config_with_claude_code(section))
+
+
+@pytest.mark.parametrize(
+    "route_path",
+    ["v1internal:generateContent", "/cloudcode/v1internal:generateContent", "/v1internal:generateContent/"],
+)
+def test_cloudcode_claude_code_rejects_non_normalized_intercept_paths(route_path):
+    section = valid_claude_code_section(intercept_paths=[route_path])
+    with pytest.raises(ConfigError, match="intercept_paths"):
+        parse_config(config_with_claude_code(section))
+
+
+def test_cloudcode_claude_code_rejects_fallback_outside_intercept_models():
+    section = valid_claude_code_section(google_fallback_models=["unknown-google-model"])
+    with pytest.raises(ConfigError, match="not a subset"):
+        parse_config(config_with_claude_code(section))
+
+
+def test_cloudcode_claude_code_rejects_catalog_entry_outside_intercept_models():
+    section = valid_claude_code_section()
+    section["catalog_model_map"]["unknown"] = {"donor_template_file": "fixtures/donor.json"}
+    with pytest.raises(ConfigError, match="not in intercept_models"):
+        parse_config(config_with_claude_code(section))
+
+
+@pytest.mark.parametrize("entry", [{}, {"donor_template_file": ""}, {"donor_template_file": "   "}])
+def test_cloudcode_claude_code_requires_catalog_donor_template(entry):
+    section = valid_claude_code_section()
+    section["catalog_model_map"]["synthetic-claude"] = entry
+    with pytest.raises(ConfigError, match="donor_template_file"):
+        parse_config(config_with_claude_code(section))
+
+
+@pytest.mark.parametrize(
+    "overrides, fragment",
+    [
+        ({"sidecar_keepalive_seconds": 0}, "sidecar_keepalive_seconds"),
+        ({"sidecar_keepalive_seconds": 40}, "sidecar_keepalive_seconds"),
+        ({"sidecar_non_stream_timeout_seconds": 45}, "sidecar_header_timeout_seconds"),
+        ({"sidecar_header_timeout_seconds": 60}, "sidecar_header_timeout_seconds"),
+        ({"sidecar_idle_timeout_seconds": 45}, "sidecar_idle_timeout_seconds"),
+        ({"sidecar_max_execution_timeout_seconds": 100}, "sidecar_max_execution_timeout_seconds"),
+        ({"sidecar_max_execution_timeout_seconds": 1801}, "sidecar_max_execution_timeout_seconds"),
+        ({"max_concurrent_generations": 2}, "max_concurrent_generations"),
+    ],
+)
+def test_cloudcode_claude_code_rejects_invalid_timeout_chain_or_concurrency(overrides, fragment):
+    section = valid_claude_code_section(**overrides)
+    with pytest.raises(ConfigError, match=fragment):
+        parse_config(config_with_claude_code(section))
+
+
+def test_cloudcode_claude_code_rejects_unknown_sidecar_upstream():
+    section = valid_claude_code_section(sidecar_upstream="ghost")
+    with pytest.raises(ConfigError, match="unknown upstream"):
+        parse_config(config_with_claude_code(section))
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [
+        {"host": "192.0.2.1", "port": 10835, "use_tls": False},
+        {"host": "127.0.0.1", "port": 10835, "use_tls": True},
+    ],
+)
+def test_cloudcode_claude_code_rejects_remote_or_tls_sidecar(upstream):
+    with pytest.raises(ConfigError, match="loopback HTTP"):
+        parse_config(config_with_claude_code(upstream=upstream))
+
+
+def test_cloudcode_claude_code_rejects_non_direct_pool():
+    pools = {"direct": {"type": "http_connect", "proxies": ["http://127.0.0.1:3128"]}}
+    with pytest.raises(ConfigError, match="direct pool"):
+        parse_config(config_with_claude_code(pools=pools))
+
+
+@pytest.mark.parametrize("claude_bin", ["claude", "relative/claude", ""])
+def test_cloudcode_claude_code_rejects_non_absolute_claude_bin(claude_bin):
+    section = valid_claude_code_section(claude_bin=claude_bin)
+    with pytest.raises(ConfigError, match="claude_bin"):
+        parse_config(config_with_claude_code(section))
+
+
+@pytest.mark.parametrize("version", ["", "   "])
+def test_cloudcode_claude_code_rejects_empty_pinned_version(version):
+    section = valid_claude_code_section(claude_bin_pinned_version=version)
+    with pytest.raises(ConfigError, match="claude_bin_pinned_version"):
+        parse_config(config_with_claude_code(section))
+
+
+def test_cloudcode_claude_code_hot_reload_on_to_off_preserves_old_snapshot(tmp_path):
+    path = tmp_path / "config.json"
+    data = config_with_claude_code()
+    write_config(path, data, 1)
+    manager = ConfigManager(path, poll_interval=0)
+    held = manager.get()
+    assert held.cloudcode_claude_code.enabled is True
+
+    data["cloudcode_claude_code"]["enabled"] = False
+    data["cloudcode_claude_code"]["model_mapping"]["synthetic-claude"] = "claude-opus-5-5"
+    write_config(path, data, 2)
+    fresh = manager.get()
+    assert fresh is not held
+    assert fresh.cloudcode_claude_code.enabled is False
+    assert fresh.cloudcode_claude_code.model_mapping["synthetic-claude"] == "claude-opus-5-5"
+    assert held.cloudcode_claude_code.enabled is True
+    assert held.cloudcode_claude_code.model_mapping["synthetic-claude"] == "claude-sonnet-5-5[1m]"

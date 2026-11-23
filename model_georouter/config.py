@@ -23,9 +23,22 @@ from .proxy_pool import parse_proxy_url
 from .retry_budget import MAX_RETRY_RATIO, MAX_TOTAL_ATTEMPTS, RetryBudgetSpec, TokenBucketRetryBudget
 
 __all__ = [
-    "FORBIDDEN_ROUTE_DE_PORTS", "AdapterConfig", "BridgeConfig", "ConfigError", "ConfigManager", "FailoverConfig",
-    "PoolConfig", "RuleConfig", "ServerConfig", "UpstreamConfig", "default_config_path", "default_log_dir",
-    "load_config_file", "parse_config",
+    "FORBIDDEN_ROUTE_DE_PORTS",
+    "AdapterConfig",
+    "BridgeConfig",
+    "CatalogModelConfig",
+    "CloudCodeClaudeCodeConfig",
+    "ConfigError",
+    "ConfigManager",
+    "FailoverConfig",
+    "PoolConfig",
+    "RuleConfig",
+    "ServerConfig",
+    "UpstreamConfig",
+    "default_config_path",
+    "default_log_dir",
+    "load_config_file",
+    "parse_config",
 ]
 
 LOGGER = get_logger("model_georouter.config")
@@ -134,6 +147,7 @@ class RuleConfig:
 @dataclass(frozen=True)
 class FailoverConfig:
     """Failover-бюджет: `capacity = rps_peak * sla_p99_seconds`; без sizing — disabled (fail-closed)."""
+
     max_total_attempts: int = MAX_TOTAL_ATTEMPTS
     retry_ratio: float = MAX_RETRY_RATIO
     rps_peak: float | None = None
@@ -143,10 +157,46 @@ class FailoverConfig:
     def capacity(self) -> float:
         """Ёмкость token-bucket за окно SLA; `0.0` без полного sizing."""
         return 0.0 if self.rps_peak is None or self.sla_p99_seconds is None else self.rps_peak * self.sla_p99_seconds
+
     @property
     def enabled(self) -> bool:
         """Failover активен только при полном sizing и положительной ёмкости."""
         return self.capacity > 0.0
+
+
+@dataclass(frozen=True)
+class CatalogModelConfig:
+    donor_template_file: str = ""
+    donor_id: str = ""
+    display_name: str = ""
+    quota_text: str = ""
+
+
+@dataclass(frozen=True)
+class CloudCodeClaudeCodeConfig:
+    """Неизменяемый снимок настроек Claude Code; по умолчанию перехват выключен."""
+
+    enabled: bool = False
+    sidecar_upstream: str = "cloudcode-claude-sidecar"
+    intercept_models: tuple[str, ...] = ()
+    model_mapping: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    google_fallback_models: tuple[str, ...] = ()
+    intercept_paths: tuple[str, ...] = (
+        "/v1internal:fetchAvailableModels",
+        "/v1internal:streamGenerateContent",
+        "/v1internal:generateContent",
+        "/v1internal:countTokens",
+    )
+    pre_commit_fallback: bool = True
+    sidecar_header_timeout_seconds: float = 45.0
+    sidecar_keepalive_seconds: float = 39.0
+    sidecar_non_stream_timeout_seconds: float = 40.0
+    sidecar_idle_timeout_seconds: float = 120.0
+    sidecar_max_execution_timeout_seconds: float = 300.0
+    claude_bin: str = "~/.local/bin/claude"
+    claude_bin_pinned_version: str = "2.1.322"
+    max_concurrent_generations: int = 1
+    catalog_model_map: Mapping[str, CatalogModelConfig] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True, eq=False)
@@ -161,6 +211,7 @@ class BridgeConfig:
     default_pool: str = "direct"
     geo_fallback_pool: str = ""
     failover: FailoverConfig = field(default_factory=FailoverConfig)
+    cloudcode_claude_code: CloudCodeClaudeCodeConfig = field(default_factory=CloudCodeClaudeCodeConfig)
 
 
 DEFAULT_UPSTREAMS = {
@@ -168,6 +219,7 @@ DEFAULT_UPSTREAMS = {
     "cordis-ai": UpstreamConfig("opencode.ai", 443, True),
     "openrouter-ai": UpstreamConfig("openrouter.ai", 443, True, "/api"),
     "cloudcode-pa": UpstreamConfig("daily-cloudcode-pa.googleapis.com", 443, True),
+    "cloudcode-claude-sidecar": UpstreamConfig(LOOPBACK, 10835, False),
 }
 DEFAULT_ADAPTERS = {
     "opencode": AdapterConfig(("/v1", "/go/v1"), "opencode-ai"),
@@ -185,13 +237,19 @@ def _mapping(value: object, path: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ConfigError(f"{path}: expected object, got {type(value).__name__}")
     return cast(Mapping[str, object], value)
-def _integer(section: Mapping[str, object], key: str, default: int, path: str, minimum: int = 0, maximum: int | None = None) -> int:
+
+
+def _integer(
+    section: Mapping[str, object], key: str, default: int, path: str, minimum: int = 0, maximum: int | None = None
+) -> int:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigError(f"{path}.{key}: expected integer, got {type(value).__name__}")
     if value < minimum or (maximum is not None and value > maximum):
         raise ConfigError(f"{path}.{key}: {value} is out of range")
     return value
+
+
 def _finite_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None) -> float:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -205,38 +263,58 @@ def _finite_number(section: Mapping[str, object], key: str, default: float, path
     if not math.isfinite(number):
         raise ConfigError(f"{path}.{key}: must be finite")
     return number
-def _positive_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None) -> float:
+
+
+def _positive_number(
+    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
+) -> float:
     if (value := _finite_number(section, key, default, path, maximum)) <= 0:
         raise ConfigError(f"{path}.{key}: must be positive")
     return value
-def _non_negative_number(section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None) -> float:
+
+
+def _non_negative_number(
+    section: Mapping[str, object], key: str, default: float, path: str, maximum: float | None = None
+) -> float:
     if (value := _finite_number(section, key, default, path, maximum)) < 0:
         raise ConfigError(f"{path}.{key}: must be non-negative")
     return value
+
+
 def _string(section: Mapping[str, object], key: str, default: str, path: str) -> str:
     value = section.get(key, default)
     if not isinstance(value, str):
         raise ConfigError(f"{path}.{key}: expected string, got {type(value).__name__}")
     return value
+
+
 def _boolean(section: Mapping[str, object], key: str, default: bool, path: str) -> bool:
     value = section.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"{path}.{key}: expected boolean, got {type(value).__name__}")
     return value
+
+
 def _string_list(section: Mapping[str, object], key: str, default: tuple[str, ...], path: str) -> tuple[str, ...]:
     value = section.get(key, list(default))
     if not isinstance(value, list) or not all(isinstance(item, str) and item for item in cast(list[object], value)):
         raise ConfigError(f"{path}.{key}: expected list of non-empty strings")
     return tuple(cast(list[str], value))
+
+
 def _pick(section: Mapping[str, object], *names: str) -> object:
     """Первое присутствующее значение по списку синонимов ключа."""
     return next((section[name] for name in names if name in section), None)
+
+
 def _size(value: object) -> float | None:
     """Положительное конечное число sizing-параметра, иначе `None` (fail-closed)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     number = float(value)
     return number if math.isfinite(number) and number > 0 else None
+
+
 def _parse_failover(root: Mapping[str, object]) -> FailoverConfig:
     """Жёсткие потолки attempts/ratio → `ConfigError`; неполный sizing лишь выключает failover."""
     merged: dict[str, object] = dict(root)
@@ -246,7 +324,9 @@ def _parse_failover(root: Mapping[str, object]) -> FailoverConfig:
     attempts = _pick(merged, "max_total_attempts", "A_max")
     attempts = MAX_TOTAL_ATTEMPTS if attempts is None else attempts
     if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= MAX_TOTAL_ATTEMPTS:
-        raise ConfigError(f"failover.max_total_attempts: expected integer in [1, {MAX_TOTAL_ATTEMPTS}], got {attempts!r}")
+        raise ConfigError(
+            f"failover.max_total_attempts: expected integer in [1, {MAX_TOTAL_ATTEMPTS}], got {attempts!r}"
+        )
     raw_ratio = _pick(merged, "retry_ratio", "retry_budget_pct")
     raw_ratio = MAX_RETRY_RATIO if raw_ratio is None else raw_ratio
     if isinstance(raw_ratio, bool) or not isinstance(raw_ratio, int | float) or not math.isfinite(float(raw_ratio)):
@@ -255,7 +335,10 @@ def _parse_failover(root: Mapping[str, object]) -> FailoverConfig:
     ratio = float(raw_ratio) / 100.0 if percent else float(raw_ratio)
     if not 0.0 <= ratio <= MAX_RETRY_RATIO:
         raise ConfigError(f"failover.retry_ratio: must be within [0, {MAX_RETRY_RATIO}], got {raw_ratio!r}")
-    rps, sla = _size(_pick(merged, "rps_peak", "RPS_peak")), _size(_pick(merged, "sla_p99_seconds", "SLA_p99_s", "sla_p99_s"))
+    rps, sla = (
+        _size(_pick(merged, "rps_peak", "RPS_peak")),
+        _size(_pick(merged, "sla_p99_seconds", "SLA_p99_s", "sla_p99_s")),
+    )
     complete = rps is not None and sla is not None
     return FailoverConfig(attempts, ratio, rps if complete else None, sla if complete else None)
 
@@ -269,7 +352,9 @@ def _parse_server(section: Mapping[str, object]) -> ServerConfig:
     if listen not in (LOOPBACK, "::1"):
         raise ConfigError(f"{path}.listen: must be {LOOPBACK!r} or '::1' (loopback only)")
     signatures = _string_list(section, "geo_error_signatures", d.geo_error_signatures, path)
-    penalize = _boolean(section, "penalize_header_timeout_without_alternative", d.penalize_header_timeout_without_alternative, path)
+    penalize = _boolean(
+        section, "penalize_header_timeout_without_alternative", d.penalize_header_timeout_without_alternative, path
+    )
     return ServerConfig(
         listen=listen,
         port=_integer(section, "port", d.port, path, 0, 65535),
@@ -290,7 +375,9 @@ def _parse_server(section: Mapping[str, object]) -> ServerConfig:
         penalize_header_timeout_without_alternative=penalize,
         retry_sleep_seconds=_non_negative_number(section, "retry_sleep_seconds", d.retry_sleep_seconds, path, 30.0),
         retry_backoff_factor=_positive_number(section, "retry_backoff_factor", d.retry_backoff_factor, path, 10.0),
-        retry_max_sleep_seconds=_non_negative_number(section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0),
+        retry_max_sleep_seconds=_non_negative_number(
+            section, "retry_max_sleep_seconds", d.retry_max_sleep_seconds, path, 60.0
+        ),
         log_dir=_string(section, "log_dir", default_log_dir(), path),
         geo_error_signatures=signatures,
         geo_cache_file=_string(section, "geo_cache_file", d.geo_cache_file, path),
@@ -315,11 +402,18 @@ def _parse_upstreams(raw: object) -> dict[str, UpstreamConfig]:
         base_path = _string(section, "base_path", "", path)
         if base_path and not base_path.startswith("/"):
             raise ConfigError(f"{path}.base_path: must start with '/'")
-        upstreams[name] = UpstreamConfig(host, _integer(section, "port", 443, path, 1, 65535), _boolean(section, "use_tls", True, path), base_path.rstrip("/"))
+        upstreams[name] = UpstreamConfig(
+            host,
+            _integer(section, "port", 443, path, 1, 65535),
+            _boolean(section, "use_tls", True, path),
+            base_path.rstrip("/"),
+        )
     return upstreams
 
 
-def _parse_adapters(raw: object, upstreams: Mapping[str, UpstreamConfig], pools: Mapping[str, PoolConfig] | None = None) -> dict[str, AdapterConfig]:
+def _parse_adapters(
+    raw: object, upstreams: Mapping[str, UpstreamConfig], pools: Mapping[str, PoolConfig] | None = None
+) -> dict[str, AdapterConfig]:
     """Встроенные имена (`DEFAULT_ADAPTERS`) — как раньше; новое имя требует `upstream` и `prefixes`."""
     adapters = dict(DEFAULT_ADAPTERS)
     for name, value in _mapping(raw, "adapters").items():
@@ -379,8 +473,13 @@ def _parse_pools(raw: object) -> dict[str, PoolConfig]:
             listed = section.get("proxies")
             if not isinstance(listed, list) or not listed:
                 raise ConfigError(f"{path}.proxies: non-empty list required for pool type {pool_type!r}")
-            proxies = tuple(_validate_proxy(url, pool_type, f"{path}.proxies[{i}]") for i, url in enumerate(cast(list[object], listed)))
-        pools[name] = PoolConfig(name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id"))
+            proxies = tuple(
+                _validate_proxy(url, pool_type, f"{path}.proxies[{i}]")
+                for i, url in enumerate(cast(list[object], listed))
+            )
+        pools[name] = PoolConfig(
+            name, pool_type, strategy, _boolean(section, "remote_dns", True, path), proxies, section.get("egress_id")
+        )
     _ = pools.setdefault("direct", PoolConfig("direct", "direct"))
     return pools
 
@@ -433,7 +532,13 @@ def _normalize(data: object) -> object:
         if isinstance(slots, Mapping):
             for key, value in _mapping(cast(object, slots), "slots").items():
                 _ = server.setdefault(key, value)
-        for key in ("max_inflight_per_backend", "max_inflight_long_header", "f08_policy", "f08_v2_risk_ack", "client_timeout_s"):
+        for key in (
+            "max_inflight_per_backend",
+            "max_inflight_long_header",
+            "f08_policy",
+            "f08_v2_risk_ack",
+            "client_timeout_s",
+        ):
             if key in root:
                 _ = server.setdefault(key, root[key])
         _alias(server, "host", "listen")
@@ -457,6 +562,132 @@ def _normalize(data: object) -> object:
                         rule_copy[alias] = [rule_copy[alias]]
                     _alias(rule_copy, alias, "match_prefix")
     return root
+
+
+def _parse_cloudcode_claude_code(
+    raw: object,
+    upstreams: Mapping[str, UpstreamConfig],
+    pools: Mapping[str, PoolConfig],
+) -> CloudCodeClaudeCodeConfig:
+    path = "cloudcode_claude_code"
+    section = _mapping(raw, path)
+    defaults = CloudCodeClaudeCodeConfig()
+    enabled = _boolean(section, "enabled", defaults.enabled, path)
+    intercept_models = _string_list(section, "intercept_models", defaults.intercept_models, path)
+    intercept_model_set = set(intercept_models)
+
+    raw_mapping = _mapping(section.get("model_mapping", {}), f"{path}.model_mapping")
+    model_mapping: dict[str, str] = {}
+    for model_id, target in raw_mapping.items():
+        if not isinstance(model_id, str) or not model_id:
+            raise ConfigError(f"{path}.model_mapping: model IDs must be non-empty strings")
+        if (
+            not isinstance(target, str)
+            or not target
+            or not target.isascii()
+            or any(char.isspace() for char in target)
+            or target.startswith("-")
+        ):
+            raise ConfigError(
+                f"{path}.model_mapping.{model_id}: expected non-empty exact ASCII claude_model_id "
+                "without whitespace or leading '-'"
+            )
+        model_mapping[model_id] = target
+    if enabled and (missing := intercept_model_set.difference(model_mapping)):
+        raise ConfigError(f"{path}.model_mapping: missing exact mapping for {sorted(missing)!r}")
+
+    fallback_models = _string_list(section, "google_fallback_models", defaults.google_fallback_models, path)
+    if unknown := set(fallback_models).difference(intercept_model_set):
+        raise ConfigError(f"{path}.google_fallback_models: not a subset of intercept_models: {sorted(unknown)!r}")
+
+    intercept_paths = _string_list(section, "intercept_paths", defaults.intercept_paths, path)
+    for route_path in intercept_paths:
+        if not route_path.startswith("/") or route_path.startswith("/cloudcode") or route_path.endswith("/"):
+            raise ConfigError(
+                f"{path}.intercept_paths: {route_path!r} must be normalized: start with '/', "
+                "not start with '/cloudcode', and not end with '/'"
+            )
+
+    raw_catalog = _mapping(section.get("catalog_model_map", {}), f"{path}.catalog_model_map")
+    catalog_model_map: dict[str, CatalogModelConfig] = {}
+    for model_id, value in raw_catalog.items():
+        entry_path = f"{path}.catalog_model_map.{model_id}"
+        if model_id not in intercept_model_set:
+            raise ConfigError(f"{entry_path}: model ID is not in intercept_models")
+        entry = _mapping(value, entry_path)
+        donor_template_file = _string(entry, "donor_template_file", "", entry_path)
+        if enabled and not donor_template_file.strip():
+            raise ConfigError(f"{entry_path}.donor_template_file: required when enabled=true")
+        catalog_model_map[model_id] = CatalogModelConfig(
+            donor_template_file=donor_template_file,
+            donor_id=_string(entry, "donor_id", "", entry_path),
+            display_name=_string(entry, "display_name", "", entry_path),
+            quota_text=_string(entry, "quota_text", "", entry_path),
+        )
+
+    sidecar_upstream = _string(section, "sidecar_upstream", defaults.sidecar_upstream, path)
+    upstream = upstreams.get(sidecar_upstream)
+    if upstream is None:
+        raise ConfigError(f"{path}.sidecar_upstream: unknown upstream {sidecar_upstream!r}")
+    if upstream.host not in (LOOPBACK, "::1") or upstream.use_tls:
+        raise ConfigError(f"{path}.sidecar_upstream: must use loopback HTTP (127.0.0.1 or ::1, use_tls=false)")
+    if pools["direct"].type != "direct":
+        raise ConfigError(f"{path}.sidecar_upstream: direct pool must have type 'direct'")
+
+    keepalive = _positive_number(section, "sidecar_keepalive_seconds", defaults.sidecar_keepalive_seconds, path)
+    non_stream = _positive_number(
+        section, "sidecar_non_stream_timeout_seconds", defaults.sidecar_non_stream_timeout_seconds, path
+    )
+    header = _positive_number(section, "sidecar_header_timeout_seconds", defaults.sidecar_header_timeout_seconds, path)
+    idle = _positive_number(section, "sidecar_idle_timeout_seconds", defaults.sidecar_idle_timeout_seconds, path)
+    max_execution = _positive_number(
+        section, "sidecar_max_execution_timeout_seconds", defaults.sidecar_max_execution_timeout_seconds, path, 1800.0
+    )
+    if not keepalive < non_stream:
+        raise ConfigError(f"{path}.sidecar_keepalive_seconds: must be less than sidecar_non_stream_timeout_seconds")
+    if not non_stream < header < 60:
+        raise ConfigError(
+            f"{path}.sidecar_header_timeout_seconds: must exceed sidecar_non_stream_timeout_seconds and be below 60"
+        )
+    if not header < idle:
+        raise ConfigError(f"{path}.sidecar_idle_timeout_seconds: must exceed sidecar_header_timeout_seconds")
+    if not idle <= max_execution:
+        raise ConfigError(
+            f"{path}.sidecar_max_execution_timeout_seconds: must be at least sidecar_idle_timeout_seconds"
+        )
+
+    claude_bin = _string(section, "claude_bin", defaults.claude_bin, path)
+    try:
+        absolute_claude_bin = Path(claude_bin).expanduser().is_absolute()
+    except RuntimeError:
+        absolute_claude_bin = False
+    if not claude_bin or not absolute_claude_bin:
+        raise ConfigError(f"{path}.claude_bin: must be an absolute path or an expandable tilde path")
+    pinned_version = _string(section, "claude_bin_pinned_version", defaults.claude_bin_pinned_version, path)
+    if not pinned_version.strip():
+        raise ConfigError(f"{path}.claude_bin_pinned_version: must be non-empty")
+    max_concurrent = _integer(section, "max_concurrent_generations", defaults.max_concurrent_generations, path)
+    if max_concurrent != 1:
+        raise ConfigError(f"{path}.max_concurrent_generations: must equal 1")
+
+    return CloudCodeClaudeCodeConfig(
+        enabled=enabled,
+        sidecar_upstream=sidecar_upstream,
+        intercept_models=intercept_models,
+        model_mapping=MappingProxyType(model_mapping),
+        google_fallback_models=fallback_models,
+        intercept_paths=intercept_paths,
+        pre_commit_fallback=_boolean(section, "pre_commit_fallback", defaults.pre_commit_fallback, path),
+        sidecar_header_timeout_seconds=header,
+        sidecar_keepalive_seconds=keepalive,
+        sidecar_non_stream_timeout_seconds=non_stream,
+        sidecar_idle_timeout_seconds=idle,
+        sidecar_max_execution_timeout_seconds=max_execution,
+        claude_bin=claude_bin,
+        claude_bin_pinned_version=pinned_version,
+        max_concurrent_generations=max_concurrent,
+        catalog_model_map=MappingProxyType(catalog_model_map),
+    )
 
 
 def parse_config(data: object) -> BridgeConfig:
@@ -493,6 +724,7 @@ def parse_config(data: object) -> BridgeConfig:
         default_pool=default_pool,
         geo_fallback_pool=fallback,
         failover=_parse_failover(root),
+        cloudcode_claude_code=_parse_cloudcode_claude_code(root.get("cloudcode_claude_code", {}), upstreams, pools),
     )
 
 
