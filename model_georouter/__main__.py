@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -24,8 +25,10 @@ def main(argv: list[str] | None = None) -> int:
         help="путь к config.json (по умолчанию ~/.config/model-georouter/config.json, иначе legacy universal-ai-bridge)",
     )
     args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logger = get_logger("model_georouter")
+    logger.setLevel(logging.INFO)
+    logger.propagate = os.environ.get("GEOROUTER_STDERR_PROPAGATE", "0").strip().lower() in ("1", "true", "yes", "on")
     try:
         manager = ConfigManager(args.config)
     except (ConfigError, OSError) as exc:

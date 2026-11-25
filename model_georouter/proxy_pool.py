@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlsplit
 
 from .errors import AllProxiesPenalizedError, EgressConnectError, EgressTimeoutError
 from .logging_utils import get_logger
+from .proxy_health_fsm import ProxyHealthFSM, ProxyHealthPolicy
 
 if TYPE_CHECKING:
     from .config import PoolConfig, ServerConfig
@@ -302,43 +303,55 @@ def open_socks5(
 class ProxyPoolManager:
     """Выбор прокси, штрафы и circuit breaker; состояние штрафов переживает hot-reload конфигурации."""
 
-    def __init__(self, *, clock: Callable[[], float] = time.time, rng: random.Random | None = None):
+    def __init__(self, *, clock: Callable[[], float] = time.time, rng: random.Random | None = None, health_policy: ProxyHealthPolicy | None = None):
         self._clock, self._rng, self._lock = clock, rng or random.Random(), threading.Lock()
         self._penalties: dict[str, float] = {}
         self._endpoints: dict[str, ProxyEndpoint] = {}
+        self._pool_sizes: dict[str, int] = {}
+        self._health_policy = health_policy
+        self._fsm = ProxyHealthFSM(health_policy, clock=self._clock, rng=self._rng) if health_policy is not None else None
 
     def endpoints(self, pool: PoolConfig) -> list[ProxyEndpoint]:
         with self._lock:
-            result = []
-            for url in pool.proxies:
-                endpoint = self._endpoints.get(url)
-                if endpoint is None:
-                    endpoint = self._endpoints[url] = parse_proxy_url(url)
-                result.append(endpoint)
-            return result
+            for u in pool.proxies: self._pool_sizes[u] = len(pool.proxies)
+            return [self._endpoints.setdefault(u, parse_proxy_url(u)) for u in pool.proxies]
+
+    def _record_fail(self, endpoint: ProxyEndpoint | None, penalize: bool, seconds: float) -> None:
+        if endpoint is None: return
+        if penalize: self.penalize(endpoint, seconds)
+        elif self._fsm is not None: self._fsm.release_probe(endpoint.raw, False)
 
     def penalize(self, endpoint: ProxyEndpoint, seconds: float) -> None:
-        """`penalty_until = time.time() + penalty_seconds`."""
-        with self._lock:
-            self._penalties[endpoint.raw] = self._clock() + seconds
+        if self._fsm is not None:
+            with self._lock: psize = self._pool_sizes.get(endpoint.raw, 1)
+            until = self._fsm.record_failure(endpoint.raw, seconds, pool_size=psize)
+        else: until = self._clock() + seconds
+        with self._lock: self._penalties[endpoint.raw] = until
+
+    def record_success(self, endpoint: ProxyEndpoint | None) -> None:
+        if endpoint is None: return
+        if self._fsm is not None: self._fsm.record_success(endpoint.raw)
+        with self._lock: self._penalties.pop(endpoint.raw, None)
 
     def is_penalized(self, endpoint: ProxyEndpoint) -> bool:
+        if self._fsm is not None:
+            return self._fsm.is_penalized(endpoint.raw)
         with self._lock:
             return self._penalties.get(endpoint.raw, 0.0) > self._clock()
 
-    def available(self, pool: PoolConfig, exclude: Iterable[str] = ()) -> list[ProxyEndpoint]:
+    def available(self, pool: PoolConfig, exclude: Iterable[str] = (), *, allow_keep_alive: bool = False) -> list[ProxyEndpoint]:
         excluded, now, endpoints = set(exclude), self._clock(), self.endpoints(pool)
+        if self._fsm is not None:
+            return self._fsm.available_endpoints(endpoints, excluded, allow_keep_alive=allow_keep_alive)[0]
         with self._lock:
             return [e for e in endpoints if self._penalties.get(e.raw, 0.0) <= now and e.raw not in excluded]
 
     def ensure_available(self, pool: PoolConfig) -> None:
-        """Circuit breaker: все прокси в штрафе — мгновенный отказ без удержания слота."""
-        if pool.type != "direct" and not self.available(pool):
+        if pool.type != "direct" and not self.available(pool, allow_keep_alive=self._fsm is not None):
             raise AllProxiesPenalizedError(pool.name)
 
-    def select(self, pool: PoolConfig, exclude: Iterable[str] = ()) -> ProxyEndpoint | None:
-        """Выбрать прокси по стратегии пула; None — нет кандидатов (или пул direct)."""
-        candidates = [] if pool.type == "direct" else self.available(pool, exclude)
+    def select(self, pool: PoolConfig, exclude: Iterable[str] = (), *, allow_keep_alive: bool = False) -> ProxyEndpoint | None:
+        candidates = [] if pool.type == "direct" else self.available(pool, exclude, allow_keep_alive=allow_keep_alive)
         if not candidates:
             return None
         return self._rng.choice(candidates) if pool.strategy == "random" else candidates[0]
@@ -415,13 +428,16 @@ class ProxyPoolManager:
         overall = time.monotonic() + settings.total_deadline
         tried: set[str] = set()
         last: EgressConnectError | None = None
-        single = len(pool.proxies) == 1  # единственную прокси перебирать нечем: ретраи идут в неё же
+        single = len(pool.proxies) == 1
+        if self._fsm is not None:
+            cap_to, cap_ret = self._fsm.bounded_timeouts(settings, len(pool.proxies))
+            settings = replace(settings, connect_timeout=cap_to, retries=cap_ret)
         if single and settings.single_pool_max_retries is not None:
             settings = replace(settings, retries=min(settings.retries, settings.single_pool_max_retries))
         for attempt in range(settings.retries + 1):
             endpoint = None
             if pool.type != "direct":
-                endpoint = self.select(pool, set() if single else tried)
+                endpoint = self.select(pool, set() if single else tried, allow_keep_alive=(self._fsm is not None and not tried))
                 if endpoint is None:
                     if last is None:
                         raise AllProxiesPenalizedError(pool.name)
@@ -433,7 +449,7 @@ class ProxyPoolManager:
                 break
             attempt_start = time.monotonic()
             attempt_deadline = attempt_start + min(settings.connect_timeout, remaining)
-            target = endpoint.label if endpoint is not None else f"{host}:{port}"  # без учётных данных прокси
+            target = endpoint.label if endpoint is not None else f"{host}:{port}"
             penalize = endpoint is not None and (not single or attempt == settings.retries)
             if on_attempt is not None:
                 on_attempt(endpoint)
@@ -441,28 +457,18 @@ class ProxyPoolManager:
                 sock = self._open(pool, endpoint, host, port, attempt_deadline)
             except (OSError, EgressConnectError) as exc:
                 last = self._normalize(exc, endpoint, host, port)
-                err_phase = last.phase or "connect"
-                if endpoint is not None and penalize:
-                    self.penalize(endpoint, settings.penalty_seconds)
-                logger.warning(
-                    "proxy %s failed during %s: %s (penalized=%s, elapsed=%.1fms)",
-                    target,
-                    err_phase,
-                    type(exc).__name__,
-                    penalize,
-                    (time.monotonic() - attempt_start) * 1000,
-                )
+                self._record_fail(endpoint, penalize, settings.penalty_seconds)
+                logger.warning("proxy %s failed during %s: %s (penalized=%s, elapsed=%.1fms)", target, last.phase or "connect", type(exc).__name__, penalize, (time.monotonic() - attempt_start) * 1000)
                 self._backoff_pause(pool, settings, attempt, single, overall)
                 continue
             if wrap is None:
                 sock.settimeout(None)
+                self.record_success(endpoint)
                 return sock
             if time.monotonic() >= attempt_deadline:
                 sock.close()
-                last = EgressTimeoutError(
-                    f"connect timeout of {settings.connect_timeout:g}s exceeded before TLS handshake",
-                    phase="tls_handshake",
-                )
+                last = EgressTimeoutError(f"connect timeout of {settings.connect_timeout:g}s exceeded before TLS handshake", phase="tls_handshake")
+                if self._fsm is not None and endpoint is not None: self._fsm.release_probe(endpoint.raw, False)
                 logger.warning("connect timeout before TLS for %s (penalized=False)", target)
                 self._backoff_pause(pool, settings, attempt, single, overall)
                 continue
@@ -470,20 +476,12 @@ class ProxyPoolManager:
                 _arm(sock, attempt_deadline)
                 wrapped = wrap(sock)
                 wrapped.settimeout(None)
+                self.record_success(endpoint)
                 return wrapped
             except (OSError, ValueError) as exc:
                 sock.close()
-                last = EgressConnectError(
-                    f"TLS handshake with {host} failed: {type(exc).__name__}", phase="tls_handshake"
-                )
-                if endpoint is not None and penalize:
-                    self.penalize(endpoint, settings.penalty_seconds)
-                logger.warning(
-                    "proxy %s failed during tls_handshake: %s (penalized=%s, elapsed=%.1fms)",
-                    target,
-                    type(exc).__name__,
-                    penalize,
-                    (time.monotonic() - attempt_start) * 1000,
-                )
+                last = EgressConnectError(f"TLS handshake with {host} failed: {type(exc).__name__}", phase="tls_handshake")
+                self._record_fail(endpoint, penalize, settings.penalty_seconds)
+                logger.warning("proxy %s failed during tls_handshake: %s (penalized=%s, elapsed=%.1fms)", target, type(exc).__name__, penalize, (time.monotonic() - attempt_start) * 1000)
                 self._backoff_pause(pool, settings, attempt, single, overall)
         raise last or EgressConnectError(f"cannot connect to {host}:{port}")

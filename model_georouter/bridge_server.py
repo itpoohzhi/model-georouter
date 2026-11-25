@@ -19,37 +19,14 @@ from . import SERVICE_NAME, SERVICE_NAME_ALIASES, __version__, config_guard, egr
 from ._typing import override
 from .adapters import AdapterRegistry, AdapterRoute, AdminAdapter
 from .config import BridgeConfig, ConfigManager, PoolConfig, UpstreamConfig
+from .egress_policy_helpers import bounded_max_attempts, bounded_setup_timeout, build_route_breaker, should_reject_breaker_floor
 from .error_handler import ErrorHandler, json_response_bytes
-from .errors import (
-    AllProxiesPenalizedError,
-    BadRequestError,
-    BridgeError,
-    ClientTimeoutError,
-    EgressConnectError,
-    EgressTimeoutError,
-    FramingError,
-    NotFoundError,
-    SlotsExhaustedError,
-    UpstreamProtocolError,
-    UpstreamTimeoutError,
-)
+from .errors import (AllProxiesPenalizedError, BadRequestError, BridgeError, ClientTimeoutError, EgressConnectError, EgressTimeoutError, FramingError, NotFoundError, SlotsExhaustedError, UpstreamProtocolError, UpstreamTimeoutError)
 from .geo_cache import GeoCache
-from .http_wire import (
-    BODY_METHODS,
-    HOP_BY_HOP,
-    Framing,
-    HeadError,
-    RequestHead,
-    ResponseHead,
-    build_client_head,
-    connection_tokens,
-    framing_for_request,
-    framing_for_response,
-    parse_request_head,
-    parse_response_head,
-    read_head_block,
-)
+from .http_wire import (BODY_METHODS, HOP_BY_HOP, Framing, HeadError, RequestHead, ResponseHead, build_client_head, connection_tokens, framing_for_request, framing_for_response, parse_request_head, parse_response_head, read_head_block)
 from .logging_utils import get_logger
+from .metadata_cache import CachedMetadataResponse, MetadataCache, MetadataQuery
+from .proxy_health_fsm import ProxyHealthPolicy
 from .model_router import (
     THINKING_BINDING_BETA,
     BodyInspector,
@@ -62,18 +39,7 @@ from .model_router import (
 )
 from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
-from .retry_budget import (
-    GEOROUTER_OWNER,
-    AttemptEvent,
-    AttemptState,
-    EgressDeadline,
-    RetryBudgetSpec,
-    RouteCircuitBreaker,
-    bridge_replay_allowed,
-    consume_live_retry,
-    evaluate_replay_for_endpoint,
-    transition,
-)
+from .retry_budget import (GEOROUTER_OWNER, AttemptEvent, AttemptState, EgressDeadline, RetryBudgetSpec, RouteCircuitBreaker, bridge_replay_allowed, consume_live_retry, evaluate_replay_for_endpoint, transition)
 from .upstream_state import UpstreamStateWriter
 
 LOGGER = get_logger("model_georouter.server")
@@ -246,7 +212,8 @@ class BridgeServer(socketserver.ThreadingTCPServer):
         state_writer: UpstreamStateWriter | None = None,
     ) -> None:
         cfg = config_manager.get().server
-        self.config_manager, self.proxy_manager = config_manager, proxy_manager or ProxyPoolManager()
+        self.config_manager, self.proxy_manager = config_manager, proxy_manager or ProxyPoolManager(health_policy=ProxyHealthPolicy.from_env())
+        self.metadata_cache = MetadataCache()
         self.geo_cache = geo_cache or GeoCache(cfg.geo_cache_file or None, cfg.geo_cache_ttl_seconds)
         self.slots, self.ingress = SplitSlots(cfg.direct_slots, cfg.proxy_slots), SlotPool(cfg.max_connections)
         self.metrics, self.error_handler, self.admin = Metrics(), ErrorHandler(), AdminAdapter()
@@ -360,7 +327,7 @@ def _breaker(route_id: str, pool: str = "") -> RouteCircuitBreaker:
     """F-003: живой breaker на пару (upstream, pool); пустой pool — legacy-ключ route_id."""
     key = f"{pool}:{route_id}" if pool else route_id
     with _BREAKER_LOCK:
-        return _BREAKERS.setdefault(key, RouteCircuitBreaker(key))
+        return _BREAKERS.setdefault(key, build_route_breaker(key))
 
 
 _CLAUDE_MODEL_PREFIXES = ("claude-", "anthropic/")
@@ -474,6 +441,14 @@ class _Handler(socketserver.BaseRequestHandler):
         if head_only:  # HEAD: статус и заголовки (в т.ч. Content-Length) как у GET, без тела
             data = data.partition(b"\r\n\r\n")[0] + b"\r\n\r\n"
         self._send_bytes(sock, data)
+
+    def _send_cached_metadata(self, sock: socket.socket, entry: CachedMetadataResponse) -> None:
+        self.status, self.outcome = entry.status, "cache_hit"
+        self._bridge.metrics.incr(f"status_{entry.status}")
+        hdrs = [f"{k}: {v}" for k, v in entry.headers] + [f"Content-Length: {len(entry.body)}", "Connection: close"]
+        head = f"HTTP/1.1 {entry.status} OK\r\n" + "\r\n".join(hdrs) + "\r\n\r\n"
+        self._send_bytes(sock, head.encode("latin-1") + entry.body)
+        self.bytes_sent = len(entry.body)
 
     def _fail(self, sock: socket.socket, exc: BaseException) -> None:
         srv = self._bridge
@@ -599,30 +574,40 @@ class _Handler(socketserver.BaseRequestHandler):
         route = runtime.registry.resolve(path)
         if route is None:
             raise NotFoundError(f"no adapter serves path {path}")
-        inspector = self._read_request_body(sock, req, rest, cfg.body_buffer_max_bytes, cfg.body_timeout)
-        self.model = inspector.model or model_from_path(path)
-        self._sanitize_request_body(req, route, inspector)
-        decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache, default_pool=route.pool or None)
-        if decision.source == "geo_cache":
-            srv.metrics.incr("geo_cache_hits")
-        upstream, fallback = snapshot.upstreams[route.upstream], snapshot.geo_fallback_pool
-        now_tick = int(time.monotonic())
-        replay_pool = fallback if (fallback and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool]) and self.retry_allowed and snapshot.failover.enabled) else ""  # fmt: skip
-        probe = decision.pool if _breaker(route.upstream, decision.pool).try_acquire(now_tick) else ""
-        pool_name, replay_pool = (decision.pool, replay_pool) if probe or not replay_pool else (replay_pool, "")
-        budget = srv.admission.f08_v2_budget
-        long_hdr = egress_admission.is_streaming_request(path, stream_body=inspector.stream and budget is not None)
-        deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and long_hdr else cfg.total_egress_deadline)  # fmt: skip
-        self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
+        up_cfg = snapshot.upstreams[route.upstream]
+        lookup = srv.metadata_cache.lookup_or_acquire(MetadataQuery(route.adapter, f"{up_cfg.host}:{up_cfg.port}", req.method, path, query, req.headers))
+        if lookup.kind == "hit" and lookup.entry is not None:
+            return self._send_cached_metadata(sock, lookup.entry)
+        self._meta_key = lookup.key if lookup.kind == "leader" else None
         try:
-            with srv.admission.admit(pool_name, path, deadline=deadline, is_stream=inspector.stream) as ticket:
-                _ = srv.config_manager.retry_budget.mint_on_admitted_primary()
-                self._attempt(pool_name, replay_pool, ticket.deadline, probe=probe)
-        except _ReplayRequested:
-            srv.geo_cache.mark_blocked(route.upstream, self.model, cfg.geo_cache_ttl_seconds)
-            srv.metrics.incr("replays")
-            self.replayed = True
-            self._attempt(fallback, "", deadline, False, fallback if _breaker(route.upstream, fallback).try_acquire(now_tick) else "")  # fmt: skip
+            inspector = self._read_request_body(sock, req, rest, cfg.body_buffer_max_bytes, cfg.body_timeout)
+            self.model = inspector.model or model_from_path(path)
+            self._sanitize_request_body(req, route, inspector)
+            decision = runtime.router.decide(self.model, route.upstream, srv.geo_cache, default_pool=route.pool or None)
+            if decision.source == "geo_cache": srv.metrics.incr("geo_cache_hits")
+            upstream, fallback, now_tick = up_cfg, snapshot.geo_fallback_pool, int(time.monotonic())
+            replay_pool = fallback if (fallback and fallback != decision.pool and _is_direct(snapshot.pools[decision.pool]) and self.retry_allowed and snapshot.failover.enabled) else ""  # fmt: skip
+            probe = decision.pool if _breaker(route.upstream, decision.pool).try_acquire(now_tick) else ""
+            pool_name, replay_pool = (decision.pool, replay_pool) if probe or not replay_pool else (replay_pool, "")
+            if should_reject_breaker_floor(bool(probe), pool_name, decision.pool, _breaker(route.upstream, pool_name), now_tick):
+                return self._respond_json(sock, 503, {"error": {"message": "route circuit breaker open", "type": "route_unavailable"}})
+            budget = srv.admission.f08_v2_budget
+            long_hdr = egress_admission.is_streaming_request(path, stream_body=inspector.stream and budget is not None)
+            deadline = EgressDeadline.from_timeout(budget.t_idle if budget is not None and long_hdr else cfg.total_egress_deadline)  # fmt: skip
+            self._context = (sock, snapshot, runtime, req, route, query, upstream, inspector)
+            try:
+                with srv.admission.admit(pool_name, path, deadline=deadline, is_stream=inspector.stream) as ticket:
+                    _ = srv.config_manager.retry_budget.mint_on_admitted_primary()
+                    self._attempt(pool_name, replay_pool, ticket.deadline, probe=probe)
+            except _ReplayRequested:
+                srv.geo_cache.mark_blocked(route.upstream, self.model, cfg.geo_cache_ttl_seconds)
+                srv.metrics.incr("replays")
+                self.replayed = True
+                self._attempt(fallback, "", deadline, False, fallback if _breaker(route.upstream, fallback).try_acquire(now_tick) else "")  # fmt: skip
+        finally:
+            if getattr(self, "_meta_key", None) is not None:
+                srv.metadata_cache.complete(self._meta_key, 502, (), b"")
+                self._meta_key = None
 
     def _read_request_body(
         self, sock: socket.socket, req: RequestHead, rest: bytes, limit: int, timeout: float
@@ -775,9 +760,15 @@ class _Handler(socketserver.BaseRequestHandler):
         else: breaker.record_failure(int(time.monotonic()), client_validation=400 <= status < 500 and status not in (403, 429))  # fmt: skip
         if adapter and adapter.wants_transform(route, head):
             body = bytearray()
-            framing = framing_for_response(req.method, status, head.headers, body.extend)
-            self._read_buffered_body(up, framing, rest, cfg.body_timeout)
+            self._read_buffered_body(up, framing_for_response(req.method, status, head.headers, body.extend), rest, cfg.body_timeout)
             return self._send_transformed_response(*adapter.transform_response(route, head, bytes(body)))
+        if getattr(self, "_meta_key", None) is not None:
+            body = bytearray()
+            self._read_buffered_body(up, framing_for_response(req.method, status, head.headers, body.extend), rest, cfg.body_timeout)
+            raw = bytes(body)
+            srv.metadata_cache.complete(self._meta_key, status, head.headers, raw)
+            self._meta_key = None
+            return self._send_transformed_response(head, raw)
         framing = framing_for_response(req.method, status, head.headers)
         initial, initial_fed, region = rest, False, False
         if head.status == 403:
@@ -795,7 +786,9 @@ class _Handler(socketserver.BaseRequestHandler):
         self._relay(up, head, framing, initial, initial_fed)
 
     def _connect_upstream(self, pool: PoolConfig, up: UpstreamConfig, dl: EgressDeadline, single: bool = False) -> socket.socket:  # fmt: skip
-        return self._bridge.egress.connect(pool, (up.host, up.port), replace(EgressSettings.from_server(self._ctx[1].server)), handler=(self, dl, EgressTimeoutError), up=up, single=single)  # fmt: skip
+        s = EgressSettings.from_server(self._ctx[1].server)
+        bounded = replace(s, connect_timeout=bounded_setup_timeout(max(0.1, dl.remaining()), s.connect_timeout), retries=bounded_max_attempts(s.retries))
+        return self._bridge.egress.connect(pool, (up.host, up.port), bounded, handler=(self, dl, EgressTimeoutError), up=up, single=single)
 
     def _send_upstream_request(self, up: socket.socket, timeout: float, dl: EgressDeadline | None = None) -> None:
         _, _, _, req, route, query, upstream, inspector = self._ctx
