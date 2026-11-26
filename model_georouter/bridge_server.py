@@ -27,16 +27,9 @@ from .http_wire import (BODY_METHODS, HOP_BY_HOP, Framing, HeadError, RequestHea
 from .logging_utils import get_logger
 from .metadata_cache import CachedMetadataResponse, MetadataCache, MetadataQuery
 from .proxy_health_fsm import ProxyHealthPolicy
-from .model_router import (
-    THINKING_BINDING_BETA,
-    BodyInspector,
-    ModelRouter,
-    RegionErrorClassifier,
-    ensure_anthropic_thinking_drop_block,
-    model_from_path,
-    sanitize_google_v1beta_body,
-    sanitize_openai_empty_messages,
-)
+from .model_router import (THINKING_BINDING_BETA, BodyInspector, ModelRouter, RegionErrorClassifier, ensure_anthropic_thinking_drop_block, model_from_path, sanitize_google_v1beta_body, sanitize_openai_empty_messages)
+from .prerelay_policy import PreRelayClientResetError
+from .prerelay_watch import read_upstream_head_watched
 from .proxy_pool import EgressSettings, ProxyEndpoint, ProxyPoolManager
 from .relay import RELAY_CHUNK, SSERelay, close_quietly, configure_socket
 from .retry_budget import (GEOROUTER_OWNER, AttemptEvent, AttemptState, EgressDeadline, RetryBudgetSpec, RouteCircuitBreaker, bridge_replay_allowed, consume_live_retry, evaluate_replay_for_endpoint, transition)
@@ -458,8 +451,10 @@ class _Handler(socketserver.BaseRequestHandler):
             if not isinstance(exc, (BridgeError, OSError)):
                 LOGGER.error("stream aborted by internal error: %s", type(exc).__name__)
             return
-        if isinstance(exc, (ConnectionError, BrokenPipeError, KeyboardInterrupt)):
+        if isinstance(exc, (ConnectionError, BrokenPipeError, KeyboardInterrupt, PreRelayClientResetError)):
             self.outcome = "client_disconnected"
+            if isinstance(exc, PreRelayClientResetError):
+                srv.metrics.incr("client_cancelled")
             return
         if not isinstance(exc, BridgeError):
             # LOG014 false positive: _fail() always runs inside `except` (see handle()),
@@ -681,7 +676,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 up = self._connect_upstream(pool, upstream, deadline, single)
                 self._send_upstream_request(up, cfg.body_timeout, deadline)
                 hdr_wait = cfg.headers_timeout if long_header else min(cfg.headers_timeout, b.primary_first_header_timeout if single else srv.admission.current(deadline).header_deadline_s)  # fmt: skip
-                head, rest = self._read_upstream_head(up, hdr_wait, None if long_header else deadline)
+                head, rest = read_upstream_head_watched(self._ctx[0], up, hdr_wait, None if long_header else deadline, self._read_upstream_head)
             except (AllProxiesPenalizedError, EgressConnectError, UpstreamTimeoutError, UpstreamProtocolError) as exc:
                 event = self._attempt_event(exc, deadline, self._last_proxy_endpoint)
                 _breaker(route.upstream, pool_name).record_failure(int(time.monotonic()))
