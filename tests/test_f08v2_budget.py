@@ -226,4 +226,3 @@ def test_openai_and_anthropic_streaming_requests_get_f08v2_sliding_budget(path: 
         assert non_stream_ticket.is_long_header is False
         assert non_stream_ticket.sliding_idle_s is None
         assert non_stream_ticket.deadline.remaining(now=200.0) == pytest.approx(40.0)
-

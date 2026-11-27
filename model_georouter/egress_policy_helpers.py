@@ -32,7 +32,9 @@ def build_route_breaker(route_id: str, failure_threshold: int = 3, cooldown_tick
     return RouteCircuitBreaker(route_id, failure_threshold=thresh, cooldown_ticks=cooldown)
 
 
-def bounded_setup_timeout(remaining_s: float, connect_timeout_s: float, *, max_setup_s: float = DEFAULT_SETUP_CAP_S) -> float:
+def bounded_setup_timeout(
+    remaining_s: float, connect_timeout_s: float, *, max_setup_s: float = DEFAULT_SETUP_CAP_S
+) -> float:
     """Ограничивает T_setup одной попытки <= 2.5s (с учётом оставшегося дедлайна)."""
     if not breaker_floor_enabled():
         return max(0.01, min(remaining_s, connect_timeout_s))

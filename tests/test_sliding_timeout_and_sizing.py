@@ -171,8 +171,6 @@ def test_sizing_configuration_m5_max() -> None:
     )
     raw_server = {field: getattr(server, field) for field in sizing_fields}
     raw_server.update(listen=server.listen, port=server.port, total_egress_deadline=40.0)
-    parsed = config_guard.validate_config(
-        {"server": raw_server, "pools": {"direct": {"type": "direct"}}, "rules": []}
-    )
+    parsed = config_guard.validate_config({"server": raw_server, "pools": {"direct": {"type": "direct"}}, "rules": []})
     for field in sizing_fields:
         assert getattr(parsed.bridge.server, field) == getattr(server, field)

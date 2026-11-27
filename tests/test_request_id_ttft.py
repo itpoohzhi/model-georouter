@@ -35,9 +35,7 @@ REQUEST_TAIL_RE = re.compile(
 
 
 def _body_for(model: str = "m", *, stream: bool = False) -> bytes:
-    return json.dumps(
-        {"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": stream}
-    ).encode()
+    return json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": stream}).encode()
 
 
 def _ok_responder(label: bytes = b"ok"):
@@ -249,9 +247,7 @@ def test_e2e_ttft_dash_when_no_upstream_response(track, start_bridge, caplog) ->
     up = track(HttpUpstream(_ok_responder(b"ok")))
     bridge = start_bridge(make_config(up.port))
     with caplog.at_level(logging.INFO, logger="model_georouter.server"):
-        resp_404 = http_request(
-            bridge.port, "GET", "/unknown/no-adapter", headers={"X-Request-Id": "req_404_test"}
-        )
+        resp_404 = http_request(bridge.port, "GET", "/unknown/no-adapter", headers={"X-Request-Id": "req_404_test"})
         assert resp_404.status == 404
         assert len(up.requests) == 0
         assert wait_for(lambda: len(_request_log_lines(caplog, "request method=GET path=/unknown/no-adapter")) == 1)

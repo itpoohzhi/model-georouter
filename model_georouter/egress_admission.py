@@ -159,7 +159,15 @@ class EgressAdmission:
                 proxy_slots, max_inflight_per_backend, max_inflight_long_header
             )
         spec, v2_budget = (
-            retry_budget or RetryBudgetSpec(total_egress_deadline=min(_cg.F08_V1_TOTAL_EGRESS_DEADLINE if float(total_egress_deadline) == 20.0 else float(total_egress_deadline), _cg.F08_V1_TOTAL_EGRESS_DEADLINE)),
+            retry_budget
+            or RetryBudgetSpec(
+                total_egress_deadline=min(
+                    _cg.F08_V1_TOTAL_EGRESS_DEADLINE
+                    if float(total_egress_deadline) == 20.0
+                    else float(total_egress_deadline),
+                    _cg.F08_V1_TOTAL_EGRESS_DEADLINE,
+                )
+            ),
             cast(_rb.F08V2Budget | None, None),
         )
         if f08_policy == _cg.DEFAULT_F08_POLICY and not isinstance(config, _cg.GuardedConfig):
@@ -197,7 +205,11 @@ class EgressAdmission:
             threading.local(),
         )
         if admission_wait_s is _F08_UNSET:
-            cfg_server = config.bridge.server if isinstance(config, _cg.GuardedConfig) else (config.server if isinstance(config, BridgeConfig) else None)
+            cfg_server = (
+                config.bridge.server
+                if isinstance(config, _cg.GuardedConfig)
+                else (config.server if isinstance(config, BridgeConfig) else None)
+            )
             admission_wait_s = getattr(cfg_server, "admission_wait_s", DEFAULT_ADMISSION_WAIT_S)
         if isinstance(admission_wait_s, bool) or not isinstance(admission_wait_s, int | float) or not math.isfinite(admission_wait_s) or admission_wait_s < 0:  # fmt: skip
             raise ConfigError("admission_wait_s: expected finite non-negative number")
@@ -250,7 +262,10 @@ class EgressAdmission:
 
     def enter_slot(self, pool: str, path: str, backend: str | None, deadline: EgressDeadline | None, started_at: float | None, now: float | None, is_stream: bool = False) -> tuple[object, Ticket]:  # fmt: skip
         """Занимает слот в счётчиках in-flight и сохраняет активный билет в TLS потока."""
-        egress_key, long_hdr = self.resolve_egress_key(pool, backend=backend), is_streaming_request(path, stream_body=is_stream and self.f08_v2_budget is not None)
+        egress_key, long_hdr = (
+            self.resolve_egress_key(pool, backend=backend),
+            is_streaming_request(path, stream_body=is_stream and self.f08_v2_budget is not None),
+        )
         eg_deadline, t_pre, s_idle = self.f08_v2_budget.resolve_for_path(path, deadline=deadline, started_at=started_at, is_stream=long_hdr) if self.f08_v2_budget else (deadline or EgressDeadline.from_timeout(self.retry_budget.total_egress_deadline, started_at=started_at), self.retry_budget.worst_case_pre_send_seconds, None)  # fmt: skip
         if (remaining_s := eg_deadline.remaining(now=now)) <= 0.0:
             raise EgressTimeoutError("egress deadline expired before admission", phase="admission")

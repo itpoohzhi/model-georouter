@@ -39,9 +39,11 @@ def test_should_reject_breaker_floor_closed_vs_open(monkeypatch) -> None:
     assert primary.try_acquire(100) is True
     assert should_reject_breaker_floor(True, "p", "p", primary, 100) is False
     # OPEN: try_acquire returns False -> acquired_primary=False -> 503 fail-fast unless healthy fallback
-    primary.record_failure(100); primary.record_failure(100)
+    primary.record_failure(100)
+    primary.record_failure(100)
     assert primary.try_acquire(101) is False
     assert should_reject_breaker_floor(False, "p", "p", primary, 101) is True
     assert should_reject_breaker_floor(False, "fb", "p", fallback, 101) is False
-    fallback.record_failure(101); fallback.record_failure(101)
+    fallback.record_failure(101)
+    fallback.record_failure(101)
     assert should_reject_breaker_floor(False, "fb", "p", fallback, 101) is True

@@ -10,19 +10,32 @@ from model_georouter.metadata_cache import MetadataCache, MetadataCacheConfig, M
 
 def test_two_principals_and_tenant_headers_never_leak() -> None:
     cache = MetadataCache()
-    l1 = cache.lookup_or_acquire(MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer alpha")]))
+    l1 = cache.lookup_or_acquire(
+        MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer alpha")])
+    )
     assert l1.kind == "leader"
     cache.complete(l1.key, 200, [("Content-Type", "application/json")], b'{"data":[{"id":"alpha"}]}')
 
-    hit = cache.lookup_or_acquire(MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer alpha")]))
+    hit = cache.lookup_or_acquire(
+        MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer alpha")])
+    )
     assert hit.kind == "hit" and hit.entry is not None and b"alpha" in hit.entry.body
 
-    beta = cache.lookup_or_acquire(MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer beta")]))
+    beta = cache.lookup_or_acquire(
+        MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer beta")])
+    )
     assert beta.kind == "leader" and beta.key != l1.key
     cache.complete(beta.key, 200, [("Content-Type", "application/json")], b'{"data":[{"id":"beta"}]}')
 
     org2 = cache.lookup_or_acquire(
-        MetadataQuery("r1", "up:443", "GET", "/openai/v1/models", "", [("Authorization", "Bearer alpha"), ("OpenAI-Organization", "org-2")])
+        MetadataQuery(
+            "r1",
+            "up:443",
+            "GET",
+            "/openai/v1/models",
+            "",
+            [("Authorization", "Bearer alpha"), ("OpenAI-Organization", "org-2")],
+        )
     )
     assert org2.kind == "leader" and org2.key != l1.key
 
@@ -30,9 +43,17 @@ def test_two_principals_and_tenant_headers_never_leak() -> None:
 def test_bypass_on_cookie_query_secret_and_no_cache_and_negative_ttl_zero(monkeypatch) -> None:
     cache = MetadataCache()
     assert cache.lookup_or_acquire(MetadataQuery("r1", "up", "HEAD", "/v1/models", "", [])).kind == "bypass"
-    assert cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Cookie", "s=1")])).kind == "bypass"
+    assert (
+        cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Cookie", "s=1")])).kind
+        == "bypass"
+    )
     assert cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "key=secret", [])).kind == "bypass"
-    assert cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Cache-Control", "no-cache")])).kind == "bypass"
+    assert (
+        cache.lookup_or_acquire(
+            MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Cache-Control", "no-cache")])
+        ).kind
+        == "bypass"
+    )
     monkeypatch.setenv("GEOROUTER_METADATA_CACHE_ENABLED", "0")
     assert cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "", [])).kind == "bypass"
     monkeypatch.delenv("GEOROUTER_METADATA_CACHE_ENABLED", raising=False)
@@ -51,7 +72,9 @@ def test_singleflight_coalesces_concurrent_requests_and_respects_max_inflight() 
     results = []
 
     def worker(_idx: int) -> None:
-        res = cache.lookup_or_acquire(MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Authorization", "Bearer same")]))
+        res = cache.lookup_or_acquire(
+            MetadataQuery("r1", "up", "GET", "/v1/models", "", [("Authorization", "Bearer same")])
+        )
         if res.kind == "leader":
             with lock:
                 hits["upstream"] += 1
