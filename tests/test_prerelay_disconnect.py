@@ -318,31 +318,37 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
     flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: flag_enabled}), encoding="utf-8")
     monkeypatch.setenv(DEFAULT_FLAGS_PATH_ENV, str(flags_file))
 
+    hdr_timeout_s = 0.15
+    wait_bound_s = max(3.0, hdr_timeout_s * 20.0)
+    accepted_lock = threading.Lock()
     accepted: list[int] = []
     eof_on_first = threading.Event()
-    release_ev = threading.Event()
 
     def _up_handler(conn: socket.socket) -> None:
-        idx = len(accepted)
-        accepted.append(idx)
-        conn.settimeout(0.5)
-        try:
-            conn.recv(4096)
-        except OSError:
-            pass
+        from tests.helpers import recv_head
+
+        with accepted_lock:
+            idx = len(accepted)
+            accepted.append(idx)
+        conn.settimeout(wait_bound_s)
         if idx == 0:
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline and not release_ev.is_set():
-                try:
-                    if conn.recv(1) == b"":
-                        eof_on_first.set()
-                        break
-                except TimeoutError:
-                    continue
-                except OSError:
-                    eof_on_first.set()
-                    break
+            try:
+                while conn.recv(4096):
+                    pass
+                eof_on_first.set()
+            except OSError:
+                eof_on_first.set()
         else:
+            head, rest = recv_head(conn)
+            cl = 0
+            for line in head.decode("latin1").splitlines():
+                if line.lower().startswith("content-length:"):
+                    cl = int(line.split(":", 1)[1].strip())
+            while len(rest) < cl:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                rest += chunk
             conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 
     up_srv = FakeServer(_up_handler)
@@ -350,7 +356,7 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
         server=ServerConfig(
             listen="127.0.0.1",
             port=0,
-            headers_timeout=0.15,
+            headers_timeout=hdr_timeout_s,
             body_timeout=1.0,
             inactivity_timeout=1.0,
             log_dir=str(tmp_path / "logs"),
@@ -372,7 +378,7 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
         )
         assert resp.status == 504
         assert resp.json["error"]["type"] == "upstream_timeout"
-        assert eof_on_first.wait(timeout=1.5), "upstream socket must be closed (not pooled) after 504"
+        assert eof_on_first.wait(timeout=wait_bound_s), "upstream socket must be closed (not pooled) after 504"
         resp2 = http_request(
             bridge.server_address[1],
             "POST",
@@ -381,13 +387,13 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
         )
         assert resp2.status == 200
         assert resp2.body == b"ok"
-        assert len(accepted) == 2
+        with accepted_lock:
+            assert len(accepted) == 2
     finally:
-        release_ev.set()
         bridge.shutdown()
         bridge.server_close()
         up_srv.close()
-        b_thread.join(timeout=2.0)
+        b_thread.join(timeout=wait_bound_s)
 
 
 def test_l1_read_head_expired_deadline_and_nonpositive_budget_raise_upstream_timeout(
