@@ -57,14 +57,23 @@ def test_bridge_metadata_cache_singleflight_and_breaker_floor_503(tmp_path) -> N
 
     cfg_path = tmp_path / "cfg.json"
     cfg_path.write_text(
-        json.dumps({
-            "server": {"listen": "127.0.0.1", "port": 0, "total_egress_deadline": 40, "log_dir": str(tmp_path / "logs"), "f08_policy": "v2", "f08_v2_risk_ack": "AD-003/2026-11-14"},
-            "pools": {"direct": {"type": "direct"}},
-            "rules": [],
-            "default_pool": "direct",
-            "upstreams": {"mock": {"host": "127.0.0.1", "port": up_port, "use_tls": False, "base_path": "/v1"}},
-            "adapters": {"m": {"prefixes": ["/m/v1"], "upstream": "mock", "pool": "direct"}},
-        }),
+        json.dumps(
+            {
+                "server": {
+                    "listen": "127.0.0.1",
+                    "port": 0,
+                    "total_egress_deadline": 40,
+                    "log_dir": str(tmp_path / "logs"),
+                    "f08_policy": "v2",
+                    "f08_v2_risk_ack": "AD-003/2026-11-14",
+                },
+                "pools": {"direct": {"type": "direct"}},
+                "rules": [],
+                "default_pool": "direct",
+                "upstreams": {"mock": {"host": "127.0.0.1", "port": up_port, "use_tls": False, "base_path": "/v1"}},
+                "adapters": {"m": {"prefixes": ["/m/v1"], "upstream": "mock", "pool": "direct"}},
+            }
+        ),
         encoding="utf-8",
     )
     bridge_server._BREAKERS.clear()

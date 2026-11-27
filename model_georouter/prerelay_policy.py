@@ -13,15 +13,17 @@ _FALSE_STRINGS: Final[frozenset[str]] = frozenset({"0", "false", "no", "off", ""
 
 # POSIX errno numbers (macOS & Linux) for client-side hard disconnect vs transient wakeup
 _TRANSIENT_ERRNOS: Final[frozenset[int]] = frozenset({4, 11, 35})  # EINTR, EAGAIN(linux), EAGAIN(darwin)
-_RESET_ERRNOS: Final[frozenset[int]] = frozenset({
-    32,   # EPIPE
-    53,   # ECONNABORTED (darwin)
-    54,   # ECONNRESET (darwin)
-    60,   # ETIMEDOUT (darwin)
-    103,  # ECONNABORTED (linux)
-    104,  # ECONNRESET (linux)
-    110,  # ETIMEDOUT (linux)
-})
+_RESET_ERRNOS: Final[frozenset[int]] = frozenset(
+    {
+        32,  # EPIPE
+        53,  # ECONNABORTED (darwin)
+        54,  # ECONNRESET (darwin)
+        60,  # ETIMEDOUT (darwin)
+        103,  # ECONNABORTED (linux)
+        104,  # ECONNRESET (linux)
+        110,  # ETIMEDOUT (linux)
+    }
+)
 
 
 class PreRelayClientResetError(Exception):

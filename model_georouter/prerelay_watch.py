@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Final, Protocol
 
+from .errors import UpstreamTimeoutError
 from .prerelay_policy import (
     ClientWatchAction,
     PreRelayClientResetError,
@@ -88,8 +89,13 @@ _DEFAULT_FLAG_CACHE = DynamicFlagCache()
 
 def _remaining_wait(timeout: float, deadline: Any, started_at: float) -> float:
     phase_left = max(0.0, timeout - (time.monotonic() - started_at))
+    if phase_left <= 0.0:
+        return 0.0
     if deadline is not None and hasattr(deadline, "clamp"):
-        return max(0.0, float(deadline.clamp(phase_left)))
+        try:
+            return max(0.0, float(deadline.clamp(phase_left)))
+        except TimeoutError:
+            raise UpstreamTimeoutError(f"upstream sent no response headers within {timeout:g}s") from None
     return phase_left
 
 
@@ -141,24 +147,24 @@ def _wait_upstream_or_client_reset(
     timeout: float,
     deadline: Any,
     started_at: float,
-) -> None:
+) -> bool:
     if _upstream_has_buffered_tls(up_sock):
-        return
+        return True
     with selectors.DefaultSelector() as sel:
         sel.register(up_sock, selectors.EVENT_READ, data="up")
         watch_client = _register_client(sel, client_sock)
         while True:
             rem = _remaining_wait(timeout, deadline, started_at)
             if rem <= 0.0:
-                return
+                return False
             events = sel.select(timeout=rem)
             if not events:
-                return
+                return False
             ready = {key.data for key, _ in events}
             if watch_client and "client" in ready:
                 watch_client = _handle_client_ready(sel, client_sock)
             if "up" in ready:
-                return
+                return True
 
 
 class SelectorPreRelayWatcher:
@@ -178,9 +184,13 @@ class SelectorPreRelayWatcher:
         if client_sock is None or not self._flag_cache.is_enabled():
             return legacy_reader(up_sock, timeout, deadline)
         started_at = time.monotonic()
-        _wait_upstream_or_client_reset(client_sock, up_sock, timeout, deadline, started_at)
+        up_ready = _wait_upstream_or_client_reset(client_sock, up_sock, timeout, deadline, started_at)
+        if not up_ready:
+            raise UpstreamTimeoutError(f"upstream sent no response headers within {timeout:g}s")
         rem = _remaining_wait(timeout, deadline, started_at)
-        return legacy_reader(up_sock, rem if rem > 0.0 else 0.001, deadline)
+        if rem <= 0.0:
+            rem = min(max(timeout, 1e-3), 0.05)
+        return legacy_reader(up_sock, rem, deadline)
 
 
 _DEFAULT_WATCHER = SelectorPreRelayWatcher()

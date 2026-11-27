@@ -42,7 +42,9 @@ def test_exponential_backoff_and_half_open_single_probe() -> None:
 def test_one_proxy_pool_preserves_legacy_fast_fail_even_with_policy() -> None:
     now = [10.0]
     mgr = ProxyPoolManager(clock=lambda: now[0], health_policy=ProxyHealthPolicy(enabled=True))
-    pool = PoolConfig(name="single", type="http_connect", strategy="first_available", proxies=("http://127.0.0.1:9001",))
+    pool = PoolConfig(
+        name="single", type="http_connect", strategy="first_available", proxies=("http://127.0.0.1:9001",)
+    )
     ep = mgr.endpoints(pool)[0]
     mgr.penalize(ep, 30.0)
     with pytest.raises(AllProxiesPenalizedError):

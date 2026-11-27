@@ -49,9 +49,7 @@ def _load_api() -> tuple[_EvaluateReplay, _RunFailover] | None:
     if missing:
         if _EXPECT_RED:
             return None
-        raise AssertionError(
-            f"W0 contract API missing from {_MODULE}: {', '.join(missing)}"
-        )
+        raise AssertionError(f"W0 contract API missing from {_MODULE}: {', '.join(missing)}")
     return (
         cast(_EvaluateReplay, namespace["evaluate_replay"]),
         cast(_RunFailover, namespace["run_failover"]),
@@ -290,4 +288,3 @@ def test_failed_half_open_probe_is_released(track, start_bridge) -> None:
 
     assert http_request(bridge.port, "POST", PATH, BODY).status == 500
     assert breaker.try_acquire(int(time.monotonic()) + 100) is True
-

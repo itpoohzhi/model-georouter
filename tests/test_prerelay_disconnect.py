@@ -35,6 +35,7 @@ from model_georouter.prerelay_watch import DEFAULT_FLAGS_PATH_ENV, DynamicFlagCa
 
 # --- L1 Zero-I/O policy & golden precedence tests ---
 
+
 @pytest.mark.parametrize(
     ("json_snap", "env_snap", "json_invalid", "expected"),
     [
@@ -100,6 +101,7 @@ def test_dynamic_flag_cache_invalidation_on_atomic_replace(tmp_path: Path, monke
 
 # --- L2 Real loopback socket tests ---
 
+
 def _force_rst(sock: socket.socket) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     sock.close()
@@ -125,6 +127,7 @@ def test_l2_client_rst_aborts_prerelay_fast_while_flag_false_keeps_legacy(tmp_pa
     c_srv, c_cli = _tcp_pair()
     u_srv, u_cli = _tcp_pair()
     try:
+
         def _send_rst() -> None:
             time.sleep(0.05)
             _force_rst(c_cli)
@@ -133,9 +136,11 @@ def test_l2_client_rst_aborts_prerelay_fast_while_flag_false_keeps_legacy(tmp_pa
         t.start()
         t0 = time.monotonic()
         with pytest.raises(PreRelayClientResetError):
+
             def _read_u(u: socket.socket, to: float, _dl: float | None) -> tuple[bytes, bytes]:
                 u.settimeout(to)
                 return u.recv(16), b""
+
             watcher.read_head(c_srv, u_srv, 2.0, None, _read_u)
         elapsed = time.monotonic() - t0
         t.join(timeout=1.0)
@@ -230,6 +235,7 @@ def test_l2_full_bridge_server_client_rst_no_proxy_penalty_and_shut_wr_ok(
                 continue
             except OSError:
                 break
+
             def _handle(c: socket.socket) -> None:
                 try:
                     c.settimeout(1.0)
@@ -241,6 +247,7 @@ def test_l2_full_bridge_server_client_rst_no_proxy_penalty_and_shut_wr_ok(
                     pass
                 finally:
                     c.close()
+
             threading.Thread(target=_handle, args=(conn,), daemon=True).start()
 
     up_thread = threading.Thread(target=_up_loop, daemon=True)
@@ -297,3 +304,47 @@ def test_l2_full_bridge_server_client_rst_no_proxy_penalty_and_shut_wr_ok(
         up_srv.close()
         b_thread.join(timeout=2.0)
         up_thread.join(timeout=2.0)
+
+
+def test_l2_prerelay_enabled_header_timeout_returns_504_not_502(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When flag is True, header timeout in selector returns 504 upstream_timeout (no ValueError/TimeoutError 502)."""
+    from tests.helpers import FakeServer, http_request
+
+    flags_file = tmp_path / "geo-flags.json"
+    flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: True}), encoding="utf-8")
+    monkeypatch.setenv(DEFAULT_FLAGS_PATH_ENV, str(flags_file))
+
+    up_srv = FakeServer(lambda conn: time.sleep(1.5))
+    cfg = BridgeConfig(
+        server=ServerConfig(
+            listen="127.0.0.1",
+            port=0,
+            headers_timeout=0.25,
+            body_timeout=1.0,
+            inactivity_timeout=1.0,
+            log_dir=str(tmp_path / "logs"),
+        ),
+        upstreams={"slow": UpstreamConfig(host="127.0.0.1", port=up_srv.port, use_tls=False)},
+        adapters={"slow": AdapterConfig(prefixes=("/v1/chat",), upstream="slow", pool="direct")},
+        pools={"direct": PoolConfig(name="direct", type="direct")},
+        rules=(RuleConfig(pool="direct", match_prefix=("/v1/chat",)),),
+    )
+    bridge = BridgeServer(ConfigManager(initial=cfg))
+    b_thread = threading.Thread(target=bridge.serve_forever, daemon=True)
+    b_thread.start()
+    try:
+        resp = http_request(
+            bridge.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            b'{"model":"m","messages":[{"role":"user","content":"hi"}]}',
+        )
+        assert resp.status == 504
+        assert resp.json["error"]["type"] == "upstream_timeout"
+    finally:
+        bridge.shutdown()
+        bridge.server_close()
+        up_srv.close()
+        b_thread.join(timeout=2.0)

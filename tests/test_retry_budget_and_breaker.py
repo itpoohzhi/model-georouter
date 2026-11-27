@@ -40,12 +40,15 @@ def _routes(count: int = 3) -> list[RouteCandidate]:
 
 def _budget(tokens: int) -> TokenBucketRetryBudget:
     budget = TokenBucketRetryBudget()
-    while budget.available_tokens < tokens: _ = budget.mint_on_admitted_primary(5)
+    while budget.available_tokens < tokens:
+        _ = budget.mint_on_admitted_primary(5)
     return budget
 
 
 def _failing(seen: list[tuple[str, str]], outcome: Mapping[str, object]) -> Callable[[str, str], Mapping[str, object]]:
-    def attempt(model: str, effort: str) -> Mapping[str, object]: seen.append((model, effort)); return dict(outcome)
+    def attempt(model: str, effort: str) -> Mapping[str, object]:
+        seen.append((model, effort))
+        return dict(outcome)
 
     return attempt
 
@@ -122,10 +125,16 @@ def test_empty_budget_yields_no_retry_traffic() -> None:
     result = run_failover(facts, _failing(seen, {"status_code": 503}))
     assert result["physical_attempts"] == 1 and len(seen) == 1
 
-def _failing3(seen: list[tuple[str, str, str]], outcome: Mapping[str, object]) -> Callable[[str, str, str], Mapping[str, object]]:
-    def attempt(model: str, effort: str, route_id: str) -> Mapping[str, object]: seen.append((model, effort, route_id)); return dict(outcome)
+
+def _failing3(
+    seen: list[tuple[str, str, str]], outcome: Mapping[str, object]
+) -> Callable[[str, str, str], Mapping[str, object]]:
+    def attempt(model: str, effort: str, route_id: str) -> Mapping[str, object]:
+        seen.append((model, effort, route_id))
+        return dict(outcome)
 
     return attempt
+
 
 @pytest.mark.parametrize(
     "outcome",
@@ -146,6 +155,7 @@ def test_any_unsuccessful_outcome_fails_over_without_status_exceptions(outcome: 
     assert result["physical_attempts"] == 3 and result["tried_routes"] == ("r0", "r1", "r2")
     assert [item[2] for item in seen] == ["r0", "r1", "r2"]
 
+
 def test_failover_keeps_canonical_model_and_effort_without_downgrade() -> None:
     seen: list[tuple[str, str, str]] = []
     routes = [
@@ -156,6 +166,7 @@ def test_failover_keeps_canonical_model_and_effort_without_downgrade() -> None:
     assert result["physical_attempts"] == len(seen) == 3
     assert {(model, effort) for model, effort, _ in seen} == {(CANONICAL, "high")}
     assert result["canonical_model_id"] == CANONICAL and result["effort"] == "high"
+
 
 @pytest.mark.parametrize(
     "changes",
@@ -176,10 +187,12 @@ def test_replay_fences_stop_after_first_attempt(changes: dict[str, object]) -> N
     result = run_failover(facts, _failing(seen, {"status_code": 503}))
     assert result["physical_attempts"] == 1 and len(seen) == 1
 
+
 @pytest.mark.parametrize("endpoint", STATELESS_GENERATION_ENDPOINTS)
 def test_replay_allowed_only_for_exact_stateless_endpoints(endpoint: str) -> None:
     decision = evaluate_replay(_facts(endpoint=endpoint))
     assert decision["evaluator_invoked"] is True and decision["replay_allowed"] is True and decision["reasons"] == ()
+
 
 @pytest.mark.parametrize(
     "endpoint",
@@ -189,6 +202,7 @@ def test_replay_rejects_inexact_endpoints(endpoint: str) -> None:
     decision = evaluate_replay(_facts(endpoint=endpoint))
     reasons = decision["reasons"]
     assert decision["replay_allowed"] is False and isinstance(reasons, tuple) and "endpoint_not_stateless" in reasons
+
 
 def test_replay_fence_reports_every_reason() -> None:
     facts = _facts(
@@ -201,19 +215,33 @@ def test_replay_fence_reports_every_reason() -> None:
     decision = evaluate_replay(facts)
     reasons = decision["reasons"]
     assert decision["evaluator_invoked"] is True and decision["replay_allowed"] is False
-    assert isinstance(reasons, tuple) and set(cast("tuple[str, ...]", reasons)) == {"downstream_committed", "tool_side_effects_unknown", "endpoint_not_stateless", "no_retry_requested", "retry_owner_not_georouter"}
+    assert isinstance(reasons, tuple) and set(cast("tuple[str, ...]", reasons)) == {
+        "downstream_committed",
+        "tool_side_effects_unknown",
+        "endpoint_not_stateless",
+        "no_retry_requested",
+        "retry_owner_not_georouter",
+    }
+
 
 def test_query_string_does_not_change_stateless_classification() -> None:
     """F-113: query-string нормализуется внутри ядра `evaluate_replay`."""
     decision = evaluate_replay(_facts(endpoint=f"{ENDPOINT}?beta=1"))
     assert decision["replay_allowed"] is True and decision["endpoint"] == ENDPOINT
 
+
 def test_failover_owner_header_cannot_bypass_no_retry() -> None:
     """F-004: `X-Failover-Owner` не отменяет `X-Georouter-No-Retry` и не растит лимит."""
     seen: list[tuple[str, str]] = []
-    facts = _facts(routes=_routes(3), budget=_budget(3), retry_owner="BRIDGE_OWNER", control_headers={"X-Georouter-No-Retry": "1", "X-Failover-Owner": "model-georouter"})
+    facts = _facts(
+        routes=_routes(3),
+        budget=_budget(3),
+        retry_owner="BRIDGE_OWNER",
+        control_headers={"X-Georouter-No-Retry": "1", "X-Failover-Owner": "model-georouter"},
+    )
     result = run_failover(facts, _failing(seen, {"status_code": 503}))
     assert result["physical_attempts"] == result["max_total_attempts"] == 1 and len(seen) == 1
+
 
 def test_breaker_half_open_admits_one_probe() -> None:
     breaker = RouteCircuitBreaker("r0", failure_threshold=2, cooldown_ticks=5)
@@ -224,6 +252,7 @@ def test_breaker_half_open_admits_one_probe() -> None:
     assert breaker.try_acquire(5) is True and breaker.try_acquire(5) is False and breaker.half_open_inflight == 1
     breaker.release_probe(success=True, now_tick=6)
     assert breaker.state_at(6) is BreakerState.CLOSED
+
 
 def test_breaker_scopes_are_independent_and_ignore_client_validation() -> None:
     breaker = RouteCircuitBreaker("r0", failure_threshold=2, cooldown_ticks=4)
@@ -236,6 +265,7 @@ def test_breaker_scopes_are_independent_and_ignore_client_validation() -> None:
     breaker.record_failure(now_tick=4, scope="credential_scope")
     breaker.record_success("node")
     assert breaker.scope("node") == (0, None) and breaker.scope("credential_scope") == (1, 4)
+
 
 def test_panic_open_selects_safe_untried_routes_by_oldest_opened() -> None:
     routes = [RouteCandidate(route_id=name) for name in ("newer", "older", "cred", "closed", "tried")]
@@ -250,9 +280,18 @@ def test_panic_open_selects_safe_untried_routes_by_oldest_opened() -> None:
     picked = panic_open_candidates(routes, breakers, tried=("tried",), now_tick=0)
     assert [route.route_id for route in picked] == ["older", "newer"]
 
+
 def test_select_next_route_priority_weight_and_open_skip() -> None:
-    routes = [RouteCandidate(route_id="a", weight=5.0), RouteCandidate(route_id="b"), RouteCandidate(route_id="c", priority=1, weight=9.0)]
-    picks = {route.route_id for seed in range(120) if (route := select_next_route(routes, {}, now_tick=0, rng=random.Random(seed))) is not None}
+    routes = [
+        RouteCandidate(route_id="a", weight=5.0),
+        RouteCandidate(route_id="b"),
+        RouteCandidate(route_id="c", priority=1, weight=9.0),
+    ]
+    picks = {
+        route.route_id
+        for seed in range(120)
+        if (route := select_next_route(routes, {}, now_tick=0, rng=random.Random(seed))) is not None
+    }
     assert picks == {"a", "b"}
     assert select_next_route(routes, {}, tried=("a",), now_tick=0) == routes[1]
     assert select_next_route(routes, {}, tried=("a", "b"), now_tick=0) == routes[2]
@@ -261,6 +300,7 @@ def test_select_next_route_priority_weight_and_open_skip() -> None:
     assert select_next_route(routes, {"a": breaker}, now_tick=0) == routes[1]
     reopened = select_next_route(routes, {"a": breaker}, now_tick=5)
     assert reopened is not None and reopened.priority == 0
+
 
 def test_half_open_admits_exactly_one_probe_under_threads() -> None:
     """F-009: гонка не пускает в HALF_OPEN больше одного пробного запроса."""
@@ -278,19 +318,27 @@ def test_half_open_admits_exactly_one_probe_under_threads() -> None:
     [thread.join() for thread in threads]
     assert results.count(True) == 1 and breaker.half_open_inflight == 1
 
+
 def test_live_retry_is_fail_closed_when_disabled() -> None:
     """F-003: kill-switch `enabled=False` не выдаёт токен даже при полном бюджете."""
     assert consume_live_retry({}, _budget(2), enabled=False) is False
 
-@pytest.mark.parametrize(("changes", "reason"), [({"effort": ""}, "identity_invalid"), ({"status_code": True}, "status_unknown")])
+
+@pytest.mark.parametrize(
+    ("changes", "reason"), [({"effort": ""}, "identity_invalid"), ({"status_code": True}, "status_unknown")]
+)
 def test_replay_identity_and_status_fences(changes: dict[str, object], reason: str) -> None:
     """F-007: пустая identity или bool-статус блокируют replay с точной причиной."""
     assert reason in cast("tuple[str, ...]", evaluate_replay(_facts(**changes))["reasons"])
 
+
 def test_attempt_exception_restores_reserved_tokens() -> None:
     """F-008: исключение внутри attempt возвращает зарезервированные токены."""
     budget = _budget(2)
-    def boom(model: str, effort: str) -> Mapping[str, object]: raise RuntimeError(f"boom {model} {effort}")
+
+    def boom(model: str, effort: str) -> Mapping[str, object]:
+        raise RuntimeError(f"boom {model} {effort}")
+
     with pytest.raises(RuntimeError):
         _ = run_failover(_facts(routes=_routes(3), budget=budget), boom)
     assert budget.available_tokens == 2

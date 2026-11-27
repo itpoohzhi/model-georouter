@@ -20,7 +20,15 @@ def test_info_not_propagated_to_stderr_by_default(monkeypatch, tmp_path: Path) -
     cfg = tmp_path / "config.json"
     cfg.write_text('{"routes": [], "proxies": {}, "server": {"port": 0}}', encoding="utf-8")
     monkeypatch.delenv("GEOROUTER_STDERR_PROPAGATE", raising=False)
-    monkeypatch.setattr(main_mod, "ConfigManager", lambda _p: type("M", (), {"get": staticmethod(lambda: type("C", (), {"server": type("S", (), {"log_dir": str(tmp_path)})()})())})())
+    monkeypatch.setattr(
+        main_mod,
+        "ConfigManager",
+        lambda _p: type(
+            "M",
+            (),
+            {"get": staticmethod(lambda: type("C", (), {"server": type("S", (), {"log_dir": str(tmp_path)})()})())},
+        )(),
+    )
 
     class _FakeServer:
         server_address = ("127.0.0.1", 19000)
@@ -59,7 +67,15 @@ def test_env_rollback_restores_stderr_propagation(monkeypatch, tmp_path: Path) -
     cfg = tmp_path / "config.json"
     cfg.write_text('{"routes": []}', encoding="utf-8")
     monkeypatch.setenv("GEOROUTER_STDERR_PROPAGATE", "1")
-    monkeypatch.setattr(main_mod, "ConfigManager", lambda _p: type("M", (), {"get": staticmethod(lambda: type("C", (), {"server": type("S", (), {"log_dir": str(tmp_path)})()})())})())
+    monkeypatch.setattr(
+        main_mod,
+        "ConfigManager",
+        lambda _p: type(
+            "M",
+            (),
+            {"get": staticmethod(lambda: type("C", (), {"server": type("S", (), {"log_dir": str(tmp_path)})()})())},
+        )(),
+    )
 
     class _FakeServer:
         server_address = ("127.0.0.1", 19001)
