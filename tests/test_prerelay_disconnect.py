@@ -312,7 +312,7 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag_enabled: bool
 ) -> None:
     """Header timeout in selector returns 504 upstream_timeout with flag parity (no ValueError/TimeoutError 502)."""
-    from tests.helpers import FakeServer, http_request
+    from tests.helpers import FakeServer, http_request, recv_head
 
     flags_file = tmp_path / "geo-flags.json"
     flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: flag_enabled}), encoding="utf-8")
@@ -320,23 +320,25 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
 
     hdr_timeout_s = 0.15
     wait_bound_s = max(3.0, hdr_timeout_s * 20.0)
+
     accepted_lock = threading.Lock()
     accepted: list[int] = []
     eof_on_first = threading.Event()
+    timed_out_ev = threading.Event()
 
     def _up_handler(conn: socket.socket) -> None:
-        from tests.helpers import recv_head
-
         with accepted_lock:
             idx = len(accepted)
             accepted.append(idx)
-        conn.settimeout(wait_bound_s)
+        conn.settimeout(wait_bound_s * 2.0)
         if idx == 0:
             try:
                 while conn.recv(4096):
                     pass
                 eof_on_first.set()
-            except OSError:
+            except TimeoutError:
+                timed_out_ev.set()
+            except ConnectionResetError:
                 eof_on_first.set()
         else:
             head, rest = recv_head(conn)
@@ -379,6 +381,7 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
         assert resp.status == 504
         assert resp.json["error"]["type"] == "upstream_timeout"
         assert eof_on_first.wait(timeout=wait_bound_s), "upstream socket must be closed (not pooled) after 504"
+        assert not timed_out_ev.is_set()
         resp2 = http_request(
             bridge.server_address[1],
             "POST",
