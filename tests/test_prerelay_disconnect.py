@@ -23,6 +23,7 @@ from model_georouter.config import (
     ServerConfig,
     UpstreamConfig,
 )
+from model_georouter.errors import UpstreamTimeoutError
 from model_georouter.prerelay_policy import (
     FLAG_GEO_PRERELAY_DISCONNECT,
     ClientWatchAction,
@@ -306,22 +307,24 @@ def test_l2_full_bridge_server_client_rst_no_proxy_penalty_and_shut_wr_ok(
         up_thread.join(timeout=2.0)
 
 
-def test_l2_prerelay_enabled_header_timeout_returns_504_not_502(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("flag_enabled", [False, True])
+def test_l2_prerelay_header_timeout_returns_504_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag_enabled: bool
 ) -> None:
-    """When flag is True, header timeout in selector returns 504 upstream_timeout (no ValueError/TimeoutError 502)."""
+    """Header timeout in selector returns 504 upstream_timeout with flag parity (no ValueError/TimeoutError 502)."""
     from tests.helpers import FakeServer, http_request
 
     flags_file = tmp_path / "geo-flags.json"
-    flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: True}), encoding="utf-8")
+    flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: flag_enabled}), encoding="utf-8")
     monkeypatch.setenv(DEFAULT_FLAGS_PATH_ENV, str(flags_file))
 
-    up_srv = FakeServer(lambda conn: time.sleep(1.5))
+    release_ev = threading.Event()
+    up_srv = FakeServer(lambda conn: release_ev.wait(timeout=3.0))
     cfg = BridgeConfig(
         server=ServerConfig(
             listen="127.0.0.1",
             port=0,
-            headers_timeout=0.25,
+            headers_timeout=0.15,
             body_timeout=1.0,
             inactivity_timeout=1.0,
             log_dir=str(tmp_path / "logs"),
@@ -344,7 +347,46 @@ def test_l2_prerelay_enabled_header_timeout_returns_504_not_502(
         assert resp.status == 504
         assert resp.json["error"]["type"] == "upstream_timeout"
     finally:
+        release_ev.set()
         bridge.shutdown()
         bridge.server_close()
         up_srv.close()
         b_thread.join(timeout=2.0)
+
+
+def test_l1_read_head_expired_deadline_and_nonpositive_budget_raise_upstream_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expired overall deadline and rem <= 0 after ready wait must raise UpstreamTimeoutError without extra wait."""
+    flags_file = tmp_path / "geo-flags.json"
+    flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: True}), encoding="utf-8")
+    monkeypatch.setenv(DEFAULT_FLAGS_PATH_ENV, str(flags_file))
+    watcher = SelectorPreRelayWatcher(DynamicFlagCache())
+
+    class _ExpiredDeadline:
+        def clamp(self, requested: float) -> float:
+            raise TimeoutError("egress deadline expired")
+
+    c_srv, c_cli = _tcp_pair()
+    u_srv, u_cli = _tcp_pair()
+    calls: list[float] = []
+    try:
+        u_cli.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+
+        def _legacy(u: socket.socket, to: float, dl: object) -> tuple[bytes, bytes]:
+            calls.append(to)
+            return b"HTTP/1.1 200 OK\r\n\r\n", b""
+
+        with pytest.raises(UpstreamTimeoutError, match="egress deadline expired"):
+            watcher.read_head(c_srv, u_srv, 1.0, _ExpiredDeadline(), _legacy)
+
+        with pytest.raises(UpstreamTimeoutError):
+            watcher.read_head(c_srv, u_srv, 0.0, None, _legacy)
+
+        assert calls == []
+    finally:
+        for s in (c_srv, c_cli, u_srv, u_cli):
+            try:
+                s.close()
+            except OSError:
+                pass

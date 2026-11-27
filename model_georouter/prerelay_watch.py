@@ -94,8 +94,8 @@ def _remaining_wait(timeout: float, deadline: Any, started_at: float) -> float:
     if deadline is not None and hasattr(deadline, "clamp"):
         try:
             return max(0.0, float(deadline.clamp(phase_left)))
-        except TimeoutError:
-            raise UpstreamTimeoutError(f"upstream sent no response headers within {timeout:g}s") from None
+        except TimeoutError as exc:
+            raise UpstreamTimeoutError(str(exc)) from None
     return phase_left
 
 
@@ -189,7 +189,7 @@ class SelectorPreRelayWatcher:
             raise UpstreamTimeoutError(f"upstream sent no response headers within {timeout:g}s")
         rem = _remaining_wait(timeout, deadline, started_at)
         if rem <= 0.0:
-            rem = min(max(timeout, 1e-3), 0.05)
+            raise UpstreamTimeoutError(f"upstream sent no response headers within {timeout:g}s")
         return legacy_reader(up_sock, rem, deadline)
 
 
