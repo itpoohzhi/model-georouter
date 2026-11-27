@@ -318,8 +318,34 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
     flags_file.write_text(json.dumps({FLAG_GEO_PRERELAY_DISCONNECT: flag_enabled}), encoding="utf-8")
     monkeypatch.setenv(DEFAULT_FLAGS_PATH_ENV, str(flags_file))
 
+    accepted: list[int] = []
+    eof_on_first = threading.Event()
     release_ev = threading.Event()
-    up_srv = FakeServer(lambda conn: release_ev.wait(timeout=3.0))
+
+    def _up_handler(conn: socket.socket) -> None:
+        idx = len(accepted)
+        accepted.append(idx)
+        conn.settimeout(0.5)
+        try:
+            conn.recv(4096)
+        except OSError:
+            pass
+        if idx == 0:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not release_ev.is_set():
+                try:
+                    if conn.recv(1) == b"":
+                        eof_on_first.set()
+                        break
+                except TimeoutError:
+                    continue
+                except OSError:
+                    eof_on_first.set()
+                    break
+        else:
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+    up_srv = FakeServer(_up_handler)
     cfg = BridgeConfig(
         server=ServerConfig(
             listen="127.0.0.1",
@@ -346,6 +372,16 @@ def test_l2_prerelay_header_timeout_returns_504_parity(
         )
         assert resp.status == 504
         assert resp.json["error"]["type"] == "upstream_timeout"
+        assert eof_on_first.wait(timeout=1.5), "upstream socket must be closed (not pooled) after 504"
+        resp2 = http_request(
+            bridge.server_address[1],
+            "POST",
+            "/v1/chat/completions",
+            b'{"model":"m","messages":[{"role":"user","content":"next"}]}',
+        )
+        assert resp2.status == 200
+        assert resp2.body == b"ok"
+        assert len(accepted) == 2
     finally:
         release_ev.set()
         bridge.shutdown()
